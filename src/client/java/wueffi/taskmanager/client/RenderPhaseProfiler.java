@@ -17,7 +17,6 @@ public class RenderPhaseProfiler {
     private final Map<String, Long> cpuStart = new ConcurrentHashMap<>();
 
     public void beginCpuPhase(String phase) {
-        if (!TaskManagerScreen.isProfilingActive()) return;
         cpuStart.put(phase, System.nanoTime());
     }
 

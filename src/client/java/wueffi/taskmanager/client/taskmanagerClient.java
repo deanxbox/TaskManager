@@ -1,5 +1,6 @@
 package wueffi.taskmanager.client;
 
+import wueffi.taskmanager.client.util.ConfigManager;
 import wueffi.taskmanager.client.util.KeyBindHandler;
 import wueffi.taskmanager.client.util.ModClassIndex;
 import net.fabricmc.api.ClientModInitializer;
@@ -16,6 +17,7 @@ public class taskmanagerClient implements ClientModInitializer {
     public void onInitializeClient() {
         ModClassIndex.build();
         KeyBindHandler.register();
+        ConfigManager.loadConfig();
 
         ClientTickEvents.END_CLIENT_TICK.register(client -> {
             if (!startupClosed) {

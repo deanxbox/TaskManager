@@ -1,6 +1,9 @@
 package wueffi.taskmanager.client.mixin;
 
+import org.spongepowered.asm.mixin.Unique;
 import wueffi.taskmanager.client.RenderPhaseProfiler;
+import wueffi.taskmanager.client.TaskManagerScreen;
+import wueffi.taskmanager.client.taskmanagerClient;
 import wueffi.taskmanager.client.util.GpuTimer;
 import net.minecraft.client.render.GameRenderer;
 import net.minecraft.client.render.RenderTickCounter;
@@ -16,7 +19,8 @@ public class GameRendererMixin {
         method = "render",
         at = @At("HEAD")
     )
-    private void renderspy$onRenderHead(RenderTickCounter tickCounter, boolean tick, CallbackInfo ci) {
+    private void taskmanager$onRenderHead(RenderTickCounter tickCounter, boolean tick, CallbackInfo ci) {
+        if (!TaskManagerScreen.isProfilingActive()) return;
         GpuTimer.collectResults();
         RenderPhaseProfiler.getInstance().beginCpuPhase("frame.total");
         GpuTimer.begin("frame.total");
@@ -26,7 +30,8 @@ public class GameRendererMixin {
         method = "render",
         at = @At("TAIL")
     )
-    private void renderspy$onRenderTail(RenderTickCounter tickCounter, boolean tick, CallbackInfo ci) {
+    private void taskmanager$onRenderTail(RenderTickCounter tickCounter, boolean tick, CallbackInfo ci) {
+        if (!TaskManagerScreen.isProfilingActive()) return;
         GpuTimer.end("frame.total");
         RenderPhaseProfiler.getInstance().endCpuPhase("frame.total");
     }
@@ -35,7 +40,8 @@ public class GameRendererMixin {
         method = "renderWorld",
         at = @At("HEAD")
     )
-    private void renderspy$onRenderWorldHead(CallbackInfo ci) {
+    private void taskmanager$onRenderWorldHead(CallbackInfo ci) {
+        if (!TaskManagerScreen.isProfilingActive()) return;
         RenderPhaseProfiler.getInstance().beginCpuPhase("gameRenderer.renderWorld");
         GpuTimer.begin("gameRenderer.renderWorld");
     }
@@ -44,7 +50,8 @@ public class GameRendererMixin {
         method = "renderWorld",
         at = @At("TAIL")
     )
-    private void renderspy$onRenderWorldTail(CallbackInfo ci) {
+    private void taskmanager$onRenderWorldTail(CallbackInfo ci) {
+        if (!TaskManagerScreen.isProfilingActive()) return;
         GpuTimer.end("gameRenderer.renderWorld");
         RenderPhaseProfiler.getInstance().endCpuPhase("gameRenderer.renderWorld");
     }

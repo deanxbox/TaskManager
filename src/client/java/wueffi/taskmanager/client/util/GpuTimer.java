@@ -37,7 +37,6 @@ public class GpuTimer {
     }
 
     public static void begin(String phase) {
-        if (!TaskManagerScreen.isProfilingActive()) return;
         if (!isSupported()) return;
         if (active != null) {
             return;

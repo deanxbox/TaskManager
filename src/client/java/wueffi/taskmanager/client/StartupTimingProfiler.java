@@ -10,7 +10,7 @@ public class StartupTimingProfiler {
     private final Map<String, Long> firstSeen = new LinkedHashMap<>();
     private final Map<String, Long> lastSeen = new LinkedHashMap<>();
     private final Map<String, Integer> registrationCount = new LinkedHashMap<>();
-    private boolean closed = false;
+    public static boolean closed = false;
 
     public void close() {
         closed = true;

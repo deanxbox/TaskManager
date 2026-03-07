@@ -17,8 +17,8 @@ public class KeyBindHandler {
                 "key.taskmanager.open",
                 InputUtil.Type.KEYSYM,
                 GLFW.GLFW_KEY_F12,
-//                "category.taskmanager"
-                new KeyBinding.Category(Identifier.of("category.taskmanager"))
+                "category.taskmanager"
+//                new KeyBinding.Category(Identifier.of("category.taskmanager"))
         ));
 
         ClientTickEvents.END_CLIENT_TICK.register(client -> {

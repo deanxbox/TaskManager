@@ -1,6 +1,9 @@
 package wueffi.taskmanager.client.mixin;
 
+// import net.minecraft.world.MoonPhase;
+import org.spongepowered.asm.mixin.Unique;
 import wueffi.taskmanager.client.RenderPhaseProfiler;
+import wueffi.taskmanager.client.TaskManagerScreen;
 import wueffi.taskmanager.client.util.GpuTimer;
 import net.minecraft.client.render.SkyRendering;
 import net.minecraft.client.util.math.MatrixStack;
@@ -18,8 +21,10 @@ public class SkyRenderingMixin {
             at = @At("HEAD")
     )
     private void taskmanager$onSkyHead(
+        MatrixStack matrices, VertexConsumerProvider.Immediate vertexConsumers, float rot, int phase, float alpha, float starBrightness, CallbackInfo ci) {
+//        MatrixStack matrices, float f, int i, float g, float h, CallbackInfo ci) {
 //            MatrixStack matrices, VertexConsumerProvider.Immediate vertexConsumers, float rot, int phase, float alpha, float starBrightness, CallbackInfo ci) {
-        MatrixStack matrices, float f, int i, float g, float h, CallbackInfo ci) {
+        if (!TaskManagerScreen.isProfilingActive()) return;
         RenderPhaseProfiler.getInstance().beginCpuPhase("sky.renderCelestialBodies");
         GpuTimer.begin("sky.renderCelestialBodies");
     }
@@ -29,8 +34,10 @@ public class SkyRenderingMixin {
             at = @At("TAIL")
     )
     private void taskmanager$onSkyTail(
-//            MatrixStack matrices, VertexConsumerProvider.Immediate vertexConsumers, float rot, int phase, float alpha, float starBrightness, CallbackInfo ci) {
-        MatrixStack matrices, float f, int i, float g, float h, CallbackInfo ci) {
+       MatrixStack matrices, VertexConsumerProvider.Immediate vertexConsumers, float rot, int phase, float alpha, float starBrightness, CallbackInfo ci) {
+//        MatrixStack matrices, float f, int i, float g, float h, CallbackInfo ci) {
+//            MatrixStack matrices, float sunAngle, float moonAngle, float starAngle, MoonPhase moonPhase, float alpha, float starBrightness, CallbackInfo ci) {
+        if (!TaskManagerScreen.isProfilingActive()) return;
         GpuTimer.end("sky.renderCelestialBodies");
         RenderPhaseProfiler.getInstance().endCpuPhase("sky.renderCelestialBodies");
     }

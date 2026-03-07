@@ -3,14 +3,17 @@ package wueffi.taskmanager.client;
 import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gl.RenderPipelines;
-import net.minecraft.client.gui.Click;
+// import net.minecraft.client.gui.Click;
 import net.minecraft.client.gui.DrawContext;
 import net.minecraft.client.gui.screen.Screen;
 import net.minecraft.text.Text;
 import net.minecraft.util.Identifier;
+import wueffi.taskmanager.client.util.ConfigManager;
 import wueffi.taskmanager.client.util.ModIconCache;
 import wueffi.taskmanager.client.util.ModTimingSnapshot;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 
 public class TaskManagerScreen extends Screen {
@@ -34,7 +37,7 @@ public class TaskManagerScreen extends Screen {
 
     private int activeTab = 0;
     private int scrollOffset = 0;
-    private static boolean onlyProfileWhenOpen = false;
+    private static boolean onlyProfileWhenOpen = ConfigManager.getOnlyProfileWhenOpen();
 
     public TaskManagerScreen() {
         super(Text.literal("Task Manager"));
@@ -228,9 +231,14 @@ public class TaskManagerScreen extends Screen {
             return;
         }
 
-        java.util.Set<String> allPhases = new java.util.LinkedHashSet<>();
+        List<String> allPhases = new ArrayList<>();
         allPhases.addAll(cpuNanos.keySet());
         allPhases.addAll(gpuNanos.keySet());
+        allPhases = allPhases.stream().distinct().sorted((a, b) -> {
+            long totalA = cpuNanos.getOrDefault(a, 0L) + gpuNanos.getOrDefault(a, 0L);
+            long totalB = cpuNanos.getOrDefault(b, 0L) + gpuNanos.getOrDefault(b, 0L);
+            return Long.compare(totalB, totalA); // descending
+        }).toList();
 
         long totalCombinedNanos = allPhases.stream()
                 .mapToLong(p -> cpuNanos.getOrDefault(p, 0L) + gpuNanos.getOrDefault(p, 0L))
@@ -310,32 +318,11 @@ public class TaskManagerScreen extends Screen {
     }
 
     @Override
-//    public boolean mouseClicked(double mouseX, double mouseY, int button) {
-//        int checkX = width - 160;
-//        if (mouseX >= checkX && mouseX < width - PADDING && mouseY >= 4 && mouseY < 16) {
-//            onlyProfileWhenOpen = !onlyProfileWhenOpen;
-//            return true;
-//        }
-//
-//        int tabY = 20;
-//        int tabW = 90;
-//        for (int i = 0; i < 3; i++) {
-//            int tx = PADDING + i * (tabW + 2);
-//            if (mouseX >= tx && mouseX < tx + tabW && mouseY >= tabY && mouseY < tabY + TAB_HEIGHT) {
-//                activeTab = i;
-//                scrollOffset = 0;
-//                return true;
-//            }
-//        }
-//        return super.mouseClicked(mouseX, mouseY, button);
-//    }
-    public boolean mouseClicked(Click click, boolean doubled) {
-        double mouseX = click.x();
-        double mouseY = click.y();
-
+    public boolean mouseClicked(double mouseX, double mouseY, int button) {
         int checkX = width - 160;
         if (mouseX >= checkX && mouseX < width - PADDING && mouseY >= 4 && mouseY < 16) {
             onlyProfileWhenOpen = !onlyProfileWhenOpen;
+            ConfigManager.setOnlyProfileWhenOpen(onlyProfileWhenOpen);
             return true;
         }
 
@@ -349,10 +336,33 @@ public class TaskManagerScreen extends Screen {
                 return true;
             }
         }
-        return super.mouseClicked(click, doubled);
+        return super.mouseClicked(mouseX, mouseY, button);
     }
+//    public boolean mouseClicked(Click click, boolean doubled) {
+//        double mouseX = click.x();
+//        double mouseY = click.y();
+//
+//        int checkX = width - 160;
+//        if (mouseX >= checkX && mouseX < width - PADDING && mouseY >= 4 && mouseY < 16) {
+//            onlyProfileWhenOpen = !onlyProfileWhenOpen;
+//            ConfigManager.setOnlyProfileWhenOpen(onlyProfileWhenOpen);
+//            return true;
+//        }
+//
+//        int tabY = 20;
+//        int tabW = 90;
+//        for (int i = 0; i < 3; i++) {
+//            int tx = PADDING + i * (tabW + 2);
+//            if (mouseX >= tx && mouseX < tx + tabW && mouseY >= tabY && mouseY < tabY + TAB_HEIGHT) {
+//                activeTab = i;
+//                scrollOffset = 0;
+//                return true;
+//            }
+//        }
+//        return super.mouseClicked(click, doubled);
+//    }
 
     public static boolean isProfilingActive() {
-        return !onlyProfileWhenOpen || MinecraftClient.getInstance().currentScreen instanceof TaskManagerScreen;
+        return !StartupTimingProfiler.closed || !onlyProfileWhenOpen || MinecraftClient.getInstance().currentScreen instanceof TaskManagerScreen;
     }
 }

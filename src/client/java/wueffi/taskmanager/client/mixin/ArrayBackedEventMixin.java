@@ -2,6 +2,8 @@ package wueffi.taskmanager.client.mixin;
 
 import wueffi.taskmanager.client.ModTimingProfiler;
 import wueffi.taskmanager.client.StartupTimingProfiler;
+import wueffi.taskmanager.client.TaskManagerScreen;
+import wueffi.taskmanager.client.taskmanagerClient;
 import wueffi.taskmanager.client.util.ModClassIndex;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Unique;
@@ -20,13 +22,11 @@ public class ArrayBackedEventMixin<T> {
     @SuppressWarnings("unchecked")
     @Inject(method = "register(Ljava/lang/Object;)V", at = @At("HEAD"), cancellable = true, remap = false)
     private void taskmanager$onRegister(T listener, CallbackInfo ci) {
-        if (taskmanager$bypassing) return;
-
+        if (taskmanager$bypassing || !TaskManagerScreen.isProfilingActive()) return;
+        Class<?>[] interfaces = listener.getClass().getInterfaces();
         String modId = ModClassIndex.getModForClassName(listener.getClass());
-
         StartupTimingProfiler.getInstance().recordRegistration(modId);
 
-        Class<?>[] interfaces = listener.getClass().getInterfaces();
         final String capturedModId = modId;
 
         Object proxy;
