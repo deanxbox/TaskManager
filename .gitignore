@@ -1,5 +1,9 @@
 # User-specific stuff
 .idea/
+.gradle-user-home
+.gradle-user-home-verify
+.gradle-user-home-verify-2
+.gradle-user-home-verify3
 
 *.iml
 *.ipr

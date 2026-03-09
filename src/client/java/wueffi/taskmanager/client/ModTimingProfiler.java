@@ -2,44 +2,42 @@ package wueffi.taskmanager.client;
 
 import wueffi.taskmanager.client.util.ModTimingSnapshot;
 
-import java.util.*;
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.LongAdder;
 
 public class ModTimingProfiler {
 
     private static final ModTimingProfiler INSTANCE = new ModTimingProfiler();
     public static ModTimingProfiler getInstance() { return INSTANCE; }
 
-    private static final long WINDOW_NS = 5_000_000_000L;
-    private record TimedEntry(String modId, String method, long nanos, long timestamp) {}
-
-    private final List<TimedEntry> entries = new java.util.concurrent.CopyOnWriteArrayList<>();
-
-    public void record(String modId, String methodName, long nanoseconds) {
-        entries.add(new TimedEntry(modId, methodName, nanoseconds, System.nanoTime()));
+    private static class Counter {
+        final LongAdder nanos = new LongAdder();
+        final LongAdder calls = new LongAdder();
     }
 
-    private void evict() {
-        long cutoff = System.nanoTime() - WINDOW_NS;
-        entries.removeIf(e -> e.timestamp() < cutoff);
+    private final Map<String, Counter> counters = new ConcurrentHashMap<>();
+
+    public void record(String modId, String methodName, long nanoseconds) {
+        String key = modId == null ? "unknown" : modId;
+        counters.computeIfAbsent(key, ignored -> new Counter()).nanos.add(nanoseconds);
+        counters.get(key).calls.increment();
     }
 
     public Map<String, ModTimingSnapshot> getSnapshot() {
-        evict();
-        Map<String, Long> nanos = new LinkedHashMap<>();
-        Map<String, Long> calls = new LinkedHashMap<>();
-        for (TimedEntry e : entries) {
-            nanos.merge(e.modId(), e.nanos(), Long::sum);
-            calls.merge(e.modId(), 1L, Long::sum);
-        }
         Map<String, ModTimingSnapshot> result = new LinkedHashMap<>();
-        nanos.entrySet().stream()
-                .sorted(Map.Entry.<String, Long>comparingByValue().reversed())
-                .forEach(e -> result.put(e.getKey(),
-                        new ModTimingSnapshot(e.getValue(), calls.getOrDefault(e.getKey(), 1L))));
+        counters.forEach((mod, counter) -> result.put(mod, new ModTimingSnapshot(counter.nanos.sum(), counter.calls.sum())));
+        return result;
+    }
+
+    public Map<String, ModTimingSnapshot> drainSnapshot() {
+        Map<String, ModTimingSnapshot> result = getSnapshot();
+        reset();
         return result;
     }
 
     public void reset() {
-        entries.clear();
+        counters.clear();
     }
 }

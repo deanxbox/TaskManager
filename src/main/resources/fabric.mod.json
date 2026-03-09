@@ -15,6 +15,9 @@
     ],
     "main": [
       "taskmanager.taskmanager"
+    ],
+    "modmenu": [
+      "wueffi.taskmanager.client.TaskManagerModMenu"
     ]
   },
   "mixins": [
@@ -27,6 +30,6 @@
   "depends": {
     "fabricloader": ">=${loader_version}",
     "fabric-api": "*",
-    "minecraft": ">=${minecraft_version} <=1.21.8"
+    "minecraft": ">=${minecraft_version}"
   }
 }

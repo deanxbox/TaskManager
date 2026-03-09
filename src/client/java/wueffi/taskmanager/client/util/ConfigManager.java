@@ -3,6 +3,7 @@ package wueffi.taskmanager.client.util;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import net.fabricmc.loader.api.FabricLoader;
+import wueffi.taskmanager.client.ProfilerManager;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -10,17 +11,176 @@ import java.nio.file.Path;
 
 public class ConfigManager {
 
+    public enum HudPosition {
+        TOP_LEFT,
+        TOP_RIGHT,
+        BOTTOM_LEFT,
+        BOTTOM_RIGHT;
+
+        public HudPosition next() {
+            HudPosition[] values = values();
+            return values[(ordinal() + 1) % values.length];
+        }
+    }
+
+    public enum HudLayoutMode {
+        SINGLE_COLUMN,
+        TWO_COLUMN,
+        THREE_COLUMN;
+
+        public HudLayoutMode next() {
+            HudLayoutMode[] values = values();
+            return values[(ordinal() + 1) % values.length];
+        }
+
+        public int columns() {
+            return switch (this) {
+                case SINGLE_COLUMN -> 1;
+                case TWO_COLUMN -> 2;
+                case THREE_COLUMN -> 3;
+            };
+        }
+    }
+
+    public enum HudTriggerMode {
+        ALWAYS,
+        SPIKES_ONLY,
+        WARNINGS_ONLY;
+
+        public HudTriggerMode next() {
+            HudTriggerMode[] values = values();
+            return values[(ordinal() + 1) % values.length];
+        }
+    }
+
     private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
-    private static final Path CONFIG_PATH = FabricLoader.getInstance().getConfigDir() .resolve("taskmanager.json");
+    private static final Path CONFIG_PATH = FabricLoader.getInstance().getConfigDir().resolve("taskmanager.json");
     private static ConfigData config = new ConfigData();
 
+    public static ProfilerManager.CaptureMode getCaptureMode() {
+        try {
+            return ProfilerManager.CaptureMode.valueOf(config.captureMode);
+        } catch (Exception ignored) {
+            return ProfilerManager.CaptureMode.OPEN_ONLY;
+        }
+    }
+
+    public static void setCaptureMode(ProfilerManager.CaptureMode mode) {
+        config.captureMode = mode.name();
+        saveConfig();
+    }
+
+    public static boolean isHudEnabled() {
+        return config.hudEnabled;
+    }
+
+    public static void setHudEnabled(boolean value) {
+        config.hudEnabled = value;
+        saveConfig();
+    }
+
+    public static HudPosition getHudPosition() {
+        try {
+            return HudPosition.valueOf(config.hudPosition);
+        } catch (Exception ignored) {
+            return HudPosition.TOP_LEFT;
+        }
+    }
+
+    public static void cycleHudPosition() {
+        config.hudPosition = getHudPosition().next().name();
+        saveConfig();
+    }
+
+    public static HudLayoutMode getHudLayoutMode() {
+        try {
+            return HudLayoutMode.valueOf(config.hudLayoutMode);
+        } catch (Exception ignored) {
+            return HudLayoutMode.SINGLE_COLUMN;
+        }
+    }
+
+    public static void cycleHudLayoutMode() {
+        config.hudLayoutMode = getHudLayoutMode().next().name();
+        saveConfig();
+    }
+
+    public static int getSessionDurationSeconds() {
+        return Math.max(15, config.sessionDurationSeconds);
+    }
+
+    public static void cycleSessionDurationSeconds() {
+        int current = getSessionDurationSeconds();
+        int next = switch (current) {
+            case 15 -> 30;
+            case 30 -> 60;
+            case 60 -> 120;
+            case 120 -> 300;
+            default -> 15;
+        };
+        config.sessionDurationSeconds = next;
+        saveConfig();
+    }
+
+    public static int getMetricsUpdateIntervalMs() {
+        return Math.max(250, config.metricsUpdateIntervalMs);
+    }
+
+    public static void cycleMetricsUpdateIntervalMs() {
+        int current = getMetricsUpdateIntervalMs();
+        int next = switch (current) {
+            case 250 -> 500;
+            case 500 -> 1000;
+            case 1000 -> 2000;
+            default -> 250;
+        };
+        config.metricsUpdateIntervalMs = next;
+        saveConfig();
+    }
+
+    public static boolean isHudShowFps() { return config.hudShowFps; }
+    public static boolean isHudShowFrame() { return config.hudShowFrame; }
+    public static boolean isHudShowTicks() { return config.hudShowTicks; }
+    public static boolean isHudShowUtilization() { return config.hudShowUtilization; }
+    public static boolean isHudShowTemperatures() { return config.hudShowTemperatures; }
+    public static boolean isHudShowParallelism() { return config.hudShowParallelism; }
+    public static boolean isHudShowMemory() { return config.hudShowMemory; }
+    public static boolean isHudShowWorld() { return config.hudShowWorld; }
+    public static boolean isHudShowSession() { return config.hudShowSession; }
+
+    public static HudTriggerMode getHudTriggerMode() {
+        try {
+            return HudTriggerMode.valueOf(config.hudTriggerMode);
+        } catch (Exception ignored) {
+            return config.hudSpikeOnly ? HudTriggerMode.SPIKES_ONLY : HudTriggerMode.ALWAYS;
+        }
+    }
+
+    public static void toggleHudShowFps() { config.hudShowFps = !config.hudShowFps; saveConfig(); }
+    public static void toggleHudShowFrame() { config.hudShowFrame = !config.hudShowFrame; saveConfig(); }
+    public static void toggleHudShowTicks() { config.hudShowTicks = !config.hudShowTicks; saveConfig(); }
+    public static void toggleHudShowUtilization() { config.hudShowUtilization = !config.hudShowUtilization; saveConfig(); }
+    public static void toggleHudShowTemperatures() { config.hudShowTemperatures = !config.hudShowTemperatures; saveConfig(); }
+    public static void toggleHudShowParallelism() { config.hudShowParallelism = !config.hudShowParallelism; saveConfig(); }
+    public static void toggleHudShowMemory() { config.hudShowMemory = !config.hudShowMemory; saveConfig(); }
+    public static void toggleHudShowWorld() { config.hudShowWorld = !config.hudShowWorld; saveConfig(); }
+    public static void toggleHudShowSession() { config.hudShowSession = !config.hudShowSession; saveConfig(); }
+    public static void cycleHudTriggerMode() { config.hudTriggerMode = getHudTriggerMode().next().name(); saveConfig(); }
+
+    public static boolean isTasksColumnVisible(String key) { return isColumnVisible(config.tasksColumns, key); }
+    public static boolean isGpuColumnVisible(String key) { return isColumnVisible(config.gpuColumns, key); }
+    public static boolean isMemoryColumnVisible(String key) { return isColumnVisible(config.memoryColumns, key); }
+
+    public static void toggleTasksColumn(String key) { config.tasksColumns = toggleColumn(config.tasksColumns, key); saveConfig(); }
+    public static void toggleGpuColumn(String key) { config.gpuColumns = toggleColumn(config.gpuColumns, key); saveConfig(); }
+    public static void toggleMemoryColumn(String key) { config.memoryColumns = toggleColumn(config.memoryColumns, key); saveConfig(); }
+
     public static boolean getOnlyProfileWhenOpen() {
-        return config.onlyProfileWhenOpen;
+        return getCaptureMode() == ProfilerManager.CaptureMode.OPEN_ONLY;
     }
 
     public static void setOnlyProfileWhenOpen(boolean value) {
-        config.onlyProfileWhenOpen = value;
-        saveConfig();
+        setCaptureMode(value ? ProfilerManager.CaptureMode.OPEN_ONLY : ProfilerManager.CaptureMode.PASSIVE_LIGHTWEIGHT);
     }
 
     public static void loadConfig() {
@@ -28,11 +188,10 @@ public class ConfigManager {
             try {
                 String json = Files.readString(CONFIG_PATH);
                 config = GSON.fromJson(json, ConfigData.class);
-
                 if (config == null) {
                     config = new ConfigData();
                 }
-
+                migrateLegacyFields();
             } catch (IOException e) {
                 e.printStackTrace();
                 config = new ConfigData();
@@ -51,7 +210,84 @@ public class ConfigManager {
         }
     }
 
+    private static boolean isColumnVisible(String csv, String key) {
+        String source = csv == null || csv.isBlank() ? key : csv;
+        for (String part : source.split(",")) {
+            if (part.trim().equalsIgnoreCase(key)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static String toggleColumn(String csv, String key) {
+        java.util.LinkedHashSet<String> values = new java.util.LinkedHashSet<>();
+        if (csv != null && !csv.isBlank()) {
+            for (String part : csv.split(",")) {
+                String trimmed = part.trim();
+                if (!trimmed.isBlank()) {
+                    values.add(trimmed);
+                }
+            }
+        }
+        if (!values.remove(key)) {
+            values.add(key);
+        }
+        return String.join(",", values);
+    }
+
+    private static void migrateLegacyFields() {
+        if (config.captureMode == null || config.captureMode.isBlank()) {
+            config.captureMode = config.onlyProfileWhenOpen ? ProfilerManager.CaptureMode.OPEN_ONLY.name() : ProfilerManager.CaptureMode.PASSIVE_LIGHTWEIGHT.name();
+        }
+        if (config.hudPosition == null || config.hudPosition.isBlank()) {
+            config.hudPosition = HudPosition.TOP_LEFT.name();
+        }
+        if (config.hudLayoutMode == null || config.hudLayoutMode.isBlank()) {
+            config.hudLayoutMode = HudLayoutMode.SINGLE_COLUMN.name();
+        }
+        if (config.hudTriggerMode == null || config.hudTriggerMode.isBlank()) {
+            config.hudTriggerMode = config.hudSpikeOnly ? HudTriggerMode.SPIKES_ONLY.name() : HudTriggerMode.ALWAYS.name();
+        }
+        if (config.sessionDurationSeconds <= 0) {
+            config.sessionDurationSeconds = 30;
+        }
+        if (config.metricsUpdateIntervalMs <= 0) {
+            config.metricsUpdateIntervalMs = 500;
+        }
+        if (config.tasksColumns == null || config.tasksColumns.isBlank()) {
+            config.tasksColumns = "cpu,threads,samples,invokes";
+        }
+        if (config.gpuColumns == null || config.gpuColumns.isBlank()) {
+            config.gpuColumns = "pct,threads,gpums,rsamples";
+        }
+        if (config.memoryColumns == null || config.memoryColumns.isBlank()) {
+            config.memoryColumns = "classes,mb,pct";
+        }
+        saveConfig();
+    }
+
     private static class ConfigData {
         public boolean onlyProfileWhenOpen = true;
+        public String captureMode = ProfilerManager.CaptureMode.OPEN_ONLY.name();
+        public boolean hudEnabled = true;
+        public String hudPosition = HudPosition.TOP_LEFT.name();
+        public String hudLayoutMode = HudLayoutMode.SINGLE_COLUMN.name();
+        public int sessionDurationSeconds = 30;
+        public int metricsUpdateIntervalMs = 500;
+        public boolean hudShowFps = true;
+        public boolean hudShowFrame = true;
+        public boolean hudShowTicks = true;
+        public boolean hudShowUtilization = true;
+        public boolean hudShowTemperatures = true;
+        public boolean hudShowParallelism = false;
+        public boolean hudShowMemory = true;
+        public boolean hudShowWorld = true;
+        public boolean hudShowSession = true;
+        public boolean hudSpikeOnly = false;
+        public String hudTriggerMode = HudTriggerMode.ALWAYS.name();
+        public String tasksColumns = "cpu,threads,samples,invokes";
+        public String gpuColumns = "pct,threads,gpums,rsamples";
+        public String memoryColumns = "classes,mb,pct";
     }
 }

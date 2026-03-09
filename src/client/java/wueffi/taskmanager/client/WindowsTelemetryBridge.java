@@ -1,0 +1,441 @@
+package wueffi.taskmanager.client;
+
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+import wueffi.taskmanager.client.util.ConfigManager;
+
+import java.io.ByteArrayOutputStream;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
+import java.util.Locale;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+final class WindowsTelemetryBridge {
+
+    record Sample(
+            boolean bridgeActive,
+            String counterSource,
+            String sensorSource,
+            String sensorErrorCode,
+            double cpuCoreLoadPercent,
+            double gpuCoreLoadPercent,
+            double gpuTemperatureC,
+            double cpuTemperatureC,
+            long bytesReceivedPerSecond,
+            long bytesSentPerSecond,
+            long diskReadBytesPerSecond,
+            long diskWriteBytesPerSecond
+    ) {
+        static Sample empty() {
+            return new Sample(false, "Unavailable", "Unavailable", "No bridge data", -1, -1, -1, -1, -1, -1, -1, -1);
+        }
+    }
+
+    private static final String SCRIPT = """
+            $ErrorActionPreference = 'SilentlyContinue'
+            $netRecv = 0.0
+            $netSent = 0.0
+            $diskRead = 0.0
+            $diskWrite = 0.0
+            $cpuLoad = -1.0
+            $gpuLoad = -1.0
+            $cpuTemp = -1.0
+            $gpuTemp = -1.0
+            $cpuSensorSource = 'Unavailable'
+            $gpuSensorSource = 'Unavailable'
+            $cpuSensorMatch = 'none'
+            $gpuSensorMatch = 'none'
+            $sensorAttempts = New-Object 'System.Collections.Generic.List[string]'
+            $sensorErrors = New-Object 'System.Collections.Generic.List[string]'
+            $counterSource = 'Windows Performance Counters'
+
+            function Add-SensorAttempt($text) {
+              try { $script:sensorAttempts.Add($text) | Out-Null } catch {}
+            }
+
+            function Add-SensorError($provider, $err) {
+              try {
+                $message = if ([string]::IsNullOrWhiteSpace($err)) { 'Unknown error' } else { $err }
+                $script:sensorErrors.Add(($provider + ': ' + $message)) | Out-Null
+              } catch {}
+            }
+
+            function Update-HardwareTree($hardware) {
+              try { $hardware.Update() } catch {}
+              try { foreach ($sub in $hardware.SubHardware) { Update-HardwareTree $sub } } catch {}
+            }
+
+            function Set-TemperatureFromSensor($origin, $hardwareType, $hardwareName, $sensorName, $sensorIdentifier, $sensorValue) {
+              if ($sensorValue -le 0) { return }
+              $search = ($hardwareType + ' ' + $hardwareName + ' ' + $sensorName + ' ' + $sensorIdentifier).ToLowerInvariant()
+              $cpuMatch = ($search -match 'cpu package|cpu package temperature|package id|package|tctl|tdie|ccd|die|cpu core|core max|core average|processor|socket|ryzen|intel') -or (($hardwareType + ' ' + $hardwareName).ToLowerInvariant() -match 'cpu|processor' -and $sensorName -match 'temperature|tdie|tctl|package|cpu') -or ($sensorName -match '^cpu$')
+              $gpuMatch = ($search -match 'gpu temperature|gpu core|hot spot|hotspot|junction|edge|graphics|mem junction|radeon|nvidia|intel graphics') -or (($hardwareType + ' ' + $hardwareName).ToLowerInvariant() -match 'gpu|graphics|radeon|nvidia|intel' -and $sensorName -match 'temperature|edge|junction|hot')
+              if (($cpuTemp -lt 0 -or $sensorValue -gt $cpuTemp) -and $cpuMatch) {
+                $script:cpuTemp = [double]$sensorValue
+                $script:cpuSensorSource = $origin
+                $script:cpuSensorMatch = $hardwareName + ' / ' + $sensorName
+              }
+              if (($gpuTemp -lt 0 -or $sensorValue -gt $gpuTemp) -and $gpuMatch) {
+                $script:gpuTemp = [double]$sensorValue
+                $script:gpuSensorSource = $origin
+                $script:gpuSensorMatch = $hardwareName + ' / ' + $sensorName
+              }
+            }
+
+            $sample = Get-Counter '\\Processor Information(_Total)\\% Processor Utility','\\Processor(_Total)\\% Processor Time','\\Network Interface(*)\\Bytes Received/sec','\\Network Interface(*)\\Bytes Sent/sec','\\PhysicalDisk(_Total)\\Disk Read Bytes/sec','\\PhysicalDisk(_Total)\\Disk Write Bytes/sec','\\GPU Engine(*)\\Utilization Percentage'
+            foreach ($counter in $sample.CounterSamples) {
+              $path = $counter.Path.ToLowerInvariant()
+              $value = [double]$counter.CookedValue
+              if ($path -like '*processor information(_total)*% processor utility*') { if ($value -ge 0) { $cpuLoad = [math]::Max($cpuLoad, $value) } }
+              elseif ($path -like '*processor(_total)*% processor time*' -and $cpuLoad -lt 0) { if ($value -ge 0) { $cpuLoad = [math]::Max($cpuLoad, $value) } }
+              elseif ($path -like '*network interface(*)*bytes received/sec*' -or $path -like '*network interface(*\\)*bytes received/sec*') { if ($value -gt 0) { $netRecv += $value } }
+              elseif ($path -like '*network interface(*)*bytes sent/sec*' -or $path -like '*network interface(*\\)*bytes sent/sec*') { if ($value -gt 0) { $netSent += $value } }
+              elseif ($path -like '*physicaldisk(_total)*disk read bytes/sec*') { if ($value -gt 0) { $diskRead += $value } }
+              elseif ($path -like '*physicaldisk(_total)*disk write bytes/sec*') { if ($value -gt 0) { $diskWrite += $value } }
+              elseif ($path -like '*gpu engine(*engtype_3d)*utilization percentage*' -or $path -like '*gpu engine(*engtype_compute_0)*utilization percentage*') { if ($value -gt $gpuLoad) { $gpuLoad = $value } }
+            }
+
+            $dllCandidates = @(
+              'C:\\Program Files\\LibreHardwareMonitor\\LibreHardwareMonitorLib.dll',
+              'C:\\Program Files\\LibreHardwareMonitor\\LibreHardwareMonitor\\LibreHardwareMonitorLib.dll',
+              'C:\\Program Files\\LibreHardwareMonitor\\Lib\\LibreHardwareMonitorLib.dll',
+              'C:\\Program Files (x86)\\LibreHardwareMonitor\\LibreHardwareMonitorLib.dll',
+              'C:\\Program Files (x86)\\LibreHardwareMonitor\\LibreHardwareMonitor\\LibreHardwareMonitorLib.dll',
+              'C:\\Program Files (x86)\\LibreHardwareMonitor\\Lib\\LibreHardwareMonitorLib.dll',
+              'C:\\Program Files\\OpenHardwareMonitor\\OpenHardwareMonitorLib.dll',
+              'C:\\Program Files\\OpenHardwareMonitor\\OpenHardwareMonitor\\OpenHardwareMonitorLib.dll',
+              'C:\\Program Files (x86)\\OpenHardwareMonitor\\OpenHardwareMonitorLib.dll',
+              'C:\\Program Files (x86)\\OpenHardwareMonitor\\OpenHardwareMonitor\\OpenHardwareMonitorLib.dll'
+            ) | Select-Object -Unique
+
+            foreach ($dllPath in $dllCandidates) {
+              try {
+                if (-not (Test-Path $dllPath)) { continue }
+                Add-SensorAttempt ('DLL ' + [System.IO.Path]::GetFileName($dllPath))
+                if ($dllPath -like '*LibreHardwareMonitor*') {
+                  Add-Type -Path $dllPath
+                  $computer = New-Object LibreHardwareMonitor.Hardware.Computer
+                  $origin = 'LibreHardwareMonitor DLL'
+                } else {
+                  Add-Type -Path $dllPath
+                  $computer = New-Object OpenHardwareMonitor.Hardware.Computer
+                  $origin = 'OpenHardwareMonitor DLL'
+                }
+                if ($computer.PSObject.Properties.Match('IsCpuEnabled').Count -gt 0) { $computer.IsCpuEnabled = $true }
+                if ($computer.PSObject.Properties.Match('CPUEnabled').Count -gt 0) { $computer.CPUEnabled = $true }
+                if ($computer.PSObject.Properties.Match('IsGpuEnabled').Count -gt 0) { $computer.IsGpuEnabled = $true }
+                if ($computer.PSObject.Properties.Match('GPUEnabled').Count -gt 0) { $computer.GPUEnabled = $true }
+                if ($computer.PSObject.Properties.Match('IsMotherboardEnabled').Count -gt 0) { $computer.IsMotherboardEnabled = $true }
+                if ($computer.PSObject.Properties.Match('MainboardEnabled').Count -gt 0) { $computer.MainboardEnabled = $true }
+                if ($computer.PSObject.Properties.Match('IsControllerEnabled').Count -gt 0) { $computer.IsControllerEnabled = $true }
+                $computer.Open()
+                foreach ($hardware in $computer.Hardware) {
+                  Update-HardwareTree $hardware
+                  foreach ($sensor in $hardware.Sensors) {
+                    if ([string]$sensor.SensorType -ne 'Temperature') { continue }
+                    Set-TemperatureFromSensor $origin ([string]$hardware.HardwareType) ([string]$hardware.Name) ([string]$sensor.Name) ([string]$sensor.Identifier) ([double]$sensor.Value)
+                  }
+                  foreach ($sub in $hardware.SubHardware) {
+                    try {
+                      foreach ($sensor in $sub.Sensors) {
+                        if ([string]$sensor.SensorType -ne 'Temperature') { continue }
+                        Set-TemperatureFromSensor $origin ([string]$sub.HardwareType) ([string]$sub.Name) ([string]$sensor.Name) ([string]$sensor.Identifier) ([double]$sensor.Value)
+                      }
+                    } catch {}
+                  }
+                }
+                try { $computer.Close() } catch {}
+                if ($cpuTemp -ge 0 -and $gpuTemp -ge 0) { break }
+              } catch { Add-SensorAttempt ('DLL failed ' + [System.IO.Path]::GetFileName($dllPath)); Add-SensorError(('DLL ' + [System.IO.Path]::GetFileName($dllPath)), $_.Exception.Message) }
+            }
+
+            $sensorNamespaces = @('root/LibreHardwareMonitor','root/OpenHardwareMonitor')
+            foreach ($ns in $sensorNamespaces) {
+              try {
+                Add-SensorAttempt ('WMI ' + $ns)
+                $sensors = Get-CimInstance -Namespace $ns -ClassName Sensor
+                if (-not $sensors) { $sensors = Get-WmiObject -Namespace $ns -Class Sensor }
+                foreach ($sensor in $sensors) {
+                  if ([string]$sensor.SensorType -ne 'Temperature') { continue }
+                  Set-TemperatureFromSensor $ns ([string]$sensor.HardwareType) ([string]$sensor.Parent) ([string]$sensor.Name) ([string]$sensor.Identifier) ([double]$sensor.Value)
+                }
+                if ($cpuTemp -ge 0 -and $gpuTemp -ge 0) { break }
+              } catch { Add-SensorAttempt ('WMI failed ' + $ns); Add-SensorError(('WMI ' + $ns), $_.Exception.Message) }
+            }
+
+            if ($cpuTemp -lt 0) {
+              try {
+                Add-SensorAttempt('Core Temp Shared Memory')
+                $mappingNames = @('CoreTempMappingObjectEx', 'CoreTempMappingObject')
+                foreach ($mappingName in $mappingNames) {
+                  try {
+                    $mmf = [System.IO.MemoryMappedFiles.MemoryMappedFile]::OpenExisting($mappingName)
+                    $view = $mmf.CreateViewStream(0, 0, [System.IO.MemoryMappedFiles.MemoryMappedFileAccess]::Read)
+                    $reader = New-Object System.IO.BinaryReader($view)
+                    $view.Position = 1536
+                    $coreCount = $reader.ReadUInt32()
+                    $cpuCount = $reader.ReadUInt32()
+                    $temps = @()
+                    for ($i = 0; $i -lt [Math]::Min([int]$coreCount, 256); $i++) {
+                      $tempValue = $reader.ReadSingle()
+                      if ($tempValue -gt 0) {
+                        $temps += [double]$tempValue
+                      }
+                    }
+                    $view.Position = 2684
+                    $fahrenheit = $reader.ReadByte()
+                    $deltaToTjMax = $reader.ReadByte()
+                    $null = $reader.ReadByte()
+                    $null = $reader.ReadByte()
+                    $view.Position = 1024
+                    $tjMax = $reader.ReadUInt32()
+                    if ($temps.Count -gt 0) {
+                      if ($deltaToTjMax -ne 0 -and $tjMax -gt 0) {
+                        $temps = $temps | ForEach-Object { [double]$tjMax - $_ }
+                      }
+                      if ($fahrenheit -ne 0) {
+                        $temps = $temps | ForEach-Object { ([double]$_ - 32.0) * 5.0 / 9.0 }
+                      }
+                      $cpuTemp = [Math]::Round(($temps | Measure-Object -Maximum).Maximum, 1)
+                      $cpuSensorSource = 'Core Temp Shared Memory'
+                      $cpuSensorMatch = $mappingName + ' / max-core'
+                      $reader.Close()
+                      $view.Close()
+                      $mmf.Dispose()
+                      break
+                    }
+                    $reader.Close()
+                    $view.Close()
+                    $mmf.Dispose()
+                  } catch {}
+                }
+              } catch { Add-SensorAttempt('Core Temp Shared Memory failed'); Add-SensorError('Core Temp Shared Memory', $_.Exception.Message) }
+            }
+
+            if ($cpuTemp -lt 0 -or $gpuTemp -lt 0) {
+              try {
+                Add-SensorAttempt('HWiNFO Shared Memory')
+                $mappingNames = @('Global\\HWiNFO_SENS_SM2', 'HWiNFO_SENS_SM2')
+                foreach ($mappingName in $mappingNames) {
+                  try {
+                    $mmf = [System.IO.MemoryMappedFiles.MemoryMappedFile]::OpenExisting($mappingName)
+                    $view = $mmf.CreateViewStream(0, 0, [System.IO.MemoryMappedFiles.MemoryMappedFileAccess]::Read)
+                    $reader = New-Object System.IO.BinaryReader($view)
+                    $signature = [System.Text.Encoding]::ASCII.GetString($reader.ReadBytes(4))
+                    if ($signature -ne 'HWiN') {
+                      $reader.Close()
+                      $view.Close()
+                      $mmf.Dispose()
+                      continue
+                    }
+                    $null = $reader.ReadUInt32()
+                    $null = $reader.ReadUInt32()
+                    $null = $reader.ReadUInt64()
+                    $null = $reader.ReadUInt32()
+                    $null = $reader.ReadUInt32()
+                    $null = $reader.ReadUInt32()
+                    $readingOffset = $reader.ReadUInt32()
+                    $readingSize = $reader.ReadUInt32()
+                    $readingCount = $reader.ReadUInt32()
+                    for ($i = 0; $i -lt [Math]::Min([int]$readingCount, 4096); $i++) {
+                      $view.Position = $readingOffset + ($i * $readingSize)
+                      $null = $reader.ReadUInt32()
+                      $null = $reader.ReadUInt32()
+                      $null = $reader.ReadUInt32()
+                      $labelOrig = ([System.Text.Encoding]::ASCII.GetString($reader.ReadBytes(128))).Split([char]0)[0]
+                      $labelUser = ([System.Text.Encoding]::ASCII.GetString($reader.ReadBytes(128))).Split([char]0)[0]
+                      $unit = ([System.Text.Encoding]::ASCII.GetString($reader.ReadBytes(16))).Split([char]0)[0]
+                      $value = $reader.ReadDouble()
+                      $null = $reader.ReadDouble()
+                      $null = $reader.ReadDouble()
+                      $null = $reader.ReadDouble()
+                      if ([string]::IsNullOrWhiteSpace($unit) -or $unit -notmatch 'C') { continue }
+                      $label = if ([string]::IsNullOrWhiteSpace($labelUser)) { $labelOrig } else { $labelUser }
+                      if ([string]::IsNullOrWhiteSpace($label)) { continue }
+                      Set-TemperatureFromSensor 'HWiNFO Shared Memory' '' $label $label $label ([double]$value)
+                    }
+                    $reader.Close()
+                    $view.Close()
+                    $mmf.Dispose()
+                    if ($cpuTemp -ge 0 -and $gpuTemp -ge 0) { break }
+                  } catch {}
+                }
+              } catch { Add-SensorAttempt('HWiNFO Shared Memory failed'); Add-SensorError('HWiNFO Shared Memory', $_.Exception.Message) }
+            }
+
+            if ($cpuTemp -lt 0) {
+              try {
+                Add-SensorAttempt('MSAcpi_ThermalZoneTemperature')
+                $zones = Get-CimInstance -Namespace root/wmi -ClassName MSAcpi_ThermalZoneTemperature
+                if (-not $zones) { $zones = Get-WmiObject -Namespace root/wmi -Class MSAcpi_ThermalZoneTemperature }
+                $zone = $zones | Where-Object { $_.CurrentTemperature -gt 0 } | Select-Object -First 1
+                if ($zone) {
+                  $cpuTemp = [math]::Round(($zone.CurrentTemperature / 10.0) - 273.15, 1)
+                  $cpuSensorSource = 'MSAcpi_ThermalZoneTemperature'
+                  $cpuSensorMatch = [string]$zone.InstanceName
+                }
+              } catch { Add-SensorAttempt('MSAcpi_ThermalZoneTemperature failed'); Add-SensorError('MSAcpi_ThermalZoneTemperature', $_.Exception.Message) }
+            }
+
+            if ($cpuTemp -lt 0) {
+              try {
+                Add-SensorAttempt('Thermal Zone Counters')
+                $thermalCounter = Get-Counter '\\Thermal Zone Information(*)\\Temperature'
+                $thermalSample = $thermalCounter.CounterSamples | Where-Object { $_.CookedValue -gt 0 } | Sort-Object CookedValue -Descending | Select-Object -First 1
+                if ($thermalSample) {
+                  $cpuTemp = [double]$thermalSample.CookedValue
+                  $cpuSensorSource = 'Thermal Zone Counter'
+                  $cpuSensorMatch = [string]$thermalSample.Path
+                }
+              } catch { Add-SensorAttempt('Thermal Zone Counters failed'); Add-SensorError('Thermal Zone Counters', $_.Exception.Message) }
+            }
+
+            if ($gpuTemp -lt 0) {
+              try {
+                Add-SensorAttempt('nvidia-smi')
+                $nvidiaSmi = Get-Command nvidia-smi.exe -ErrorAction SilentlyContinue
+                if ($nvidiaSmi) {
+                  $gpuLine = & $nvidiaSmi.Source '--query-gpu=temperature.gpu' '--format=csv,noheader,nounits' 2>$null | Select-Object -First 1
+                  if ($gpuLine) {
+                    $gpuTemp = [double]($gpuLine.ToString().Trim())
+                    $gpuSensorSource = 'nvidia-smi'
+                    $gpuSensorMatch = 'temperature.gpu'
+                  }
+                }
+              } catch { Add-SensorAttempt('nvidia-smi failed'); Add-SensorError('nvidia-smi', $_.Exception.Message) }
+            }
+
+            $attemptText = if ($sensorAttempts.Count -gt 0) { ' | Tried: ' + (($sensorAttempts | Select-Object -Unique) -join ', ') } else { '' }
+            $errorText = if ($sensorErrors.Count -gt 0) { (($sensorErrors | Select-Object -Unique) -join ' | ') } else { 'none' }
+            $sensorSource = 'CPU: ' + $cpuSensorSource + ' [' + $cpuSensorMatch + '] | GPU: ' + $gpuSensorSource + ' [' + $gpuSensorMatch + ']' + $attemptText
+            $result = @{
+              bridgeActive = $true
+              counterSource = $counterSource
+              sensorSource = $sensorSource
+              sensorErrorCode = $errorText
+              cpuCoreLoadPercent = $cpuLoad
+              gpuCoreLoadPercent = $gpuLoad
+              gpuTemperatureC = $gpuTemp
+              cpuTemperatureC = $cpuTemp
+              bytesReceivedPerSecond = [int64][math]::Round($netRecv)
+              bytesSentPerSecond = [int64][math]::Round($netSent)
+              diskReadBytesPerSecond = [int64][math]::Round($diskRead)
+              diskWriteBytesPerSecond = [int64][math]::Round($diskWrite)
+            }
+            $result | ConvertTo-Json -Compress
+            """;
+
+    private final AtomicBoolean requestInFlight = new AtomicBoolean(false);
+    private volatile Sample latest = Sample.empty();
+    private volatile long lastRequestAtMillis;
+
+    boolean isSupported() {
+        return System.getProperty("os.name", "").toLowerCase(Locale.ROOT).contains("win");
+    }
+
+    void requestRefreshIfNeeded() {
+        if (!isSupported()) {
+            latest = Sample.empty();
+            return;
+        }
+
+        long now = System.currentTimeMillis();
+        if (now - lastRequestAtMillis < ConfigManager.getMetricsUpdateIntervalMs() || !requestInFlight.compareAndSet(false, true)) {
+            return;
+        }
+        lastRequestAtMillis = now;
+
+        Thread thread = new Thread(this::runRefresh, "taskmanager-windows-telemetry");
+        thread.setDaemon(true);
+        thread.start();
+    }
+
+    Sample getLatest() {
+        return latest;
+    }
+
+    private void runRefresh() {
+        try {
+            Process process = new ProcessBuilder("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", SCRIPT)
+                    .redirectErrorStream(true)
+                    .start();
+            byte[] output = readAll(process.getInputStream());
+            int exitCode = process.waitFor();
+            if (exitCode != 0) {
+                latest = Sample.empty();
+                return;
+            }
+            String json = new String(output, StandardCharsets.UTF_8).trim();
+            if (json.isEmpty()) {
+                latest = Sample.empty();
+                return;
+            }
+            JsonObject root = JsonParser.parseString(json).getAsJsonObject();
+            latest = new Sample(
+                    getBoolean(root, "bridgeActive"),
+                    getString(root, "counterSource"),
+                    getString(root, "sensorSource"),
+                    getString(root, "sensorErrorCode"),
+                    getDouble(root, "cpuCoreLoadPercent"),
+                    getDouble(root, "gpuCoreLoadPercent"),
+                    getDouble(root, "gpuTemperatureC"),
+                    getDouble(root, "cpuTemperatureC"),
+                    getLong(root, "bytesReceivedPerSecond"),
+                    getLong(root, "bytesSentPerSecond"),
+                    getLong(root, "diskReadBytesPerSecond"),
+                    getLong(root, "diskWriteBytesPerSecond")
+            );
+        } catch (Exception e) {
+            latest = Sample.empty();
+            taskmanagerClient.LOGGER.debug("Windows telemetry bridge failed: {}", e.getMessage());
+        } finally {
+            requestInFlight.set(false);
+        }
+    }
+
+    private byte[] readAll(InputStream inputStream) throws Exception {
+        try (InputStream in = inputStream; ByteArrayOutputStream out = new ByteArrayOutputStream()) {
+            in.transferTo(out);
+            return out.toByteArray();
+        }
+    }
+
+    private boolean getBoolean(JsonObject root, String key) {
+        if (!root.has(key) || root.get(key).isJsonNull()) return false;
+        try {
+            return root.get(key).getAsBoolean();
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    private String getString(JsonObject root, String key) {
+        if (!root.has(key) || root.get(key).isJsonNull()) return "Unavailable";
+        try {
+            String value = root.get(key).getAsString();
+            return value == null || value.isBlank() ? "Unavailable" : value;
+        } catch (Exception ignored) {
+            return "Unavailable";
+        }
+    }
+
+    private double getDouble(JsonObject root, String key) {
+        if (!root.has(key) || root.get(key).isJsonNull()) return -1;
+        try {
+            double value = root.get(key).getAsDouble();
+            return Double.isFinite(value) ? value : -1;
+        } catch (Exception ignored) {
+            return -1;
+        }
+    }
+
+    private long getLong(JsonObject root, String key) {
+        if (!root.has(key) || root.get(key).isJsonNull()) return -1;
+        try {
+            return root.get(key).getAsLong();
+        } catch (Exception ignored) {
+            return -1;
+        }
+    }
+}
+
