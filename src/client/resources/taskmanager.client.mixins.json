@@ -5,16 +5,19 @@
   "compatibilityLevel": "JAVA_21",
   "client": [
     "GameRendererMixin",
+    "MouseMixin",
+    "MinecraftClientMixin",
+    "MinecraftServerMixin",
     "SkyRenderingMixin",
-    "WorldRendererMixin"
+    "WorldRendererMixin",
+    "ArrayBackedEventMixin",
+    "ClientConnectionMixin",
+    "FabricLoaderImplMixin"
   ],
   "injectors": {
     "defaultRequire": 1
   },
   "overwrites": {
     "requireAnnotations": true
-  },
-  "mixins": [
-    "ArrayBackedEventMixin"
-  ]
+  }
 }

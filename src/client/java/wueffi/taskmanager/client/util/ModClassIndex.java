@@ -3,7 +3,6 @@ package wueffi.taskmanager.client.util;
 import net.fabricmc.loader.api.FabricLoader;
 import net.fabricmc.loader.api.ModContainer;
 
-import java.net.URL;
 import java.nio.file.Path;
 import java.security.CodeSource;
 import java.util.HashMap;
@@ -25,7 +24,8 @@ public class ModClassIndex {
                 try {
                     String normalized = normalizePath(root.toUri().toURL().toString());
                     normalizedRootToMod.put(normalized, modId);
-                } catch (Exception ignored) {}
+                } catch (Exception ignored) {
+                }
             }
         }
     }
@@ -33,10 +33,10 @@ public class ModClassIndex {
     public static String getModForClassName(Class<?> clazz) {
         if (!built) build();
 
-        String className = clazz.getName()
-                .replaceAll("\\$\\$Lambda.*", "")
-                .replaceAll("\\$\\d+$", "");
-
+        String className = sanitizeClassName(clazz.getName());
+        if (className == null || className.isBlank()) {
+            return null;
+        }
         if (cache.containsKey(className)) return cache.get(className);
 
         String classSource = null;
@@ -45,7 +45,8 @@ public class ModClassIndex {
             if (cs != null && cs.getLocation() != null) {
                 classSource = normalizePath(cs.getLocation().toString());
             }
-        } catch (Exception ignored) {}
+        } catch (Exception ignored) {
+        }
 
         if (classSource != null) {
             for (Map.Entry<String, String> entry : normalizedRootToMod.entrySet()) {
@@ -57,6 +58,54 @@ public class ModClassIndex {
         }
 
         cache.put(className, null);
+        return null;
+    }
+
+    public static String getModForClassName(String rawClassName) {
+        if (!built) build();
+
+        String className = sanitizeClassName(rawClassName);
+        if (className == null || className.isBlank()) {
+            return null;
+        }
+
+        if (cache.containsKey(className)) {
+            return cache.get(className);
+        }
+
+        try {
+            Class<?> clazz = Class.forName(className, false, ModClassIndex.class.getClassLoader());
+            return getModForClassName(clazz);
+        } catch (Throwable ignored) {
+            cache.put(className, null);
+            return null;
+        }
+    }
+
+    private static String sanitizeClassName(String rawClassName) {
+        if (rawClassName == null || rawClassName.isBlank()) {
+            return rawClassName;
+        }
+
+        String className = rawClassName
+                .replace('/', '.')
+                .replaceAll("\\$\\$Lambda.*", "")
+                .replaceAll("\\$\\d+$", "")
+                .replaceAll("\\$Subclass\\d+", "")
+                .replaceAll("\\$MixinProxy.*", "");
+
+        if (!className.startsWith("[")) {
+            return className;
+        }
+
+        while (className.startsWith("[")) {
+            className = className.substring(1);
+        }
+
+        if (className.startsWith("L") && className.endsWith(";")) {
+            return className.substring(1, className.length() - 1).replace('/', '.');
+        }
+
         return null;
     }
 

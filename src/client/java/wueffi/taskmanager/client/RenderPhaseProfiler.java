@@ -1,19 +1,25 @@
 package wueffi.taskmanager.client;
 
-import java.util.*;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.LongAdder;
 
 public class RenderPhaseProfiler {
 
     private static final RenderPhaseProfiler INSTANCE = new RenderPhaseProfiler();
     public static RenderPhaseProfiler getInstance() { return INSTANCE; }
 
-    private static final long WINDOW_NS = 20_000_000_000L;
+    private static class Counter {
+        final LongAdder cpuNanos = new LongAdder();
+        final LongAdder cpuCalls = new LongAdder();
+        final LongAdder gpuNanos = new LongAdder();
+        final LongAdder gpuCalls = new LongAdder();
+    }
 
-    private record TimedEntry(String phase, long cpuNs, long gpuNs, long cpuCalls, long gpuCalls, long timestamp) {}
+    public record PhaseSnapshot(long cpuNanos, long cpuCalls, long gpuNanos, long gpuCalls) {}
 
-    private final List<TimedEntry> entries = new CopyOnWriteArrayList<>();
+    private final Map<String, Counter> counters = new ConcurrentHashMap<>();
     private final Map<String, Long> cpuStart = new ConcurrentHashMap<>();
 
     public void beginCpuPhase(String phase) {
@@ -23,33 +29,62 @@ public class RenderPhaseProfiler {
     public void endCpuPhase(String phase) {
         Long start = cpuStart.remove(phase);
         if (start == null) return;
-        entries.add(new TimedEntry(phase, System.nanoTime() - start, 0L, 1L, 0L, System.nanoTime()));
+
+        long duration = System.nanoTime() - start;
+        Counter counter = counters.computeIfAbsent(phase, ignored -> new Counter());
+        counter.cpuNanos.add(duration);
+        counter.cpuCalls.increment();
     }
 
     public void recordGpuResult(String phase, long nanoseconds) {
-        entries.add(new TimedEntry(phase, 0L, nanoseconds, 0L, 1L, System.nanoTime()));
+        Counter counter = counters.computeIfAbsent(phase, ignored -> new Counter());
+        counter.gpuNanos.add(nanoseconds);
+        counter.gpuCalls.increment();
     }
 
-    private void evict() {
-        long cutoff = System.nanoTime() - WINDOW_NS;
-        entries.removeIf(e -> e.timestamp() < cutoff);
+    public Map<String, PhaseSnapshot> getSnapshot() {
+        Map<String, PhaseSnapshot> result = new LinkedHashMap<>();
+        counters.forEach((phase, counter) -> result.put(phase, new PhaseSnapshot(
+                counter.cpuNanos.sum(),
+                counter.cpuCalls.sum(),
+                counter.gpuNanos.sum(),
+                counter.gpuCalls.sum()
+        )));
+        return result;
     }
 
-    public Map<String, Long> getCpuNanos() { return aggregate(TimedEntry::cpuNs); }
-    public Map<String, Long> getCpuCalls()  { return aggregate(TimedEntry::cpuCalls); }
-    public Map<String, Long> getGpuNanos() { return aggregate(TimedEntry::gpuNs); }
-    public Map<String, Long> getGpuCalls()  { return aggregate(TimedEntry::gpuCalls); }
+    public Map<String, PhaseSnapshot> drainSnapshot() {
+        Map<String, PhaseSnapshot> result = getSnapshot();
+        reset();
+        return result;
+    }
 
-    private Map<String, Long> aggregate(java.util.function.ToLongFunction<TimedEntry> field) {
-        evict();
+    public Map<String, Long> getCpuNanos() {
         Map<String, Long> result = new LinkedHashMap<>();
-        for (TimedEntry e : entries) {
-            result.merge(e.phase(), field.applyAsLong(e), Long::sum);
-        }
+        getSnapshot().forEach((phase, snapshot) -> result.put(phase, snapshot.cpuNanos()));
+        return result;
+    }
+
+    public Map<String, Long> getCpuCalls() {
+        Map<String, Long> result = new LinkedHashMap<>();
+        getSnapshot().forEach((phase, snapshot) -> result.put(phase, snapshot.cpuCalls()));
+        return result;
+    }
+
+    public Map<String, Long> getGpuNanos() {
+        Map<String, Long> result = new LinkedHashMap<>();
+        getSnapshot().forEach((phase, snapshot) -> result.put(phase, snapshot.gpuNanos()));
+        return result;
+    }
+
+    public Map<String, Long> getGpuCalls() {
+        Map<String, Long> result = new LinkedHashMap<>();
+        getSnapshot().forEach((phase, snapshot) -> result.put(phase, snapshot.gpuCalls()));
         return result;
     }
 
     public void reset() {
-        entries.clear();
+        counters.clear();
+        cpuStart.clear();
     }
 }

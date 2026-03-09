@@ -20,24 +20,44 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 public class WorldRendererMixin {
 
     @Inject(
-        method = "render",
-        at = @At("HEAD")
+            method = "render",
+            at = @At("HEAD")
     )
     private void taskmanager$onRenderHead(
-            ObjectAllocator allocator, RenderTickCounter tickCounter, boolean renderBlockOutline, Camera camera, Matrix4f positionMatrix, Matrix4f projectionMatrix, GpuBufferSlice fog, Vector4f fogColor, boolean shouldRenderSky, CallbackInfo ci) {
-//        ObjectAllocator allocator, RenderTickCounter tickCounter, boolean renderBlockOutline, Camera camera, Matrix4f positionMatrix, Matrix4f matrix4f, Matrix4f projectionMatrix, GpuBufferSlice fogBuffer, Vector4f fogColor, boolean renderSky, CallbackInfo ci) {
+            ObjectAllocator allocator,
+            RenderTickCounter tickCounter,
+            boolean renderBlockOutline,
+            Camera camera,
+            Matrix4f positionMatrix,
+            Matrix4f matrix4f,          // NEW PARAM
+            Matrix4f projectionMatrix,
+            GpuBufferSlice fog,
+            Vector4f fogColor,
+            boolean shouldRenderSky,
+            CallbackInfo ci) {
+
         if (!TaskManagerScreen.isProfilingActive()) return;
         RenderPhaseProfiler.getInstance().beginCpuPhase("worldRenderer.render");
         GpuTimer.begin("worldRenderer.render");
     }
 
     @Inject(
-        method = "render",
-        at = @At("TAIL")
+            method = "render",
+            at = @At("TAIL")
     )
     private void taskmanager$onRenderTail(
-            ObjectAllocator allocator, RenderTickCounter tickCounter, boolean renderBlockOutline, Camera camera, Matrix4f positionMatrix, Matrix4f projectionMatrix, GpuBufferSlice fog, Vector4f fogColor, boolean shouldRenderSky, CallbackInfo ci) {
-//        ObjectAllocator allocator, RenderTickCounter tickCounter, boolean renderBlockOutline, Camera camera, Matrix4f positionMatrix, Matrix4f matrix4f, Matrix4f projectionMatrix, GpuBufferSlice fogBuffer, Vector4f fogColor, boolean renderSky, CallbackInfo ci) {
+            ObjectAllocator allocator,
+            RenderTickCounter tickCounter,
+            boolean renderBlockOutline,
+            Camera camera,
+            Matrix4f positionMatrix,
+            Matrix4f matrix4f,          // NEW PARAM
+            Matrix4f projectionMatrix,
+            GpuBufferSlice fog,
+            Vector4f fogColor,
+            boolean shouldRenderSky,
+            CallbackInfo ci) {
+
         if (!TaskManagerScreen.isProfilingActive()) return;
         GpuTimer.end("worldRenderer.render");
         RenderPhaseProfiler.getInstance().endCpuPhase("worldRenderer.render");
