@@ -122,6 +122,11 @@ public class TaskManagerScreen extends Screen {
     private MemorySort memorySort = MemorySort.MEMORY_MB;
     private boolean memorySortDescending = true;
     private WorldMiniTab worldMiniTab = WorldMiniTab.LAG_MAP;
+    private float uiScale = 1.0f;
+    private float uiOffsetX = 0.0f;
+    private float uiOffsetY = 0.0f;
+    private int layoutWidth;
+    private int layoutHeight;
     private ProfilerManager.ProfilerSnapshot snapshot = ProfilerManager.getInstance().getCurrentSnapshot();
 
     public TaskManagerScreen() {
@@ -153,17 +158,25 @@ public class TaskManagerScreen extends Screen {
     @Override
     public void render(DrawContext ctx, int mouseX, int mouseY, float delta) {
         snapshot = ProfilerManager.getInstance().getCurrentSnapshot();
+        updateUiScale();
+        int logicalMouseX = toLogicalX(mouseX);
+        int logicalMouseY = toLogicalY(mouseY);
 
-        int w = this.width;
-        int h = this.height;
+        ctx.fill(0, 0, this.width, this.height, BG_COLOR);
+        ctx.getMatrices().pushMatrix();
+        ctx.getMatrices().translate(uiOffsetX, uiOffsetY);
+        ctx.getMatrices().scale(uiScale, uiScale);
+
+        int w = getScreenWidth();
+        int h = getScreenHeight();
 
         ctx.fill(0, 0, w, h, BG_COLOR);
         ctx.fill(0, 0, w, 30, 0xFF0A0A0A);
         ctx.drawText(textRenderer, "Task Manager", PADDING, 6, TEXT_PRIMARY, false);
 
-        renderModeButton(ctx, mouseX, mouseY);
-        renderHudToggle(ctx, mouseX, mouseY);
-        renderExportButton(ctx, mouseX, mouseY);
+        renderModeButton(ctx, logicalMouseX, logicalMouseY);
+        renderHudToggle(ctx, logicalMouseX, logicalMouseY);
+        renderExportButton(ctx, logicalMouseX, logicalMouseY);
 
         double clientTickMs = TickProfiler.getInstance().getAverageClientTickNs() / 1_000_000.0;
         double serverTickMs = TickProfiler.getInstance().getAverageServerTickNs() / 1_000_000.0;
@@ -198,20 +211,50 @@ public class TaskManagerScreen extends Screen {
         ctx.fill(0, contentY, w, h, PANEL_COLOR);
         ctx.fill(0, contentY, w, contentY + 1, BORDER_COLOR);
 
-        if (activeTab == 0) renderTasks(ctx, 0, contentY, w, contentH, mouseX, mouseY);
-        else if (activeTab == 1) renderGpu(ctx, 0, contentY, w, contentH, mouseX, mouseY);
-        else if (activeTab == 2) renderRender(ctx, 0, contentY, w, contentH, mouseX, mouseY);
-        else if (activeTab == 3) renderStartup(ctx, 0, contentY, w, contentH, mouseX, mouseY);
-        else if (activeTab == 4) renderMemory(ctx, 0, contentY, w, contentH, mouseX, mouseY);
+        if (activeTab == 0) renderTasks(ctx, 0, contentY, w, contentH, logicalMouseX, logicalMouseY);
+        else if (activeTab == 1) renderGpu(ctx, 0, contentY, w, contentH, logicalMouseX, logicalMouseY);
+        else if (activeTab == 2) renderRender(ctx, 0, contentY, w, contentH, logicalMouseX, logicalMouseY);
+        else if (activeTab == 3) renderStartup(ctx, 0, contentY, w, contentH, logicalMouseX, logicalMouseY);
+        else if (activeTab == 4) renderMemory(ctx, 0, contentY, w, contentH, logicalMouseX, logicalMouseY);
         else if (activeTab == 5) renderFlamegraph(ctx, 0, contentY, w, contentH);
         else if (activeTab == 6) renderTimeline(ctx, 0, contentY, w, contentH);
         else if (activeTab == 7) renderNetwork(ctx, 0, contentY, w, contentH);
         else if (activeTab == 8) renderDisk(ctx, 0, contentY, w, contentH);
         else if (activeTab == 9) renderWorldTab(ctx, 0, contentY, w, contentH);
         else if (activeTab == 10) renderSystem(ctx, 0, contentY, w, contentH);
-        else renderSettings(ctx, 0, contentY, w, contentH, mouseX, mouseY);
+        else renderSettings(ctx, 0, contentY, w, contentH, logicalMouseX, logicalMouseY);
 
+        ctx.getMatrices().popMatrix();
         super.render(ctx, mouseX, mouseY, delta);
+    }
+
+    private void updateUiScale() {
+        float widthScale = this.width / 1180.0f;
+        float heightScale = this.height / 760.0f;
+        uiScale = Math.min(1.0f, Math.min(widthScale, heightScale));
+        if (uiScale <= 0.0f) {
+            uiScale = 1.0f;
+        }
+        layoutWidth = Math.max(1, Math.round(this.width / uiScale));
+        layoutHeight = Math.max(1, Math.round(this.height / uiScale));
+        uiOffsetX = (this.width - (layoutWidth * uiScale)) / 2.0f;
+        uiOffsetY = (this.height - (layoutHeight * uiScale)) / 2.0f;
+    }
+
+    private int getScreenWidth() {
+        return layoutWidth > 0 ? layoutWidth : this.width;
+    }
+
+    private int getScreenHeight() {
+        return layoutHeight > 0 ? layoutHeight : this.height;
+    }
+
+    private int toLogicalX(double mouseX) {
+        return Math.round((float) ((mouseX - uiOffsetX) / uiScale));
+    }
+
+    private int toLogicalY(double mouseY) {
+        return Math.round((float) ((mouseY - uiOffsetY) / uiScale));
     }
 
     private int getTabY() {
@@ -239,7 +282,7 @@ public class TaskManagerScreen extends Screen {
     private int renderSectionHeader(DrawContext ctx, int x, int y, String title, String subtitle) {
         ctx.drawText(textRenderer, title, x, y, TEXT_PRIMARY, false);
         if (subtitle != null && !subtitle.isBlank()) {
-            ctx.drawText(textRenderer, textRenderer.trimToWidth(subtitle, Math.max(120, this.width - (x * 2))), x, y + 12, TEXT_DIM, false);
+            ctx.drawText(textRenderer, textRenderer.trimToWidth(subtitle, Math.max(120, getScreenWidth() - (x * 2))), x, y + 12, TEXT_DIM, false);
             return y + 28;
         }
         return y + 16;
@@ -256,7 +299,7 @@ public class TaskManagerScreen extends Screen {
     }
 
     private void renderHudToggle(DrawContext ctx, int mouseX, int mouseY) {
-        int checkX = width - 254;
+        int checkX = getScreenWidth() - 254;
         int checkY = 3;
         int chipW = 96;
         int chipH = 14;
@@ -269,7 +312,7 @@ public class TaskManagerScreen extends Screen {
     }
 
     private void renderExportButton(DrawContext ctx, int mouseX, int mouseY) {
-        int x = width - 118;
+        int x = getScreenWidth() - 118;
         int y = 3;
         int w = 110;
         int h = 14;
@@ -1430,8 +1473,8 @@ public class TaskManagerScreen extends Screen {
 
 
     public boolean mouseClicked(Click click, boolean doubled) {
-        double mouseX = click.x();
-        double mouseY = click.y();
+        double mouseX = toLogicalX(click.x());
+        double mouseY = toLogicalY(click.y());
         focusedSearchTable = null;
 
         if (isInside(mouseX, mouseY, PADDING + 106, 3, 128, 14)) {
@@ -1439,18 +1482,18 @@ public class TaskManagerScreen extends Screen {
             return true;
         }
 
-        if (isInside(mouseX, mouseY, width - 250, 5, 90, 12)) {
+        if (isInside(mouseX, mouseY, getScreenWidth() - 250, 5, 90, 12)) {
             ConfigManager.setHudEnabled(!ConfigManager.isHudEnabled());
             return true;
         }
 
-        if (isInside(mouseX, mouseY, width - 116, 4, 108, 12)) {
+        if (isInside(mouseX, mouseY, getScreenWidth() - 116, 4, 108, 12)) {
             ProfilerManager.getInstance().exportSession();
             return true;
         }
 
         int tabY = getTabY();
-        int tabW = Math.max(66, Math.min(84, (width - (PADDING * 2) - ((TAB_NAMES.length - 1) * 2)) / TAB_NAMES.length));
+        int tabW = Math.max(66, Math.min(84, (getScreenWidth() - (PADDING * 2) - ((TAB_NAMES.length - 1) * 2)) / TAB_NAMES.length));
         for (int i = 0; i < TAB_NAMES.length; i++) {
             int tx = PADDING + i * (tabW + 2);
             if (isInside(mouseX, mouseY, tx, tabY, tabW, TAB_HEIGHT)) {
@@ -1462,8 +1505,8 @@ public class TaskManagerScreen extends Screen {
         }
 
         if (activeTab == 0) {
-            int detailW = Math.min(420, Math.max(320, width / 3));
-            int listW = width - detailW - PADDING;
+            int detailW = Math.min(420, Math.max(320, getScreenWidth() / 3));
+            int listW = getScreenWidth() - detailW - PADDING;
             if (isInside(mouseX, mouseY, listW - 160, getContentY() + PADDING + 24, 152, 16)) {
                 focusedSearchTable = TableId.TASKS;
                 return true;
@@ -1479,8 +1522,8 @@ public class TaskManagerScreen extends Screen {
         }
 
         if (activeTab == 1) {
-            int detailW = Math.min(420, Math.max(320, width / 3));
-            int listW = width - detailW - PADDING;
+            int detailW = Math.min(420, Math.max(320, getScreenWidth() / 3));
+            int listW = getScreenWidth() - detailW - PADDING;
             if (isInside(mouseX, mouseY, listW - 160, getContentY() + PADDING + 24, 152, 16)) {
                 focusedSearchTable = TableId.GPU;
                 return true;
@@ -1496,8 +1539,8 @@ public class TaskManagerScreen extends Screen {
         }
 
         if (activeTab == 4) {
-            int sharedPanelW = snapshot.sharedMemoryFamilies().isEmpty() ? 0 : Math.min(280, Math.max(220, this.width / 4));
-            int tableW = this.width - sharedPanelW - (sharedPanelW > 0 ? PADDING : 0);
+            int sharedPanelW = snapshot.sharedMemoryFamilies().isEmpty() ? 0 : Math.min(280, Math.max(220, getScreenWidth() / 4));
+            int tableW = getScreenWidth() - sharedPanelW - (sharedPanelW > 0 ? PADDING : 0);
             if (isInside(mouseX, mouseY, tableW - 160, getContentY() + PADDING, 152, 16)) {
                 focusedSearchTable = TableId.MEMORY;
                 return true;
@@ -1540,11 +1583,12 @@ public class TaskManagerScreen extends Screen {
         if (activeTab == 11) {
             int left = PADDING;
             int top = getContentY() + PADDING + 18 - scrollOffset;
-            int[] offsets = {0, 22, 44, 94, 116, 138, 160, 182, 204, 226, 248, 270, 292, 314, 336, 358, 410, 432, 454, 476, 498, 520, 542, 564, 586, 608, 630};
+            int[] offsets = {0, 22, 44, 66, 116, 138, 160, 182, 204, 226, 248, 270, 292, 314, 336, 358, 380, 432, 454, 476, 498, 520, 542, 564, 586, 608, 630, 652};
             Runnable[] actions = {
                 () -> ProfilerManager.getInstance().toggleSessionLogging(),
                 ConfigManager::cycleSessionDurationSeconds,
                 ConfigManager::cycleMetricsUpdateIntervalMs,
+                ConfigManager::cycleProfilerUpdateDelayMs,
                 () -> ConfigManager.setHudEnabled(!ConfigManager.isHudEnabled()),
                 ConfigManager::cycleHudPosition,
                 ConfigManager::cycleHudLayoutMode,
@@ -1571,7 +1615,7 @@ public class TaskManagerScreen extends Screen {
                 () -> ConfigManager.toggleMemoryColumn("pct")
             };
             for (int i = 0; i < offsets.length; i++) {
-                if (isInside(mouseX, mouseY, left, top + offsets[i], width - 16, 16)) {
+                if (isInside(mouseX, mouseY, left, top + offsets[i], getScreenWidth() - 16, 16)) {
                     actions[i].run();
                     return true;
                 }
@@ -1584,6 +1628,8 @@ public class TaskManagerScreen extends Screen {
 
     @Override
     public boolean mouseScrolled(double mouseX, double mouseY, double horizontalAmount, double verticalAmount) {
+        mouseX = toLogicalX(mouseX);
+        mouseY = toLogicalY(mouseY);
         int maxScroll = getMaxScrollOffset();
         if (maxScroll <= 0) {
             scrollOffset = 0;
@@ -1594,7 +1640,7 @@ public class TaskManagerScreen extends Screen {
     }
 
     private int getMaxScrollOffset() {
-        int visibleHeight = Math.max(1, this.height - getContentY() - PADDING);
+        int visibleHeight = Math.max(1, getScreenHeight() - getContentY() - PADDING);
         int contentHeight = switch (activeTab) {
             case 0 -> Math.max(visibleHeight, 40 + (snapshot.cpuMods().size() * ROW_HEIGHT));
             case 1 -> Math.max(visibleHeight, 40 + ((int) snapshot.cpuMods().values().stream().filter(entry -> entry.renderSamples() > 0).count() * ROW_HEIGHT));
@@ -1838,7 +1884,7 @@ public class TaskManagerScreen extends Screen {
         if (activeTab != 0) {
             return null;
         }
-        int detailW = Math.min(420, Math.max(320, width / 3));
+        int detailW = Math.min(420, Math.max(320, getScreenWidth() / 3));
         int listW = width - detailW - PADDING;
         return findRowAt(mouseX, mouseY, getContentY() + PADDING + 66, listW, getTaskRows());
     }
@@ -1847,7 +1893,7 @@ public class TaskManagerScreen extends Screen {
         if (activeTab != 1) {
             return null;
         }
-        int detailW = Math.min(420, Math.max(320, width / 3));
+        int detailW = Math.min(420, Math.max(320, getScreenWidth() / 3));
         int listW = width - detailW - PADDING;
         return findRowAt(mouseX, mouseY, getContentY() + PADDING + 66, listW, getGpuRows());
     }
@@ -1856,8 +1902,8 @@ public class TaskManagerScreen extends Screen {
         if (activeTab != 4) {
             return null;
         }
-        int sharedPanelW = snapshot.sharedMemoryFamilies().isEmpty() ? 0 : Math.min(280, Math.max(220, this.width / 4));
-        int tableW = this.width - sharedPanelW - (sharedPanelW > 0 ? PADDING : 0);
+        int sharedPanelW = snapshot.sharedMemoryFamilies().isEmpty() ? 0 : Math.min(280, Math.max(220, getScreenWidth() / 4));
+        int tableW = getScreenWidth() - sharedPanelW - (sharedPanelW > 0 ? PADDING : 0);
         return findRowAt(mouseX, mouseY, getContentY() + PADDING + 110, tableW, getMemoryRows());
     }
 
@@ -1867,8 +1913,8 @@ public class TaskManagerScreen extends Screen {
         if (activeTab != 4 || sharedFamilies.isEmpty()) {
             return null;
         }
-        int sharedPanelW = Math.min(280, Math.max(220, this.width / 4));
-        int panelX = this.width - sharedPanelW;
+        int sharedPanelW = Math.min(280, Math.max(220, getScreenWidth() / 4));
+        int panelX = getScreenWidth() - sharedPanelW;
         int rowY = getContentY() + PADDING + 118 - scrollOffset;
         for (String family : sharedFamilies.keySet()) {
             if (isInside(mouseX, mouseY, panelX, rowY - 2, sharedPanelW, 12)) {
@@ -1881,20 +1927,26 @@ public class TaskManagerScreen extends Screen {
 
     private ChunkPos findLagMapChunkAt(double mouseX, double mouseY) {
         MinecraftClient client = MinecraftClient.getInstance();
-        if (client.player == null || client.world == null || activeTab != 9) {
+        if (client.player == null || client.world == null || activeTab != 9 || worldMiniTab != WorldMiniTab.LAG_MAP) {
             return null;
         }
+
         int left = PADDING;
-        int top = getContentY() + PADDING + 30 - scrollOffset;
-        int mapWidth = Math.min(260, this.width - 24);
-        int mapHeight = Math.min(260, this.height - getContentY() - 32);
+        int top = getFullPageScrollTop(getContentY());
+        top += 26; // Matches renderSectionHeader spacing for the World tab.
+        top += 24; // Mini-tab row.
+
+        int mapWidth = Math.min(260, getScreenWidth() - 24);
+        int mapHeight = Math.min(260, getScreenHeight() - getContentY() - 32);
         int radius = 4;
-        int cell = Math.max(12, Math.min(20, Math.min(mapWidth, mapHeight) / ((radius * 2) + 1)));
+        int cell = Math.max(12, Math.min(20, Math.min(mapWidth, mapHeight - 18) / ((radius * 2) + 1)));
+        int mapTop = top + 14; // Matches renderLagMap title offset.
+
         ChunkPos playerChunk = client.player.getChunkPos();
         for (int dz = -radius; dz <= radius; dz++) {
             for (int dx = -radius; dx <= radius; dx++) {
                 int px = left + (dx + radius) * cell;
-                int py = top + (dz + radius) * cell;
+                int py = mapTop + (dz + radius) * cell;
                 if (mouseX >= px && mouseX < px + cell && mouseY >= py && mouseY < py + cell) {
                     return new ChunkPos(playerChunk.x + dx, playerChunk.z + dz);
                 }
@@ -2274,6 +2326,8 @@ public class TaskManagerScreen extends Screen {
         drawMetricRow(ctx, left, top, w - 24, "Session Duration", ConfigManager.getSessionDurationSeconds() + "s");
         top += 22;
         drawMetricRow(ctx, left, top, w - 24, "Metrics Update Interval", ConfigManager.getMetricsUpdateIntervalMs() + "ms");
+        top += 22;
+        drawMetricRow(ctx, left, top, w - 24, "Profiler Update Delay", ConfigManager.getProfilerUpdateDelayMs() + "ms");
         top += 32;
         ctx.drawText(textRenderer, "HUD Settings", left, top, TEXT_PRIMARY, false);
         top += 18;

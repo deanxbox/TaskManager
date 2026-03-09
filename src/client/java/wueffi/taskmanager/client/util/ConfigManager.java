@@ -138,6 +138,24 @@ public class ConfigManager {
         saveConfig();
     }
 
+    public static int getProfilerUpdateDelayMs() {
+        return Math.clamp(config.profilerUpdateDelayMs, 50, 2000);
+    }
+
+    public static void cycleProfilerUpdateDelayMs() {
+        int current = getProfilerUpdateDelayMs();
+        int next = switch (current) {
+            case 50 -> 100;
+            case 100 -> 250;
+            case 250 -> 500;
+            case 500 -> 1000;
+            case 1000 -> 2000;
+            default -> 50;
+        };
+        config.profilerUpdateDelayMs = next;
+        saveConfig();
+    }
+
     public static boolean isHudShowFps() { return config.hudShowFps; }
     public static boolean isHudShowFrame() { return config.hudShowFrame; }
     public static boolean isHudShowTicks() { return config.hudShowTicks; }
@@ -255,6 +273,9 @@ public class ConfigManager {
         if (config.metricsUpdateIntervalMs <= 0) {
             config.metricsUpdateIntervalMs = 500;
         }
+        if (config.profilerUpdateDelayMs <= 0) {
+            config.profilerUpdateDelayMs = 100;
+        }
         if (config.tasksColumns == null || config.tasksColumns.isBlank()) {
             config.tasksColumns = "cpu,threads,samples,invokes";
         }
@@ -275,6 +296,7 @@ public class ConfigManager {
         public String hudLayoutMode = HudLayoutMode.SINGLE_COLUMN.name();
         public int sessionDurationSeconds = 30;
         public int metricsUpdateIntervalMs = 500;
+        public int profilerUpdateDelayMs = 100;
         public boolean hudShowFps = true;
         public boolean hudShowFrame = true;
         public boolean hudShowTicks = true;

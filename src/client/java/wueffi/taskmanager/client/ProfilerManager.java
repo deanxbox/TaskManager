@@ -247,11 +247,12 @@ public class ProfilerManager {
     private volatile boolean sessionRecorded;
     private volatile long sessionRecordedAtMillis;
     private long lastSeenFrameSequence = 0;
+    private long lastSnapshotPublishedAtMillis = 0L;
 
     public void initialize() {
         mode = ConfigManager.getCaptureMode();
         CpuSamplingProfiler.getInstance().start();
-        publishSnapshot();
+        publishSnapshot(true);
     }
 
     public void onScreenOpened() {
@@ -265,14 +266,14 @@ public class ProfilerManager {
             TickProfiler.getInstance().reset();
         }
         MemoryProfiler.getInstance().sampleJvm();
-        publishSnapshot();
+        publishSnapshot(true);
     }
 
     public void onScreenClosed() {
         screenOpen = false;
         if (mode == CaptureMode.OPEN_ONLY) {
             clearRollingWindows();
-            publishSnapshot();
+            publishSnapshot(true);
         }
     }
 
@@ -284,7 +285,7 @@ public class ProfilerManager {
         this.mode = mode;
         ConfigManager.setCaptureMode(mode);
         clearRollingWindows();
-        publishSnapshot();
+        publishSnapshot(true);
     }
 
     public boolean isCaptureActive() {
@@ -329,7 +330,7 @@ public class ProfilerManager {
     public void toggleSessionLogging() {
         if (sessionLogging) {
             sessionLogging = false;
-            publishSnapshot();
+            publishSnapshot(true);
             return;
         }
         sessionHistory.clear();
@@ -341,7 +342,7 @@ public class ProfilerManager {
         sessionRecorded = false;
         sessionRecordedAtMillis = 0L;
         sessionLoggingStartedAtMillis = System.currentTimeMillis();
-        publishSnapshot();
+        publishSnapshot(true);
     }
 
     public void onClientTickEnd(MinecraftClient client) {
@@ -361,7 +362,7 @@ public class ProfilerManager {
 
         if (!isCaptureActive()) {
             enforceSessionWindow(client);
-            publishSnapshot();
+            publishSnapshot(false);
             return;
         }
 
@@ -384,7 +385,7 @@ public class ProfilerManager {
         captureStutterJumpSnapshot(client);
         recordSessionPoint();
         enforceSessionWindow(client);
-        publishSnapshot(cpuWindow.lastSampleAgeMillis());
+        publishSnapshot(false, cpuWindow.lastSampleAgeMillis());
     }
 
     public java.util.List<SessionPoint> getSessionHistory() {
@@ -886,10 +887,23 @@ public class ProfilerManager {
     }
 
     private void publishSnapshot() {
-        publishSnapshot(Long.MAX_VALUE);
+        publishSnapshot(false, Long.MAX_VALUE);
+    }
+
+    private void publishSnapshot(boolean force) {
+        publishSnapshot(force, Long.MAX_VALUE);
     }
 
     private void publishSnapshot(long cpuSampleAgeMillis) {
+        publishSnapshot(false, cpuSampleAgeMillis);
+    }
+
+    private void publishSnapshot(boolean force, long cpuSampleAgeMillis) {
+        long now = System.currentTimeMillis();
+        if (!force && lastSnapshotPublishedAtMillis != 0L && now - lastSnapshotPublishedAtMillis < ConfigManager.getProfilerUpdateDelayMs()) {
+            return;
+        }
+        lastSnapshotPublishedAtMillis = now;
         Map<String, CpuSamplingProfiler.Snapshot> cpu = aggregateCpuWindows();
         Map<String, CpuSamplingProfiler.DetailSnapshot> cpuDetails = aggregateCpuDetailWindows();
         Map<String, ModTimingSnapshot> modInvokes = aggregateModWindows();
