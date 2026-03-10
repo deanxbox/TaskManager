@@ -8,7 +8,7 @@ public class FrameTimelineProfiler {
     public static FrameTimelineProfiler getInstance() { return INSTANCE; }
 
     private static final int SIZE = 300;
-    private static final long FPS_WINDOW_NS = 500_000_000L;
+    private static final long FPS_WINDOW_NS = 50_000_000L;
 
     private final long[] frameTimes = new long[SIZE];
     private final long[] frameTimestamps = new long[SIZE];
@@ -38,7 +38,7 @@ public class FrameTimelineProfiler {
         long elapsed = now - fpsWindowStartNs;
         if (elapsed >= FPS_WINDOW_NS) {
             double measuredFps = fpsWindowFrames * 1_000_000_000.0 / elapsed;
-            currentFps = currentFps == 0.0 ? measuredFps : (currentFps * 0.7) + (measuredFps * 0.3);
+            currentFps = currentFps == 0.0 ? measuredFps : (currentFps * 0.35) + (measuredFps * 0.65);
             fpsWindowFrames = 0;
             fpsWindowStartNs = now;
         }

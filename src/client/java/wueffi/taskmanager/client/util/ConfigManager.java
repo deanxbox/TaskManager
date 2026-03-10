@@ -123,16 +123,18 @@ public class ConfigManager {
     }
 
     public static int getMetricsUpdateIntervalMs() {
-        return Math.max(250, config.metricsUpdateIntervalMs);
+        return Math.clamp(config.metricsUpdateIntervalMs, 50, 2000);
     }
 
     public static void cycleMetricsUpdateIntervalMs() {
         int current = getMetricsUpdateIntervalMs();
         int next = switch (current) {
+            case 50 -> 100;
+            case 100 -> 250;
             case 250 -> 500;
             case 500 -> 1000;
             case 1000 -> 2000;
-            default -> 250;
+            default -> 50;
         };
         config.metricsUpdateIntervalMs = next;
         saveConfig();
@@ -153,6 +155,22 @@ public class ConfigManager {
             default -> 50;
         };
         config.profilerUpdateDelayMs = next;
+        saveConfig();
+    }
+
+
+    public static int getCpuGraphColor() { return parseColor(config.cpuGraphColor, 0xFF5EA9FF); }
+    public static int getGpuGraphColor() { return parseColor(config.gpuGraphColor, 0xFF77DD77); }
+
+    public static String getCpuGraphColorHex() { return normalizeColorHex(config.cpuGraphColor, 0xFF5EA9FF); }
+    public static String getGpuGraphColorHex() { return normalizeColorHex(config.gpuGraphColor, 0xFF77DD77); }
+
+    public static void setCpuGraphColorHex(String value) { config.cpuGraphColor = normalizeColorHex(value, 0xFF5EA9FF); saveConfig(); }
+    public static void setGpuGraphColorHex(String value) { config.gpuGraphColor = normalizeColorHex(value, 0xFF77DD77); saveConfig(); }
+
+    public static void resetGraphColors() {
+        config.cpuGraphColor = "#5EA9FF";
+        config.gpuGraphColor = "#77DD77";
         saveConfig();
     }
 
@@ -188,6 +206,28 @@ public class ConfigManager {
     public static boolean isTasksColumnVisible(String key) { return isColumnVisible(config.tasksColumns, key); }
     public static boolean isGpuColumnVisible(String key) { return isColumnVisible(config.gpuColumns, key); }
     public static boolean isMemoryColumnVisible(String key) { return isColumnVisible(config.memoryColumns, key); }
+
+    public static String getTasksSearch() { return config.tasksSearch == null ? "" : config.tasksSearch; }
+    public static String getGpuSearch() { return config.gpuSearch == null ? "" : config.gpuSearch; }
+    public static String getMemorySearch() { return config.memorySearch == null ? "" : config.memorySearch; }
+    public static String getStartupSearch() { return config.startupSearch == null ? "" : config.startupSearch; }
+    public static String getTaskSort() { return config.taskSort == null || config.taskSort.isBlank() ? "CPU" : config.taskSort; }
+    public static boolean isTaskSortDescending() { return config.taskSortDescending; }
+    public static String getGpuSort() { return config.gpuSort == null || config.gpuSort.isBlank() ? "EST_GPU" : config.gpuSort; }
+    public static boolean isGpuSortDescending() { return config.gpuSortDescending; }
+    public static String getMemorySort() { return config.memorySort == null || config.memorySort.isBlank() ? "MEMORY_MB" : config.memorySort; }
+    public static boolean isMemorySortDescending() { return config.memorySortDescending; }
+    public static String getStartupSort() { return config.startupSort == null || config.startupSort.isBlank() ? "ACTIVE" : config.startupSort; }
+    public static boolean isStartupSortDescending() { return config.startupSortDescending; }
+
+    public static void setTasksSearch(String value) { config.tasksSearch = value == null ? "" : value; saveConfig(); }
+    public static void setGpuSearch(String value) { config.gpuSearch = value == null ? "" : value; saveConfig(); }
+    public static void setMemorySearch(String value) { config.memorySearch = value == null ? "" : value; saveConfig(); }
+    public static void setStartupSearch(String value) { config.startupSearch = value == null ? "" : value; saveConfig(); }
+    public static void setTaskSortState(String sort, boolean descending) { config.taskSort = sort; config.taskSortDescending = descending; saveConfig(); }
+    public static void setGpuSortState(String sort, boolean descending) { config.gpuSort = sort; config.gpuSortDescending = descending; saveConfig(); }
+    public static void setMemorySortState(String sort, boolean descending) { config.memorySort = sort; config.memorySortDescending = descending; saveConfig(); }
+    public static void setStartupSortState(String sort, boolean descending) { config.startupSort = sort; config.startupSortDescending = descending; saveConfig(); }
 
     public static void toggleTasksColumn(String key) { config.tasksColumns = toggleColumn(config.tasksColumns, key); saveConfig(); }
     public static void toggleGpuColumn(String key) { config.gpuColumns = toggleColumn(config.gpuColumns, key); saveConfig(); }
@@ -226,6 +266,25 @@ public class ConfigManager {
         } catch (IOException e) {
             e.printStackTrace();
         }
+    }
+
+    private static String normalizeColorHex(String value, int fallback) {
+        if (value == null) {
+            return String.format("#%06X", fallback & 0xFFFFFF);
+        }
+        String trimmed = value.trim().toUpperCase();
+        if (trimmed.startsWith("#")) {
+            trimmed = trimmed.substring(1);
+        }
+        if (trimmed.length() == 6 && trimmed.matches("[0-9A-F]{6}")) {
+            return "#" + trimmed;
+        }
+        return String.format("#%06X", fallback & 0xFFFFFF);
+    }
+
+    private static int parseColor(String value, int fallback) {
+        String normalized = normalizeColorHex(value, fallback);
+        return 0xFF000000 | Integer.parseInt(normalized.substring(1), 16);
     }
 
     private static boolean isColumnVisible(String csv, String key) {
@@ -271,7 +330,7 @@ public class ConfigManager {
             config.sessionDurationSeconds = 30;
         }
         if (config.metricsUpdateIntervalMs <= 0) {
-            config.metricsUpdateIntervalMs = 500;
+            config.metricsUpdateIntervalMs = 100;
         }
         if (config.profilerUpdateDelayMs <= 0) {
             config.profilerUpdateDelayMs = 100;
@@ -285,6 +344,18 @@ public class ConfigManager {
         if (config.memoryColumns == null || config.memoryColumns.isBlank()) {
             config.memoryColumns = "classes,mb,pct";
         }
+        if (config.tasksSearch == null) config.tasksSearch = "";
+        if (config.gpuSearch == null) config.gpuSearch = "";
+        if (config.memorySearch == null) config.memorySearch = "";
+        if (config.startupSearch == null) config.startupSearch = "";
+        if (config.taskSort == null || config.taskSort.isBlank()) config.taskSort = "CPU";
+        if (config.gpuSort == null || config.gpuSort.isBlank()) config.gpuSort = "EST_GPU";
+        if (config.memorySort == null || config.memorySort.isBlank()) config.memorySort = "MEMORY_MB";
+        if (config.startupSort == null || config.startupSort.isBlank()) config.startupSort = "ACTIVE";
+        if ((config.cpuGraphColor == null || config.cpuGraphColor.isBlank()) && config.cpuIntelColor != null) config.cpuGraphColor = config.cpuIntelColor;
+        if ((config.gpuGraphColor == null || config.gpuGraphColor.isBlank()) && config.gpuNvidiaColor != null) config.gpuGraphColor = config.gpuNvidiaColor;
+        config.cpuGraphColor = normalizeColorHex(config.cpuGraphColor, 0xFF5EA9FF);
+        config.gpuGraphColor = normalizeColorHex(config.gpuGraphColor, 0xFF77DD77);
         saveConfig();
     }
 
@@ -295,7 +366,7 @@ public class ConfigManager {
         public String hudPosition = HudPosition.TOP_LEFT.name();
         public String hudLayoutMode = HudLayoutMode.SINGLE_COLUMN.name();
         public int sessionDurationSeconds = 30;
-        public int metricsUpdateIntervalMs = 500;
+        public int metricsUpdateIntervalMs = 100;
         public int profilerUpdateDelayMs = 100;
         public boolean hudShowFps = true;
         public boolean hudShowFrame = true;
@@ -311,5 +382,27 @@ public class ConfigManager {
         public String tasksColumns = "cpu,threads,samples,invokes";
         public String gpuColumns = "pct,threads,gpums,rsamples";
         public String memoryColumns = "classes,mb,pct";
+        public String tasksSearch = "";
+        public String gpuSearch = "";
+        public String memorySearch = "";
+        public String startupSearch = "";
+        public String taskSort = "CPU";
+        public boolean taskSortDescending = true;
+        public String gpuSort = "EST_GPU";
+        public boolean gpuSortDescending = true;
+        public String memorySort = "MEMORY_MB";
+        public boolean memorySortDescending = true;
+        public String startupSort = "ACTIVE";
+        public boolean startupSortDescending = true;
+        public String cpuGraphColor = "#5EA9FF";
+        public String gpuGraphColor = "#77DD77";
+        public String cpuIntelColor = "#5EA9FF";
+        public String cpuAmdColor = "#FF6B6B";
+        public String gpuNvidiaColor = "#77DD77";
+        public String gpuAmdColor = "#FF6B6B";
+        public String gpuIntegratedColor = "#5EA9FF";
     }
 }
+
+
+

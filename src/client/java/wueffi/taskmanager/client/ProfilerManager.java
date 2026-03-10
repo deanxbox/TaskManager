@@ -13,6 +13,7 @@ import wueffi.taskmanager.client.util.ConfigManager;
 import wueffi.taskmanager.client.util.ModTimingSnapshot;
 
 import java.io.IOException;
+import java.lang.management.ManagementFactory;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayDeque;
@@ -58,7 +59,28 @@ public class ProfilerManager {
 
     public record BlockEntityHotspot(String className, int count, String heuristic) {}
 
-    public record RuleFinding(String severity, String category, String message, String confidence) {}
+    public record RuleFinding(String severity, String category, String message, String confidence, String details, String nextStep, String metricSummary) {}
+
+    public record ExportMetadata(
+            String taskManagerVersion,
+            String minecraftVersion,
+            String fabricLoaderVersion,
+            String osName,
+            String osVersion,
+            String javaVersion,
+            String cpuInfo,
+            String gpuInfo,
+            int guiScale,
+            String captureMode,
+            String hudTriggerMode,
+            java.util.List<String> modList,
+            double consistentFps,
+            double onePercentLowFps,
+            double pointOnePercentLowFps,
+            java.util.List<String> jvmLaunchArguments,
+            java.util.Map<String, Object> minecraftSettings,
+            java.util.Map<String, Object> graphicsModSettings
+    ) {}
 
     public record SpikeCapture(
             long capturedAtEpochMillis,
@@ -395,6 +417,7 @@ public class ProfilerManager {
     public String exportSession() {
         Map<String, Object> export = new LinkedHashMap<>();
         export.put("generatedAtEpochMillis", System.currentTimeMillis());
+        export.put("metadata", buildExportMetadata());
         export.put("captureMode", mode.name());
         export.put("sessionDurationSeconds", ConfigManager.getSessionDurationSeconds());
         export.put("entityCounts", latestEntityCounts);
@@ -420,6 +443,11 @@ public class ProfilerManager {
         export.put("diagnosis", buildDiagnosis());
         export.put("spikes", new ArrayList<>(spikes));
         export.put("sessionPoints", new ArrayList<>(sessionHistory));
+        export.put("frameTimeTimelineMs", FrameTimelineProfiler.getInstance().getOrderedFrameMsHistory());
+        export.put("fpsTimeline", FrameTimelineProfiler.getInstance().getOrderedFpsHistory());
+        export.put("chunkPipelineTimeline", buildChunkPipelineTimeline());
+        export.put("startupRows", currentSnapshot.startupRows());
+        export.put("startupSummary", buildStartupSummary());
         export.put("currentSnapshot", currentSnapshot);
 
         Path dir = FabricLoader.getInstance().getGameDir().resolve("taskmanager-sessions");
@@ -653,7 +681,199 @@ public class ProfilerManager {
         summary.put("topMemoryMods", buildTopMemoryModSummary());
         summary.put("hotChunkSummary", latestHotChunks.isEmpty() ? null : latestHotChunks.getFirst());
         summary.put("blockEntityClasses", latestBlockEntityHotspots);
+        summary.put("startupSummary", buildStartupSummary());
+        summary.put("metadata", buildExportMetadata());
         return summary;
+    }
+
+    private Map<String, Object> buildStartupSummary() {
+        Map<String, Object> startup = new LinkedHashMap<>();
+        List<StartupTimingProfiler.StartupRow> rows = currentSnapshot.startupRows();
+        startup.put("spanMs", Math.max(0.0, (currentSnapshot.startupLast() - currentSnapshot.startupFirst()) / 1_000_000.0));
+        startup.put("mods", rows.size());
+        startup.put("measuredEntrypoints", rows.stream().anyMatch(StartupTimingProfiler.StartupRow::measuredEntrypoints));
+        startup.put("measuredRows", rows.stream().filter(StartupTimingProfiler.StartupRow::measuredEntrypoints).count());
+        startup.put("fallbackRows", rows.stream().filter(row -> !row.measuredEntrypoints()).count());
+        startup.put("topMods", rows.stream().limit(6).map(row -> Map.of(
+                "mod", row.modId(),
+                "activeMs", row.activeNanos() / 1_000_000.0,
+                "entrypoints", row.entrypoints(),
+                "registrations", row.registrations(),
+                "stage", row.stageSummary(),
+                "definition", row.definitionSummary()
+        )).toList());
+        startup.put("slowestMods", rows.stream().limit(10).map(row -> Map.of(
+                "mod", row.modId(),
+                "displayName", FabricLoader.getInstance().getModContainer(row.modId()).map(mod -> mod.getMetadata().getName()).orElse(row.modId()),
+                "activeMs", row.activeNanos() / 1_000_000.0,
+                "startMs", (row.first() - currentSnapshot.startupFirst()) / 1_000_000.0,
+                "endMs", (row.last() - currentSnapshot.startupFirst()) / 1_000_000.0,
+                "entrypoints", row.entrypoints(),
+                "registrations", row.registrations(),
+                "measured", row.measuredEntrypoints(),
+                "stage", row.stageSummary(),
+                "definition", row.definitionSummary()
+        )).toList());
+        startup.put("entrypointHeavyMods", rows.stream().sorted((a, b) -> Integer.compare(b.entrypoints(), a.entrypoints())).limit(5).map(row -> Map.of(
+                "mod", row.modId(),
+                "entrypoints", row.entrypoints(),
+                "activeMs", row.activeNanos() / 1_000_000.0
+        )).toList());
+        startup.put("registrationHeavyMods", rows.stream().sorted((a, b) -> Integer.compare(b.registrations(), a.registrations())).limit(5).map(row -> Map.of(
+                "mod", row.modId(),
+                "registrations", row.registrations(),
+                "activeMs", row.activeNanos() / 1_000_000.0
+        )).toList());
+        return startup;
+    }
+
+    private ExportMetadata buildExportMetadata() {
+        MinecraftClient client = MinecraftClient.getInstance();
+        String taskManagerVersion = FabricLoader.getInstance().getModContainer("taskmanager")
+                .map(mod -> mod.getMetadata().getVersion().getFriendlyString())
+                .orElse("unknown");
+        String minecraftVersion = FabricLoader.getInstance().getModContainer("minecraft")
+                .map(mod -> mod.getMetadata().getVersion().getFriendlyString())
+                .orElse("unknown");
+        String loaderVersion = FabricLoader.getInstance().getModContainer("fabricloader")
+                .map(mod -> mod.getMetadata().getVersion().getFriendlyString())
+                .orElse("unknown");
+        String cpuInfo = System.getenv("PROCESSOR_IDENTIFIER");
+        if (cpuInfo == null || cpuInfo.isBlank()) {
+            cpuInfo = System.getProperty("os.arch", "unknown");
+        }
+        SystemMetricsProfiler.Snapshot system = SystemMetricsProfiler.getInstance().getSnapshot();
+        String gpuInfo = (system.gpuVendor() == null || system.gpuVendor().isBlank() ? "Unknown GPU" : system.gpuVendor())
+                + " | " + (system.gpuRenderer() == null || system.gpuRenderer().isBlank() ? "Unknown renderer" : system.gpuRenderer());
+        int guiScale = client != null ? client.options.getGuiScale().getValue() : -1;
+        java.util.List<String> modList = FabricLoader.getInstance().getAllMods().stream()
+                .map(mod -> mod.getMetadata().getId() + "@" + mod.getMetadata().getVersion().getFriendlyString())
+                .sorted()
+                .toList();
+        FrameTimelineProfiler frames = FrameTimelineProfiler.getInstance();
+        return new ExportMetadata(
+                taskManagerVersion,
+                minecraftVersion,
+                loaderVersion,
+                System.getProperty("os.name", "unknown"),
+                System.getProperty("os.version", "unknown"),
+                System.getProperty("java.version", "unknown"),
+                cpuInfo,
+                gpuInfo,
+                guiScale,
+                mode.name(),
+                ConfigManager.getHudTriggerMode().name(),
+                modList,
+                computeConsistentFps(frames),
+                frames.getOnePercentLowFps(),
+                frames.getPointOnePercentLowFps(),
+                ManagementFactory.getRuntimeMXBean().getInputArguments(),
+                buildMinecraftSettings(client),
+                buildGraphicsModSettings(client)
+        );
+    }
+
+    private double computeConsistentFps(FrameTimelineProfiler frames) {
+        double[] history = frames.getOrderedFpsHistory();
+        if (history.length == 0) return 0.0;
+        double[] copy = java.util.Arrays.copyOf(history, history.length);
+        java.util.Arrays.sort(copy);
+        return copy[copy.length / 2];
+    }
+
+    private Map<String, Object> buildMinecraftSettings(MinecraftClient client) {
+        Map<String, Object> settings = new LinkedHashMap<>();
+        if (client == null) return settings;
+        settings.put("renderDistance", client.options.getViewDistance().getValue());
+        settings.put("simulationDistance", client.options.getSimulationDistance().getValue());
+        settings.put("entityDistanceScale", client.options.getEntityDistanceScaling().getValue());
+        settings.put("guiScale", client.options.getGuiScale().getValue());
+        settings.put("vsync", readOptionValue(client.options, "getEnableVsync"));
+        settings.put("maxFramerate", readOptionValue(client.options, "getMaxFps"));
+        return settings;
+    }
+
+    private Map<String, Object> buildGraphicsModSettings(MinecraftClient client) {
+        Map<String, Object> settings = new LinkedHashMap<>();
+        settings.put("irisDetected", FabricLoader.getInstance().isModLoaded("iris"));
+        settings.put("sodiumDetected", FabricLoader.getInstance().isModLoaded("sodium"));
+        settings.put("shaderPack", detectShaderPackName());
+        settings.put("chunkUpdateThreads", detectSodiumChunkThreads());
+        return settings;
+    }
+
+    private Object readOptionValue(Object options, String methodName) {
+        if (options == null) return "unavailable";
+        try {
+            Object option = options.getClass().getMethod(methodName).invoke(options);
+            if (option == null) return "unavailable";
+            try {
+                return option.getClass().getMethod("getValue").invoke(option);
+            } catch (ReflectiveOperationException ignored) {
+                return option.toString();
+            }
+        } catch (ReflectiveOperationException e) {
+            return "unavailable";
+        }
+    }
+
+    private String detectShaderPackName() {
+        Path gameDir = FabricLoader.getInstance().getGameDir();
+        for (Path candidate : List.of(gameDir.resolve("config/iris.properties"), gameDir.resolve("optionsshaders.txt"))) {
+            String value = readConfigValue(candidate, "shaderPack", "shaderPackName", "shader_pack", "packName");
+            if (value != null) {
+                return value;
+            }
+        }
+        return "best-effort unavailable";
+    }
+
+    private String detectSodiumChunkThreads() {
+        Path gameDir = FabricLoader.getInstance().getGameDir();
+        for (Path candidate : List.of(gameDir.resolve("config/sodium-options.json"), gameDir.resolve("config/sodium-options.json5"))) {
+            String value = readConfigValue(candidate, "chunkBuilderThreads", "chunk_build_threads", "chunkUpdateThreads");
+            if (value != null) {
+                return value;
+            }
+        }
+        return "runtime worker-derived";
+    }
+
+    private String readConfigValue(Path path, String... keys) {
+        try {
+            if (!Files.exists(path)) {
+                return null;
+            }
+            String content = Files.readString(path);
+            for (String key : keys) {
+                Pattern pattern = Pattern.compile("(?:\"" + Pattern.quote(key) + "\"|" + Pattern.quote(key) + ")\s*[:=]\s*[\"]?([^\"\r\n,}]+)");
+                Matcher matcher = pattern.matcher(content);
+                if (matcher.find()) {
+                    String value = matcher.group(1).trim();
+                    if (!value.isBlank() && !"null".equalsIgnoreCase(value)) {
+                        return value;
+                    }
+                }
+            }
+        } catch (IOException ignored) {
+        }
+        return null;
+    }
+
+    private List<Map<String, Object>> buildChunkPipelineTimeline() {
+        List<Map<String, Object>> timeline = new ArrayList<>();
+        for (SessionPoint point : sessionHistory) {
+            Map<String, Object> row = new LinkedHashMap<>();
+            row.put("capturedAtEpochMillis", point.capturedAtEpochMillis());
+            row.put("chunksGenerating", point.chunksGenerating());
+            row.put("chunksMeshing", point.chunksMeshing());
+            row.put("chunksUploading", point.chunksUploading());
+            row.put("lightsUpdatePending", point.lightsUpdatePending());
+            row.put("chunkMeshesRebuilt", point.chunkMeshesRebuilt());
+            row.put("chunkMeshesUploaded", point.chunkMeshesUploaded());
+            timeline.add(row);
+        }
+        return timeline;
     }
 
     private Map<String, Object> buildSensorDiagnostics(SystemMetricsProfiler.Snapshot system) {
@@ -1055,50 +1275,141 @@ public class ProfilerManager {
         SystemMetricsProfiler.Snapshot system = SystemMetricsProfiler.getInstance().getSnapshot();
         double latestFrameMs = FrameTimelineProfiler.getInstance().getLatestFrameNs() / 1_000_000.0;
         double serverTickMs = TickProfiler.getInstance().getAverageServerTickNs() / 1_000_000.0;
+        double clientTickMs = TickProfiler.getInstance().getAverageClientTickNs() / 1_000_000.0;
+        double stutterScore = FrameTimelineProfiler.getInstance().getStutterScore();
+        double heapUsedPct = currentSnapshot.memory().heapCommittedBytes() > 0
+                ? currentSnapshot.memory().heapUsedBytes() * 100.0 / currentSnapshot.memory().heapCommittedBytes()
+                : 0.0;
+
         if (system.gpuCoreLoadPercent() > 90.0 && latestFrameMs > 16.7 && serverTickMs < 15.0) {
-            findings.add(new RuleFinding("warning", "gpu", "GPU appears saturated while logic stays healthy.", "measured"));
+            findings.add(new RuleFinding(latestFrameMs > 33.0 && system.gpuCoreLoadPercent() > 97.0 ? "critical" : "warning", "gpu", "GPU appears saturated while logic stays healthy.", "measured",
+                    "The render path is spending time on the GPU while server-side logic remains within budget.",
+                    "Check heavy shader packs, high-resolution effects, and the GPU tab's hottest render phases.",
+                    String.format(Locale.ROOT, "GPU %.0f%% | frame %.1f ms | server %.1f ms", system.gpuCoreLoadPercent(), latestFrameMs, serverTickMs)));
         }
         if (serverTickMs > 40.0) {
-            findings.add(new RuleFinding("warning", "logic", String.format("Server tick is elevated at %.1f ms.", serverTickMs), "measured"));
+            findings.add(new RuleFinding(serverTickMs > 80.0 ? "critical" : "warning", "logic", String.format(Locale.ROOT, "Server tick is elevated at %.1f ms.", serverTickMs), "measured",
+                    "Integrated-server work is exceeding a comfortable frame budget and will usually show up as simulation hitching.",
+                    "Inspect the World tab for hot chunks, block entities, and thread wait activity around the same window.",
+                    String.format(Locale.ROOT, "server %.1f ms | client %.1f ms | stutter %.1f", serverTickMs, clientTickMs, stutterScore)));
         }
         if (system.diskWriteBytesPerSecond() > 8L * 1024L * 1024L && latestFrameMs > 50.0) {
-            findings.add(new RuleFinding("warning", "io", "Heavy disk writes overlap with a bad frame spike.", "measured"));
+            findings.add(new RuleFinding(system.diskWriteBytesPerSecond() > 24L * 1024L * 1024L ? "critical" : "warning", "io", "Heavy disk writes overlap with a bad frame spike.", "measured",
+                    "High write throughput is coinciding with a visible hitch and may point to saves, chunk flushes, or logging bursts.",
+                    "Check the Disk tab and world activity for saves, region writes, or mods with frequent persistence.",
+                    String.format(Locale.ROOT, "writes %s | frame %.1f ms", formatBytesPerSecond(system.diskWriteBytesPerSecond()), latestFrameMs)));
         }
-        if (system.activeHighLoadThreads() > Math.max(1, system.estimatedPhysicalCores() / 2) && FrameTimelineProfiler.getInstance().getStutterScore() > 10.0) {
-            findings.add(new RuleFinding("warning", "threads", "Thread overscheduling warning: too many high-load threads are active for the estimated physical core budget.", "inferred"));
+        if (system.activeHighLoadThreads() > Math.max(1, system.estimatedPhysicalCores() / 2) && stutterScore > 10.0) {
+            findings.add(new RuleFinding(system.activeHighLoadThreads() > Math.max(2, system.estimatedPhysicalCores()) ? "critical" : "warning", "threads", "Thread overscheduling warning: too many high-load threads are active for the estimated physical core budget.", "inferred",
+                    "Multiple hot threads are competing for a limited physical-core budget during a stutter window.",
+                    "Inspect the System tab's top threads and worker activity to see whether chunk builders or async workers are crowding the CPU.",
+                    String.format(Locale.ROOT, "high-load threads %d | est. physical cores %d | stutter %.1f", system.activeHighLoadThreads(), system.estimatedPhysicalCores(), stutterScore)));
         }
         if (!latestHotChunks.isEmpty() && serverTickMs > 20.0) {
             HotChunkSnapshot hot = latestHotChunks.getFirst();
-            findings.add(new RuleFinding("info", "chunks", String.format(Locale.ROOT, "Hot chunk %d,%d has %d entities and %d block entities.", hot.chunkX(), hot.chunkZ(), hot.entityCount(), hot.blockEntityCount()), "measured"));
+            findings.add(new RuleFinding("info", "chunks", String.format(Locale.ROOT, "Hot chunk %d,%d has %d entities and %d block entities.", hot.chunkX(), hot.chunkZ(), hot.entityCount(), hot.blockEntityCount()), "measured",
+                    "A single chunk is standing out in the current window and may be central to the slowdown.",
+                    "Select the chunk in the World tab and inspect entity density, block entities, and thread load together.",
+                    String.format(Locale.ROOT, "activity %.1f | entities %d | block entities %d", hot.activityScore(), hot.entityCount(), hot.blockEntityCount())));
         }
         if (!latestEntityHotspots.isEmpty()) {
             EntityHotspot hotspot = latestEntityHotspots.getFirst();
             if (!"none".equals(hotspot.heuristic())) {
-                findings.add(new RuleFinding("warning", "entities", hotspot.className() + " is dominating recent entity cost signals: " + hotspot.heuristic(), "inferred"));
+                findings.add(new RuleFinding(hotspot.count() >= 100 ? "critical" : "warning", "entities", hotspot.className() + " is dominating recent entity cost signals: " + hotspot.heuristic(), "inferred",
+                        "Recent world samples point to one entity family as the strongest source of per-chunk entity pressure.",
+                        "Inspect mob AI density, farms, and clustered spawns in the World tab near the hot chunk.",
+                        String.format(Locale.ROOT, "%s x%d", hotspot.className(), hotspot.count())));
             }
         }
         if (!latestBlockEntityHotspots.isEmpty()) {
             BlockEntityHotspot hotspot = latestBlockEntityHotspots.getFirst();
             if (hotspot.count() >= 20) {
-                findings.add(new RuleFinding("warning", "block-entities", hotspot.className() + " is dense across loaded chunks and may be ticking heavily.", "inferred"));
+                findings.add(new RuleFinding(hotspot.count() >= 60 ? "critical" : "warning", "block-entities", hotspot.className() + " is dense across loaded chunks and may be ticking heavily.", "inferred",
+                        "A block entity class is showing up frequently enough to plausibly drive ticking or storage pressure.",
+                        "Open the Block Entities mini-tab and inspect the selected chunk plus the global hotspot list.",
+                        String.format(Locale.ROOT, "%s x%d | %s", hotspot.className(), hotspot.count(), hotspot.heuristic())));
             }
         }
         if (!latestLockSummaries.isEmpty()) {
-            findings.add(new RuleFinding("info", "locks", latestLockSummaries.getFirst(), "measured"));
+            findings.add(new RuleFinding("info", "locks", latestLockSummaries.getFirst(), "measured",
+                    "A thread spent time blocked or waiting in the current window.",
+                    "Use the System tab to check the owning thread and see whether the wait lines up with chunk IO or background workers.",
+                    latestLockSummaries.getFirst()));
             boolean chunkIoLock = latestLockSummaries.stream()
                     .map(summary -> summary.toLowerCase(Locale.ROOT))
                     .anyMatch(summary -> summary.contains("region") || summary.contains("chunk") || summary.contains("poi") || summary.contains("anvil") || summary.contains("storage"));
             if (chunkIoLock && (serverTickMs > 20.0 || latestFrameMs > 25.0)) {
-                findings.add(new RuleFinding("warning", "chunk-io", "Threads are waiting on chunk or region style locks during a slow window.", "inferred"));
+                findings.add(new RuleFinding((serverTickMs > 50.0 || latestFrameMs > 40.0) ? "critical" : "warning", "chunk-io", "Threads are waiting on chunk or region style locks during a slow window.", "inferred",
+                        "The lock names look chunk-storage related and overlap with a visible slowdown.",
+                        "Check async chunk mods, world storage activity, and the Disk tab for matching spikes.",
+                        String.format(Locale.ROOT, "server %.1f ms | frame %.1f ms | lock count %d", serverTickMs, latestFrameMs, latestLockSummaries.size())));
             }
         }
-        if (system.cpuTemperatureC() < 0 && system.gpuTemperatureC() < 0) {
-            findings.add(new RuleFinding("info", "sensors", "Temperature sensors are unavailable on this machine/provider combination; falling back to load-only telemetry.", "unavailable"));
+        if (system.bytesReceivedPerSecond() > 512L * 1024L && latestFrameMs > 20.0) {
+            findings.add(new RuleFinding("info", "network", "A network burst overlaps with a slower frame window.", "measured",
+                    "Inbound traffic is elevated enough to plausibly disturb the client if packet handling or chunk delivery is busy.",
+                    "Inspect the Network tab's packet types and recent spike bookmarks.",
+                    String.format(Locale.ROOT, "inbound %s | packet latency %.1f ms", formatBytesPerSecond(system.bytesReceivedPerSecond()), system.packetProcessingLatencyMs())));
+        }
+        if ((system.chunksGenerating() > 0 || system.chunksMeshing() > 0 || system.chunksUploading() > 0) && (latestFrameMs > 20.0 || serverTickMs > 20.0)) {
+            findings.add(new RuleFinding("info", "chunk-pipeline", "Chunk generation, meshing, or upload work is active during the current slow window.", "measured",
+                    "World streaming work is non-idle and may be contributing to a hitch, especially while moving quickly or exploring new terrain.",
+                    "Check the World tab and render metrics for generation, meshing, upload, and lighting pressure.",
+                    String.format(Locale.ROOT, "gen %d | mesh %d | upload %d | lights %d", system.chunksGenerating(), system.chunksMeshing(), system.chunksUploading(), system.lightsUpdatePending())));
+        }
+        if (heapUsedPct > 85.0) {
+            findings.add(new RuleFinding("info", "memory", "Heap usage is high relative to committed memory.", "measured",
+                    "Live heap usage is near the current committed ceiling, which can increase GC pressure or mask leaks.",
+                    "Inspect the Memory tab for dominant mods and shared JVM buckets, especially if GC pauses are appearing too.",
+                    String.format(Locale.ROOT, "heap %.0f%% | used %s", heapUsedPct, formatBytesMb(currentSnapshot.memory().heapUsedBytes()))));
         }
         if (currentSnapshot.memory().gcPauseDurationMs() > 0) {
-            findings.add(new RuleFinding("info", "gc", "Recent GC pause detected: " + currentSnapshot.memory().gcType() + " " + currentSnapshot.memory().gcPauseDurationMs() + " ms.", "measured"));
+            findings.add(new RuleFinding("info", "gc", "Recent GC pause detected: " + currentSnapshot.memory().gcType() + " " + currentSnapshot.memory().gcPauseDurationMs() + " ms.", "measured",
+                    "A garbage-collection pause occurred recently and may explain a hitch if it aligns with frame or tick spikes.",
+                    "Correlate the pause with frame-time spikes and high heap usage in the Timeline and Memory tabs.",
+                    String.format(Locale.ROOT, "%s | pause %d ms", currentSnapshot.memory().gcType(), currentSnapshot.memory().gcPauseDurationMs())));
         }
+        if (system.cpuTemperatureC() < 0 && system.gpuTemperatureC() < 0) {
+            findings.add(new RuleFinding("info", "sensors", "Temperature sensors are unavailable on this machine/provider combination; falling back to load-only telemetry.", "unavailable",
+                    "The profiler can still report utilization, but package/core temperatures are not currently exposed by any detected provider.",
+                    "Open the System tab's Sensors panel to see provider attempts and the last bridge error.",
+                    system.cpuTemperatureUnavailableReason()));
+        } else if (system.cpuTemperatureC() >= 85.0 || system.gpuTemperatureC() >= 85.0) {
+            findings.add(new RuleFinding((system.cpuTemperatureC() >= 92.0 || system.gpuTemperatureC() >= 90.0) ? "critical" : "warning", "thermals", "A CPU or GPU temperature is entering a throttling-prone range.", "measured",
+                    "Sustained temperatures in the mid-80s or higher can cause clocks to drop and make spikes harder to explain from software alone.",
+                    "Check cooling, fan curves, and whether the slowdown lines up with a thermal ramp in exported sessions.",
+                    String.format(Locale.ROOT, "CPU %s | GPU %s", system.cpuTemperatureC() >= 0 ? String.format(Locale.ROOT, "%.1f C", system.cpuTemperatureC()) : "N/A", system.gpuTemperatureC() >= 0 ? String.format(Locale.ROOT, "%.1f C", system.gpuTemperatureC()) : "N/A")));
+        }
+        findings.sort((a, b) -> Integer.compare(severityRank(b.severity()), severityRank(a.severity())));
         return findings;
+    }
+
+    private int severityRank(String severity) {
+        return switch (severity == null ? "info" : severity.toLowerCase(Locale.ROOT)) {
+            case "critical" -> 3;
+            case "error" -> 2;
+            case "warning" -> 1;
+            default -> 0;
+        };
+    }
+    private String formatBytesPerSecond(long value) {
+        if (value < 0) {
+            return "N/A";
+        }
+        if (value >= 1024L * 1024L) {
+            return String.format(Locale.ROOT, "%.2f MB/s", value / (1024.0 * 1024.0));
+        }
+        if (value >= 1024L) {
+            return String.format(Locale.ROOT, "%.1f KB/s", value / 1024.0);
+        }
+        return value + " B/s";
+    }
+
+    private String formatBytesMb(long bytes) {
+        if (bytes < 0) {
+            return "N/A";
+        }
+        return String.format(Locale.ROOT, "%.1f MB", bytes / (1024.0 * 1024.0));
     }
 
     private String topClassName(Map<String, Integer> counts) {
@@ -1149,7 +1460,8 @@ public class ProfilerManager {
                 .map(entry -> {
                     ThreadLoadProfiler.ThreadSnapshot detail = entry.getValue();
                     String lockName = detail.lockName() == null || detail.lockName().isBlank() ? "unknown lock" : detail.lockName();
-                    return entry.getKey() + " waiting on " + lockName + " (blocked " + detail.blockedCountDelta() + ", waited " + detail.waitedCountDelta() + ")";
+                    String owner = detail.lockOwnerName() == null || detail.lockOwnerName().isBlank() ? "" : (" owned by " + detail.lockOwnerName());
+                    return entry.getKey() + " waiting on " + lockName + owner + " (blocked " + detail.blockedCountDelta() + ", waited " + detail.waitedCountDelta() + ")";
                 })
                 .toList();
     }
@@ -1411,15 +1723,26 @@ public class ProfilerManager {
                 .append("</style></head><body>");
         html.append("<h1>Task Manager Session Report</h1>");
         html.append("<section><h2>Diagnosis</h2><p>").append(escapeHtml(diagnosis)).append("</p></section>");
+        html.append("<section><h2>Metadata</h2><pre>").append(escapeHtml(EXPORT_GSON.toJson(buildExportMetadata()))).append("</pre></section>");
         html.append("<section><h2>Summary</h2><table>");
         for (Map.Entry<String, Object> entry : summary.entrySet()) {
             html.append("<tr><th>").append(escapeHtml(entry.getKey())).append("</th><td>").append(escapeHtml(String.valueOf(entry.getValue()))).append("</td></tr>");
         }
         html.append("</table></section>");
+        html.append("<section><h2>Highlights</h2><table>");
+        html.append("<tr><th>Worst frame</th><td>").append(escapeHtml(String.valueOf(summary.get("worstFrame")))).append("</td></tr>");
+        html.append("<tr><th>Worst MSPT spike</th><td>").append(escapeHtml(String.valueOf(summary.get("worstMsptSpike")))).append("</td></tr>");
+        html.append("<tr><th>Top CPU mods</th><td>").append(escapeHtml(String.valueOf(summary.get("topCpuMods")))).append("</td></tr>");
+        html.append("<tr><th>Top GPU mods</th><td>").append(escapeHtml(String.valueOf(summary.get("topGpuMods")))).append("</td></tr>");
+        html.append("<tr><th>Top memory mods</th><td>").append(escapeHtml(String.valueOf(summary.get("topMemoryMods")))).append("</td></tr>");
+        html.append("<tr><th>Hot chunk</th><td>").append(escapeHtml(String.valueOf(summary.get("hotChunkSummary")))).append("</td></tr>");
+        html.append("<tr><th>Block entity classes</th><td>").append(escapeHtml(String.valueOf(summary.get("blockEntityClasses")))).append("</td></tr>");
+        html.append("<tr><th>Sensors</th><td>").append(escapeHtml(String.valueOf(summary.get("sensorDiagnostics")))).append("</td></tr>");
+        html.append("</table></section>");
         html.append("<section><h2>Rule Findings</h2><ul>");
         for (RuleFinding finding : latestRuleFindings) {
             html.append("<li><strong>").append(escapeHtml(finding.category())).append("</strong> [").append(escapeHtml(finding.severity())).append("] ")
-                    .append(escapeHtml(finding.message())).append(" <code>").append(escapeHtml(finding.confidence())).append("</code></li>");
+                    .append(escapeHtml(finding.message())).append(" <code>").append(escapeHtml(finding.confidence())).append("</code><br><small>").append(escapeHtml(finding.metricSummary())).append("</small><br><small>").append(escapeHtml(finding.details())).append("</small><br><small><strong>Next:</strong> ").append(escapeHtml(finding.nextStep())).append("</small></li>");
         }
         html.append("</ul></section>");
         html.append("<section><h2>Entity Hotspots</h2><ul>");
@@ -1427,6 +1750,8 @@ public class ProfilerManager {
             html.append("<li>").append(escapeHtml(hotspot.className())).append(" x").append(hotspot.count()).append(" - ").append(escapeHtml(hotspot.heuristic())).append("</li>");
         }
         html.append("</ul></section>");
+        html.append("<section><h2>Startup</h2><pre>").append(escapeHtml(EXPORT_GSON.toJson(buildStartupSummary()))).append("</pre></section>");
+        html.append("<section><h2>Startup Slowest Mods</h2><pre>").append(escapeHtml(EXPORT_GSON.toJson(buildStartupSummary().get("slowestMods")))).append("</pre></section>");
         html.append("<section><h2>Block Entity Hotspots</h2><ul>");
         for (BlockEntityHotspot hotspot : latestBlockEntityHotspots) {
             html.append("<li>").append(escapeHtml(hotspot.className())).append(" x").append(hotspot.count()).append(" - ").append(escapeHtml(hotspot.heuristic())).append("</li>");

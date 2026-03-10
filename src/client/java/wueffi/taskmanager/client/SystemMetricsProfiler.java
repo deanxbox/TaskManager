@@ -91,6 +91,10 @@ public class SystemMetricsProfiler {
     private final long[] networkOutHistory = new long[HISTORY_SIZE];
     private final long[] diskReadHistory = new long[HISTORY_SIZE];
     private final long[] diskWriteHistory = new long[HISTORY_SIZE];
+    private final double[] cpuLoadHistory = new double[HISTORY_SIZE];
+    private final double[] gpuLoadHistory = new double[HISTORY_SIZE];
+    private final double[] memoryUsedHistory = new double[HISTORY_SIZE];
+    private final double[] memoryCommittedHistory = new double[HISTORY_SIZE];
     private final WindowsTelemetryBridge windowsBridge = new WindowsTelemetryBridge();
     private int historyIndex;
     private int historyCount;
@@ -234,10 +238,15 @@ public class SystemMetricsProfiler {
                 motion.distanceTravelledBlocks()
         );
 
-        pushHistory(networkInHistory, snapshot.bytesReceivedPerSecond());
-        pushHistory(networkOutHistory, snapshot.bytesSentPerSecond());
-        pushHistory(diskReadHistory, snapshot.diskReadBytesPerSecond());
-        pushHistory(diskWriteHistory, snapshot.diskWriteBytesPerSecond());
+        pushHistory(networkInHistory, Math.max(0L, snapshot.bytesReceivedPerSecond()));
+        pushHistory(networkOutHistory, Math.max(0L, snapshot.bytesSentPerSecond()));
+        pushHistory(diskReadHistory, Math.max(0L, snapshot.diskReadBytesPerSecond()));
+        pushHistory(diskWriteHistory, Math.max(0L, snapshot.diskWriteBytesPerSecond()));
+        pushHistory(cpuLoadHistory, Math.max(0.0, snapshot.cpuCoreLoadPercent()));
+        pushHistory(gpuLoadHistory, Math.max(0.0, snapshot.gpuCoreLoadPercent()));
+        pushHistory(memoryUsedHistory, Math.max(0.0, memorySnapshot.heapUsedBytes() / (1024.0 * 1024.0)));
+        pushHistory(memoryCommittedHistory, Math.max(0.0, memorySnapshot.heapCommittedBytes() / (1024.0 * 1024.0)));
+        advanceHistory();
     }
 
     public Snapshot getSnapshot() {
@@ -254,20 +263,38 @@ public class SystemMetricsProfiler {
     public long[] getOrderedNetworkOutHistory() { return orderedHistory(networkOutHistory); }
     public long[] getOrderedDiskReadHistory() { return orderedHistory(diskReadHistory); }
     public long[] getOrderedDiskWriteHistory() { return orderedHistory(diskWriteHistory); }
+    public double[] getOrderedCpuLoadHistory() { return orderedHistory(cpuLoadHistory); }
+    public double[] getOrderedGpuLoadHistory() { return orderedHistory(gpuLoadHistory); }
+    public double[] getOrderedMemoryUsedHistory() { return orderedHistory(memoryUsedHistory); }
+    public double[] getOrderedMemoryCommittedHistory() { return orderedHistory(memoryCommittedHistory); }
     public double getHistorySpanSeconds() { return historyCount <= 1 ? 0.0 : (historyCount - 1) * (ConfigManager.getMetricsUpdateIntervalMs() / 1000.0); }
 
     private void pushHistory(long[] history, long value) {
         history[historyIndex] = value;
-        if (history == diskWriteHistory) {
-            historyIndex = (historyIndex + 1) % HISTORY_SIZE;
-            if (historyCount < HISTORY_SIZE) {
-                historyCount++;
-            }
+    }
+
+    private void pushHistory(double[] history, double value) {
+        history[historyIndex] = value;
+    }
+
+    private void advanceHistory() {
+        historyIndex = (historyIndex + 1) % HISTORY_SIZE;
+        if (historyCount < HISTORY_SIZE) {
+            historyCount++;
         }
     }
 
     private long[] orderedHistory(long[] history) {
         long[] ordered = new long[historyCount];
+        for (int i = 0; i < historyCount; i++) {
+            int sourceIndex = (historyIndex - historyCount + i + HISTORY_SIZE) % HISTORY_SIZE;
+            ordered[i] = history[sourceIndex];
+        }
+        return ordered;
+    }
+
+    private double[] orderedHistory(double[] history) {
+        double[] ordered = new double[historyCount];
         for (int i = 0; i < historyCount; i++) {
             int sourceIndex = (historyIndex - historyCount + i + HISTORY_SIZE) % HISTORY_SIZE;
             ordered[i] = history[sourceIndex];
@@ -599,6 +626,10 @@ public class SystemMetricsProfiler {
         return value == null ? "" : value;
     }
 }
+
+
+
+
 
 
 

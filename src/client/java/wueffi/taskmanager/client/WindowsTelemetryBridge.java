@@ -48,6 +48,25 @@ final class WindowsTelemetryBridge {
             $sensorAttempts = New-Object 'System.Collections.Generic.List[string]'
             $sensorErrors = New-Object 'System.Collections.Generic.List[string]'
             $counterSource = 'Windows Performance Counters'
+            $activeRenderer = if ($env:TM_ACTIVE_RENDERER) { [string]$env:TM_ACTIVE_RENDERER } else { '' }
+            $activeVendor = if ($env:TM_ACTIVE_VENDOR) { [string]$env:TM_ACTIVE_VENDOR } else { '' }
+            $gpuPreferredMatchFound = $false
+
+            function Normalize-Name($text) {
+              if ($null -eq $text) { return '' }
+              return ([regex]::Replace(([string]$text).ToLowerInvariant(), '[^a-z0-9]+', ' ')).Trim()
+            }
+
+            function Test-PreferredGpu($hardwareName, $sensorName, $sensorIdentifier) {
+              $target = Normalize-Name($script:activeRenderer + ' ' + $script:activeVendor)
+              $candidate = Normalize-Name($hardwareName + ' ' + $sensorName + ' ' + $sensorIdentifier)
+              if ([string]::IsNullOrWhiteSpace($target) -or [string]::IsNullOrWhiteSpace($candidate)) { return $false }
+              if ($target.Contains($candidate) -or $candidate.Contains($target)) { return $true }
+              $targetTokens = $target.Split(' ') | Where-Object { $_.Length -ge 3 }
+              $hits = @($targetTokens | Where-Object { $candidate.Contains($_) }).Count
+              return $hits -ge 2
+            }
+
 
             function Add-SensorAttempt($text) {
               try { $script:sensorAttempts.Add($text) | Out-Null } catch {}
@@ -75,25 +94,63 @@ final class WindowsTelemetryBridge {
                 $script:cpuSensorSource = $origin
                 $script:cpuSensorMatch = $hardwareName + ' / ' + $sensorName
               }
-              if (($gpuTemp -lt 0 -or $sensorValue -gt $gpuTemp) -and $gpuMatch) {
-                $script:gpuTemp = [double]$sensorValue
-                $script:gpuSensorSource = $origin
-                $script:gpuSensorMatch = $hardwareName + ' / ' + $sensorName
+              if ($gpuMatch) {
+                $preferredGpu = Test-PreferredGpu $hardwareName $sensorName $sensorIdentifier
+                if ($preferredGpu) {
+                  if (-not $script:gpuPreferredMatchFound -or $gpuTemp -lt 0 -or $sensorValue -gt $gpuTemp) {
+                    $script:gpuTemp = [double]$sensorValue
+                    $script:gpuSensorSource = $origin
+                    $script:gpuSensorMatch = $hardwareName + ' / ' + $sensorName
+                    $script:gpuPreferredMatchFound = $true
+                  }
+                } elseif (-not $script:gpuPreferredMatchFound -and ($gpuTemp -lt 0 -or $sensorValue -gt $gpuTemp)) {
+                  $script:gpuTemp = [double]$sensorValue
+                  $script:gpuSensorSource = $origin
+                  $script:gpuSensorMatch = $hardwareName + ' / ' + $sensorName
+                }
               }
             }
 
-            $sample = Get-Counter '\\Processor Information(_Total)\\% Processor Utility','\\Processor(_Total)\\% Processor Time','\\Network Interface(*)\\Bytes Received/sec','\\Network Interface(*)\\Bytes Sent/sec','\\PhysicalDisk(_Total)\\Disk Read Bytes/sec','\\PhysicalDisk(_Total)\\Disk Write Bytes/sec','\\GPU Engine(*)\\Utilization Percentage'
-            foreach ($counter in $sample.CounterSamples) {
-              $path = $counter.Path.ToLowerInvariant()
-              $value = [double]$counter.CookedValue
-              if ($path -like '*processor information(_total)*% processor utility*') { if ($value -ge 0) { $cpuLoad = [math]::Max($cpuLoad, $value) } }
-              elseif ($path -like '*processor(_total)*% processor time*' -and $cpuLoad -lt 0) { if ($value -ge 0) { $cpuLoad = [math]::Max($cpuLoad, $value) } }
-              elseif ($path -like '*network interface(*)*bytes received/sec*' -or $path -like '*network interface(*\\)*bytes received/sec*') { if ($value -gt 0) { $netRecv += $value } }
-              elseif ($path -like '*network interface(*)*bytes sent/sec*' -or $path -like '*network interface(*\\)*bytes sent/sec*') { if ($value -gt 0) { $netSent += $value } }
-              elseif ($path -like '*physicaldisk(_total)*disk read bytes/sec*') { if ($value -gt 0) { $diskRead += $value } }
-              elseif ($path -like '*physicaldisk(_total)*disk write bytes/sec*') { if ($value -gt 0) { $diskWrite += $value } }
-              elseif ($path -like '*gpu engine(*engtype_3d)*utilization percentage*' -or $path -like '*gpu engine(*engtype_compute_0)*utilization percentage*') { if ($value -gt $gpuLoad) { $gpuLoad = $value } }
-            }
+            try {
+              $cpuSample = Get-Counter '\\Processor Information(_Total)\\% Processor Utility','\\Processor(_Total)\\% Processor Time'
+              foreach ($counter in $cpuSample.CounterSamples) {
+                $path = $counter.Path.ToLowerInvariant()
+                $value = [double]$counter.CookedValue
+                if ($path -like '*processor information(_total)*% processor utility*') { if ($value -ge 0) { $cpuLoad = [math]::Max($cpuLoad, $value) } }
+                elseif ($path -like '*processor(_total)*% processor time*' -and $cpuLoad -lt 0) { if ($value -ge 0) { $cpuLoad = [math]::Max($cpuLoad, $value) } }
+              }
+            } catch { Add-SensorError('CPU Counters', $_.Exception.Message) }
+
+            try {
+              $netSample = Get-Counter '\\Network Interface(*)\\Bytes Received/sec','\\Network Interface(*)\\Bytes Sent/sec'
+              foreach ($counter in $netSample.CounterSamples) {
+                $path = $counter.Path.ToLowerInvariant()
+                $value = [double]$counter.CookedValue
+                if ($path -like '*network interface(*)*bytes received/sec*' -or $path -like '*network interface(*\\)*bytes received/sec*') { if ($value -gt 0) { $netRecv += $value } }
+                elseif ($path -like '*network interface(*)*bytes sent/sec*' -or $path -like '*network interface(*\\)*bytes sent/sec*') { if ($value -gt 0) { $netSent += $value } }
+              }
+            } catch { Add-SensorError('Network Counters', $_.Exception.Message) }
+
+            try {
+              $diskSample = Get-Counter '\\PhysicalDisk(_Total)\\Disk Read Bytes/sec','\\PhysicalDisk(_Total)\\Disk Write Bytes/sec'
+              foreach ($counter in $diskSample.CounterSamples) {
+                $path = $counter.Path.ToLowerInvariant()
+                $value = [double]$counter.CookedValue
+                if ($path -like '*physicaldisk(_total)*disk read bytes/sec*') { if ($value -gt 0) { $diskRead += $value } }
+                elseif ($path -like '*physicaldisk(_total)*disk write bytes/sec*') { if ($value -gt 0) { $diskWrite += $value } }
+              }
+            } catch { Add-SensorError('Disk Counters', $_.Exception.Message) }
+
+            try {
+              $gpuCounterSample = Get-Counter '\\GPU Engine(*)\\Utilization Percentage'
+              foreach ($counter in $gpuCounterSample.CounterSamples) {
+                $path = $counter.Path.ToLowerInvariant()
+                $value = [double]$counter.CookedValue
+                if ($path -like '*gpu engine(*engtype_3d)*utilization percentage*' -or $path -like '*gpu engine(*engtype_compute_0)*utilization percentage*') {
+                  if ($value -gt $gpuLoad) { $gpuLoad = $value }
+                }
+              }
+            } catch { Add-SensorError('GPU Counters', $_.Exception.Message) }
 
             $dllCandidates = @(
               'C:\\Program Files\\LibreHardwareMonitor\\LibreHardwareMonitorLib.dll',
@@ -290,16 +347,38 @@ final class WindowsTelemetryBridge {
               } catch { Add-SensorAttempt('Thermal Zone Counters failed'); Add-SensorError('Thermal Zone Counters', $_.Exception.Message) }
             }
 
-            if ($gpuTemp -lt 0) {
+            if ($gpuTemp -lt 0 -or ($gpuLoad -lt 0 -and $activeVendor.ToLowerInvariant().Contains('nvidia'))) {
               try {
                 Add-SensorAttempt('nvidia-smi')
                 $nvidiaSmi = Get-Command nvidia-smi.exe -ErrorAction SilentlyContinue
                 if ($nvidiaSmi) {
-                  $gpuLine = & $nvidiaSmi.Source '--query-gpu=temperature.gpu' '--format=csv,noheader,nounits' 2>$null | Select-Object -First 1
-                  if ($gpuLine) {
-                    $gpuTemp = [double]($gpuLine.ToString().Trim())
-                    $gpuSensorSource = 'nvidia-smi'
-                    $gpuSensorMatch = 'temperature.gpu'
+                  $gpuRows = & $nvidiaSmi.Source '--query-gpu=index,name,temperature.gpu,utilization.gpu' '--format=csv,noheader,nounits' 2>$null
+                  $selected = $null
+                  foreach ($gpuRow in $gpuRows) {
+                    $parts = $gpuRow -split ','
+                    if ($parts.Count -lt 4) { continue }
+                    $name = $parts[1].Trim()
+                    $preferred = Test-PreferredGpu $name $name $name
+                    if ($preferred) {
+                      $selected = $parts
+                      break
+                    }
+                    if ($null -eq $selected) {
+                      $selected = $parts
+                    }
+                  }
+                  if ($selected) {
+                    $tempValue = [double]($selected[2].Trim())
+                    $utilValue = [double]($selected[3].Trim())
+                    if ($tempValue -gt 0) {
+                      $gpuTemp = $tempValue
+                      $gpuSensorSource = 'nvidia-smi'
+                      $gpuSensorMatch = $selected[1].Trim()
+                    }
+                    if ($utilValue -ge 0) {
+                      $gpuLoad = $utilValue
+                      $counterSource = 'nvidia-smi + Windows Performance Counters'
+                    }
                   }
                 }
               } catch { Add-SensorAttempt('nvidia-smi failed'); Add-SensorError('nvidia-smi', $_.Exception.Message) }
@@ -356,9 +435,18 @@ final class WindowsTelemetryBridge {
 
     private void runRefresh() {
         try {
-            Process process = new ProcessBuilder("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", SCRIPT)
-                    .redirectErrorStream(true)
-                    .start();
+            SystemMetricsProfiler.Snapshot systemSnapshot = SystemMetricsProfiler.getInstance().getSnapshot();
+            String activeRenderer = systemSnapshot.gpuRenderer();
+            String activeVendor = systemSnapshot.gpuVendor();
+            ProcessBuilder processBuilder = new ProcessBuilder("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", SCRIPT)
+                    .redirectErrorStream(true);
+            if (activeRenderer != null) {
+                processBuilder.environment().put("TM_ACTIVE_RENDERER", activeRenderer);
+            }
+            if (activeVendor != null) {
+                processBuilder.environment().put("TM_ACTIVE_VENDOR", activeVendor);
+            }
+            Process process = processBuilder.start();
             byte[] output = readAll(process.getInputStream());
             int exitCode = process.waitFor();
             if (exitCode != 0) {
@@ -438,4 +526,7 @@ final class WindowsTelemetryBridge {
         }
     }
 }
+
+
+
 

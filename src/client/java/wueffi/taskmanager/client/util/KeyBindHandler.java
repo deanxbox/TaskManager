@@ -21,19 +21,19 @@ public class KeyBindHandler {
                 "key.taskmanager.open",
                 InputUtil.Type.KEYSYM,
                 GLFW.GLFW_KEY_F12,
-                new KeyBinding.Category(Identifier.of("category.taskmanager"))
+                new KeyBinding.Category(Identifier.of("taskmanager", "taskmanager"))
         ));
         sessionKey = KeyBindingHelper.registerKeyBinding(new KeyBinding(
                 "key.taskmanager.session",
                 InputUtil.Type.KEYSYM,
                 GLFW.GLFW_KEY_F11,
-                new KeyBinding.Category(Identifier.of("category.taskmanager"))
+                new KeyBinding.Category(Identifier.of("taskmanager", "taskmanager"))
         ));
         hudToggleKey = KeyBindingHelper.registerKeyBinding(new KeyBinding(
                 "key.taskmanager.hud_toggle",
                 InputUtil.Type.KEYSYM,
                 GLFW.GLFW_KEY_F10,
-                new KeyBinding.Category(Identifier.of("category.taskmanager"))
+                new KeyBinding.Category(Identifier.of("taskmanager", "taskmanager"))
         ));
 
         ClientTickEvents.END_CLIENT_TICK.register(client -> {

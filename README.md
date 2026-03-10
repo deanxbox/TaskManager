@@ -74,5 +74,7 @@ Task Manager aims to be honest about what is measured versus estimated:
 - GPU attribution is estimated from render-thread samples weighted by GPU timer-query time
 - Memory attribution is based on JVM/class-histogram style ownership and shared runtime buckets
 - Temperatures and some system metrics depend on what the platform or an external sensor provider exposes
+- For CPU temperature on Windows, running Core Temp is the primary recommended setup; LibreHardwareMonitor/OpenHardwareMonitor and HWiNFO can also work
 
 That means the profiler is very useful for finding hotspots and spikes, but some values, especially GPU-per-mod and shared JVM memory, should be interpreted as guidance rather than perfect ground truth.
+

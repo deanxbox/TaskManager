@@ -13,7 +13,7 @@ public class MouseMixin {
 
     @Inject(method = "onCursorPos", at = @At("HEAD"))
     private void taskmanager$onCursorPos(long window, double x, double y, CallbackInfo ci) {
-        InputLatencyProfiler.getInstance().recordInputEvent();
+        InputLatencyProfiler.getInstance().recordMouseMove(x, y);
     }
 
     @Inject(method = "onMouseButton", at = @At("HEAD"))
