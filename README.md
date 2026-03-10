@@ -16,6 +16,8 @@ Open the profiler in-game with `F12`.
 - Session recording and export with summarized worst frame, MSPT spikes, top CPU/GPU/memory mods, hot chunk, and block-entity hotspots
 - Optional HUD overlay with configurable sections, layout, position, and trigger mode
 
+![Task Manager](https://cdn.modrinth.com/data/cached_images/f984d1f0fa21750fbf4bc77ac8940655ddd826ea.png)
+
 ## Tabs
 
 - `Tasks`: per-mod CPU share, sampled threads, sample counts, invokes, filtering, sorting, and row detail
@@ -30,6 +32,10 @@ Open the profiler in-game with `F12`.
 - `World`: lag map, hot chunks, entity hotspots, and block-entity drilldown
 - `System`: CPU/GPU load, temperatures, thread load, waits/locks, sensors, and runtime diagnostics
 - `Settings`: session options, HUD options, and configurable table column visibility
+
+![Task Manager](https://cdn.modrinth.com/data/cached_images/dae4562f6718c53e4d2c8feb45d4dceb042368c6.png)
+
+![Task Manager](https://cdn.modrinth.com/data/cached_images/5355d01fc79d7f784245f016c5eb583f8472d4e7.png)
 
 ## Controls
 

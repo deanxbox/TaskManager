@@ -4,7 +4,7 @@
   "version": "${version}",
   "name": "Task Manager",
   "description": "Configurable Task Manager to check CPU/GPU/Startup time and Memory per mod",
-  "authors": [],
+  "authors": ["Waffle [Wueffi], dean [deanxbox]"],
   "contact": {},
   "license": "Apache-2.0",
   "icon": "assets/taskmanager/icon.png",
