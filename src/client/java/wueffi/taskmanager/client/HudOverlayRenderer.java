@@ -31,15 +31,19 @@ public final class HudOverlayRenderer {
 
         ProfilerManager.ProfilerSnapshot snapshot = ProfilerManager.getInstance().getCurrentSnapshot();
         ConfigManager.HudTriggerMode triggerMode = ConfigManager.getHudTriggerMode();
+        ProfilerManager.RuleFinding highestFinding = ProfilerManager.getInstance().getLatestRuleFindings().stream()
+                .sorted((a, b) -> Integer.compare(severityRank(b.severity()), severityRank(a.severity())))
+                .findFirst()
+                .orElse(null);
         if (triggerMode == ConfigManager.HudTriggerMode.SPIKES_ONLY) {
             double latestFrameMs = FrameTimelineProfiler.getInstance().getLatestFrameNs() / 1_000_000.0;
             long recentSpikeAge = snapshot.spikes().isEmpty() ? Long.MAX_VALUE : Math.max(0L, System.currentTimeMillis() - snapshot.spikes().get(0).capturedAtEpochMillis());
-            if (latestFrameMs < 50.0 && recentSpikeAge > 3000L) {
+            boolean shouldShow = latestFrameMs >= 40.0 || recentSpikeAge <= 5000L || snapshot.stutterScore() >= 10.0 || (highestFinding != null && severityRank(highestFinding.severity()) >= 2);
+            if (!shouldShow) {
                 return;
             }
         } else if (triggerMode == ConfigManager.HudTriggerMode.WARNINGS_ONLY) {
-            boolean hasWarning = !ProfilerManager.getInstance().getLatestRuleFindings().stream().filter(finding -> "warning".equals(finding.severity()) || "error".equals(finding.severity())).toList().isEmpty();
-            if (!hasWarning) {
+            if (highestFinding == null || severityRank(highestFinding.severity()) < 1) {
                 return;
             }
         }
@@ -72,7 +76,7 @@ public final class HudOverlayRenderer {
             entries.add(new Entry("Parallel", parallelText, WARN));
         }
         if (ConfigManager.isHudShowMemory()) {
-            entries.add(new Entry("Memory", String.format("%.0f/%.0f MB", memory.heapUsedBytes() / (1024.0 * 1024.0), memory.heapCommittedBytes() / (1024.0 * 1024.0)), DIM));
+            entries.add(new Entry("Memory", String.format("%.0f/%.0f MB", memory.heapUsedBytes() / (1024.0 * 1024.0), (memory.heapMaxBytes() > 0 ? memory.heapMaxBytes() : memory.heapCommittedBytes()) / (1024.0 * 1024.0)), DIM));
         }
         if (ConfigManager.isHudShowWorld()) {
             entries.add(new Entry("Entities", String.valueOf(snapshot.entityCounts().totalEntities()), ACCENT));
@@ -80,6 +84,23 @@ public final class HudOverlayRenderer {
         }
         if (ConfigManager.isHudShowSession() && snapshot.sessionLogging()) {
             entries.add(new Entry("Session", formatDuration(snapshot.sessionLoggingElapsedMillis()) + " / " + formatDuration(ConfigManager.getSessionDurationSeconds() * 1000L), WARN));
+        }
+        long warningCount = ProfilerManager.getInstance().getLatestRuleFindings().stream().filter(finding -> severityRank(finding.severity()) >= 1).count();
+        if (warningCount > 0) {
+            String highestSeverity = highestFinding == null ? "warning" : highestFinding.severity();
+            int findingColor = severityRank(highestSeverity) >= 3 ? 0xFFFF6B6B : WARN;
+            entries.add(new Entry("Findings", warningCount + " active | " + snapshot.stutterScore() + " stutter", findingColor));
+            if (highestFinding != null) {
+                entries.add(new Entry("Alert", highestFinding.category() + ": " + highestFinding.message(), findingColor));
+            }
+        }
+        if (triggerMode == ConfigManager.HudTriggerMode.SPIKES_ONLY && !snapshot.spikes().isEmpty()) {
+            ProfilerManager.SpikeCapture latestSpike = snapshot.spikes().get(0);
+            entries.add(new Entry("Spike", String.format("%.1f ms | %s", latestSpike.frameDurationMs(), latestSpike.likelyBottleneck()), WARN));
+        }
+        String bottleneck = ProfilerManager.getInstance().getCurrentBottleneckLabel();
+        if (bottleneck != null && !bottleneck.isBlank()) {
+            entries.add(new Entry("Bottleneck", bottleneck, DIM));
         }
 
         int columns = ConfigManager.getHudLayoutMode().columns();
@@ -152,6 +173,15 @@ public final class HudOverlayRenderer {
     private static String formatDuration(long millis) {
         long totalSeconds = Math.max(0L, millis / 1000L);
         return String.format("%02d:%02d", totalSeconds / 60L, totalSeconds % 60L);
+    }
+
+    private static int severityRank(String severity) {
+        return switch (severity == null ? "info" : severity.toLowerCase()) {
+            case "critical" -> 3;
+            case "error" -> 2;
+            case "warning" -> 1;
+            default -> 0;
+        };
     }
 
     private record Entry(String label, String value, int color) {

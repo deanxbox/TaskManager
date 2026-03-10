@@ -1,0 +1,9 @@
+{
+  "category.taskmanager": "TaskManager",
+  "key.category.taskmanager.taskmanager": "Task Manager",
+  "key.taskmanager.open": "Open Task Manager",
+  "key.taskmanager.session": "Toggle Session Recording",
+  "key.taskmanager.hud_toggle": "Toggle HUD Overlay",
+  "key.category.minecraft.category.taskmanager": "TaskManager",
+  "key.category.minecraft.taskmanager": "TaskManager"
+}
