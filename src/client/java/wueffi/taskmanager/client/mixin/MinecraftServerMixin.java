@@ -15,13 +15,13 @@ public class MinecraftServerMixin {
 
     @Inject(method = "tick", at = @At("HEAD"))
     private void taskmanager$onServerTickStart(BooleanSupplier shouldKeepTicking, CallbackInfo ci) {
-        if (!TaskManagerScreen.isProfilingActive()) return;
+        if (!TaskManagerScreen.isLiveMetricsActive()) return;
         TickProfiler.getInstance().beginServerTick();
     }
 
     @Inject(method = "tick", at = @At("TAIL"))
     private void taskmanager$onServerTickEnd(BooleanSupplier shouldKeepTicking, CallbackInfo ci) {
-        if (!TaskManagerScreen.isProfilingActive()) return;
+        if (!TaskManagerScreen.isLiveMetricsActive()) return;
         TickProfiler.getInstance().endServerTick();
     }
 }

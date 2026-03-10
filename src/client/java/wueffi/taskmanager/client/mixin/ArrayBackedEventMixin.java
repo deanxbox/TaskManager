@@ -1,6 +1,7 @@
 package wueffi.taskmanager.client.mixin;
 
 import org.spongepowered.asm.mixin.Mixin;
+import wueffi.taskmanager.client.ProfilerManager;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Redirect;
 import wueffi.taskmanager.client.ModTimingProfiler;
@@ -25,7 +26,7 @@ public abstract class ArrayBackedEventMixin {
         recordStartupListeners(listeners);
         Object original = factory.apply(listeners);
 
-        if (!TaskManagerScreen.isProfilingActive()) {
+        if (!ProfilerManager.getInstance().shouldCollectDetailedMetrics()) {
             return original;
         }
 

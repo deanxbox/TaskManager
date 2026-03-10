@@ -41,6 +41,14 @@ public class ProfilerManager {
         }
     }
 
+    public enum LiveCollectionMode {
+        INACTIVE,
+        HUD,
+        SESSION,
+        SCREEN,
+        CAPTURE
+    }
+
     public record EntityCounts(int totalEntities, int livingEntities, int blockEntities) {
         static EntityCounts empty() {
             return new EntityCounts(0, 0, 0);
@@ -77,6 +85,10 @@ public class ProfilerManager {
             double consistentFps,
             double onePercentLowFps,
             double pointOnePercentLowFps,
+            long sessionSampleIntervalMs,
+            long observedSessionSampleIntervalMs,
+            int missedSessionSamples,
+            long maxSessionSampleGapMs,
             java.util.List<String> jvmLaunchArguments,
             java.util.Map<String, Object> minecraftSettings,
             java.util.Map<String, Object> graphicsModSettings
@@ -97,6 +109,8 @@ public class ProfilerManager {
 
     public record SessionPoint(
             long capturedAtEpochMillis,
+            long sampleIntervalMs,
+            int missedSamplesSincePrevious,
             double currentFps,
             double averageFps,
             double onePercentLowFps,
@@ -268,6 +282,9 @@ public class ProfilerManager {
     private volatile long sessionLoggingStartedAtMillis;
     private volatile boolean sessionRecorded;
     private volatile long sessionRecordedAtMillis;
+    private volatile int sessionMissedSamples;
+    private volatile long sessionMaxSampleGapMillis;
+    private volatile long sessionExpectedSampleIntervalMillis = 50L;
     private long lastSeenFrameSequence = 0;
     private long lastSnapshotPublishedAtMillis = 0L;
 
@@ -323,6 +340,33 @@ public class ProfilerManager {
         return mode;
     }
 
+    public LiveCollectionMode getLiveCollectionMode() {
+        if (screenOpen) {
+            return LiveCollectionMode.SCREEN;
+        }
+        if (sessionLogging) {
+            return LiveCollectionMode.SESSION;
+        }
+        if (ConfigManager.isHudEnabled()) {
+            return LiveCollectionMode.HUD;
+        }
+        if (isCaptureActive()) {
+            return LiveCollectionMode.CAPTURE;
+        }
+        return LiveCollectionMode.INACTIVE;
+    }
+
+    public boolean shouldCollectFrameMetrics() {
+        return getLiveCollectionMode() != LiveCollectionMode.INACTIVE;
+    }
+
+    public boolean shouldCollectDetailedMetrics() {
+        return switch (getLiveCollectionMode()) {
+            case SCREEN, SESSION, CAPTURE -> true;
+            default -> false;
+        };
+    }
+
     public ProfilerSnapshot getCurrentSnapshot() {
         return currentSnapshot;
     }
@@ -363,6 +407,9 @@ public class ProfilerManager {
         sessionLogging = true;
         sessionRecorded = false;
         sessionRecordedAtMillis = 0L;
+        sessionMissedSamples = 0;
+        sessionMaxSampleGapMillis = 0L;
+        sessionExpectedSampleIntervalMillis = 50L;
         sessionLoggingStartedAtMillis = System.currentTimeMillis();
         publishSnapshot(true);
     }
@@ -417,6 +464,7 @@ public class ProfilerManager {
     public String exportSession() {
         Map<String, Object> export = new LinkedHashMap<>();
         export.put("generatedAtEpochMillis", System.currentTimeMillis());
+        export.put("executiveSummary", buildExecutiveSummary());
         export.put("metadata", buildExportMetadata());
         export.put("captureMode", mode.name());
         export.put("sessionDurationSeconds", ConfigManager.getSessionDurationSeconds());
@@ -444,6 +492,7 @@ public class ProfilerManager {
         export.put("spikes", new ArrayList<>(spikes));
         export.put("sessionPoints", new ArrayList<>(sessionHistory));
         export.put("frameTimeTimelineMs", FrameTimelineProfiler.getInstance().getOrderedFrameMsHistory());
+        export.put("frameTimestampTimelineNs", FrameTimelineProfiler.getInstance().getOrderedFrameTimestampHistory());
         export.put("fpsTimeline", FrameTimelineProfiler.getInstance().getOrderedFpsHistory());
         export.put("chunkPipelineTimeline", buildChunkPipelineTimeline());
         export.put("startupRows", currentSnapshot.startupRows());
@@ -530,8 +579,17 @@ public class ProfilerManager {
         });
         MemoryProfiler.getInstance().getTopClassesByMod().forEach((modId, classes) -> memoryClassCountsByMod.put(modId, classes.size()));
 
+        long capturedAtMillis = System.currentTimeMillis();
+        SessionPoint previousPoint = sessionHistory.peekLast();
+        long sampleIntervalMs = previousPoint == null ? sessionExpectedSampleIntervalMillis : Math.max(0L, capturedAtMillis - previousPoint.capturedAtEpochMillis());
+        int missedSamplesSincePrevious = computeMissedSamples(previousPoint == null ? 0L : previousPoint.capturedAtEpochMillis(), capturedAtMillis, (int) sessionExpectedSampleIntervalMillis);
+        sessionMissedSamples += missedSamplesSincePrevious;
+        sessionMaxSampleGapMillis = Math.max(sessionMaxSampleGapMillis, sampleIntervalMs);
+
         sessionHistory.addLast(new SessionPoint(
-                System.currentTimeMillis(),
+                capturedAtMillis,
+                sampleIntervalMs,
+                missedSamplesSincePrevious,
                 frameTimeline.getCurrentFps(),
                 frameTimeline.getAverageFps(),
                 frameTimeline.getOnePercentLowFps(),
@@ -628,6 +686,37 @@ public class ProfilerManager {
         return bookmarks;
     }
 
+    private Map<String, Object> buildExecutiveSummary() {
+        Map<String, Object> summary = new LinkedHashMap<>();
+        if (sessionHistory.isEmpty()) {
+            summary.put("whatChanged", "No session samples were captured.");
+            summary.put("when", "No recorded interval.");
+            summary.put("likelyWhy", buildDiagnosis());
+            return summary;
+        }
+
+        SessionPoint first = sessionHistory.peekFirst();
+        SessionPoint last = sessionHistory.peekLast();
+        SpikeCapture worstSpike = spikes.stream().max((a, b) -> Double.compare(a.frameDurationMs(), b.frameDurationMs())).orElse(null);
+        RuleFinding highestFinding = latestRuleFindings.stream()
+                .sorted((a, b) -> Integer.compare(severityRank(b.severity()), severityRank(a.severity())))
+                .findFirst()
+                .orElse(null);
+
+        String whatChanged = worstSpike != null
+                ? "Frame pacing shifted from " + String.format(Locale.ROOT, "%.1f", first.frameTimeMs()) + " ms to a worst spike of " + String.format(Locale.ROOT, "%.1f", worstSpike.frameDurationMs()) + " ms."
+                : "Session stayed between " + String.format(Locale.ROOT, "%.1f", first.frameTimeMs()) + " ms and " + String.format(Locale.ROOT, "%.1f", last.frameTimeMs()) + " ms frame time.";
+        String when = "From " + first.capturedAtEpochMillis() + " to " + last.capturedAtEpochMillis() + " (" + sessionHistory.size() + " samples, missed " + sessionMissedSamples + ").";
+        String likelyWhy = highestFinding != null
+                ? highestFinding.category() + ": " + highestFinding.message()
+                : (worstSpike != null ? worstSpike.likelyBottleneck() : buildDiagnosis());
+
+        summary.put("whatChanged", whatChanged);
+        summary.put("when", when);
+        summary.put("likelyWhy", likelyWhy);
+        return summary;
+    }
+
     private Map<String, Object> buildExportSummary() {
         SystemMetricsProfiler.Snapshot system = SystemMetricsProfiler.getInstance().getSnapshot();
         Map<String, Object> summary = new LinkedHashMap<>();
@@ -682,6 +771,10 @@ public class ProfilerManager {
         summary.put("hotChunkSummary", latestHotChunks.isEmpty() ? null : latestHotChunks.getFirst());
         summary.put("blockEntityClasses", latestBlockEntityHotspots);
         summary.put("startupSummary", buildStartupSummary());
+        summary.put("sessionSampleIntervalMs", sessionExpectedSampleIntervalMillis);
+        summary.put("observedSessionSampleIntervalMs", computeObservedSessionSampleIntervalMs());
+        summary.put("missedSessionSamples", sessionMissedSamples);
+        summary.put("maxSessionSampleGapMs", sessionMaxSampleGapMillis);
         summary.put("metadata", buildExportMetadata());
         return summary;
     }
@@ -767,6 +860,10 @@ public class ProfilerManager {
                 computeConsistentFps(frames),
                 frames.getOnePercentLowFps(),
                 frames.getPointOnePercentLowFps(),
+                sessionExpectedSampleIntervalMillis,
+                computeObservedSessionSampleIntervalMs(),
+                sessionMissedSamples,
+                sessionMaxSampleGapMillis,
                 ManagementFactory.getRuntimeMXBean().getInputArguments(),
                 buildMinecraftSettings(client),
                 buildGraphicsModSettings(client)
@@ -779,6 +876,34 @@ public class ProfilerManager {
         double[] copy = java.util.Arrays.copyOf(history, history.length);
         java.util.Arrays.sort(copy);
         return copy[copy.length / 2];
+    }
+
+    static boolean shouldPublishSnapshot(boolean force, long nowMillis, long lastPublishedMillis, int snapshotDelayMs) {
+        return force || lastPublishedMillis == 0L || nowMillis - lastPublishedMillis >= snapshotDelayMs;
+    }
+
+    static int computeMissedSamples(long previousSampleAtMillis, long currentSampleAtMillis, int expectedIntervalMs) {
+        if (previousSampleAtMillis <= 0L || currentSampleAtMillis <= previousSampleAtMillis || expectedIntervalMs <= 0) {
+            return 0;
+        }
+        long delta = currentSampleAtMillis - previousSampleAtMillis;
+        return Math.max(0, (int) Math.round((double) delta / expectedIntervalMs) - 1);
+    }
+
+    static long computeObservedSampleIntervalMs(long[] capturedAtMillis, int fallbackIntervalMs) {
+        if (capturedAtMillis.length < 2) {
+            return fallbackIntervalMs;
+        }
+        long totalInterval = 0L;
+        for (int i = 1; i < capturedAtMillis.length; i++) {
+            totalInterval += Math.max(0L, capturedAtMillis[i] - capturedAtMillis[i - 1]);
+        }
+        return Math.max(1L, totalInterval / (capturedAtMillis.length - 1));
+    }
+
+    private long computeObservedSessionSampleIntervalMs() {
+        long[] capturedAtMillis = sessionHistory.stream().mapToLong(SessionPoint::capturedAtEpochMillis).toArray();
+        return computeObservedSampleIntervalMs(capturedAtMillis, (int) sessionExpectedSampleIntervalMillis);
     }
 
     private Map<String, Object> buildMinecraftSettings(MinecraftClient client) {
@@ -1120,7 +1245,8 @@ public class ProfilerManager {
 
     private void publishSnapshot(boolean force, long cpuSampleAgeMillis) {
         long now = System.currentTimeMillis();
-        if (!force && lastSnapshotPublishedAtMillis != 0L && now - lastSnapshotPublishedAtMillis < ConfigManager.getProfilerUpdateDelayMs()) {
+        int snapshotDelayMs = ConfigManager.isHudEnabled() ? 50 : ConfigManager.getProfilerUpdateDelayMs();
+        if (!shouldPublishSnapshot(force, now, lastSnapshotPublishedAtMillis, snapshotDelayMs)) {
             return;
         }
         lastSnapshotPublishedAtMillis = now;
@@ -1715,6 +1841,7 @@ public class ProfilerManager {
     }
 
     private String buildHtmlReport(Map<String, Object> export) {
+        Map<String, Object> executiveSummary = buildExecutiveSummary();
         Map<String, Object> summary = buildExportSummary();
         String diagnosis = buildDiagnosis();
         StringBuilder html = new StringBuilder();
@@ -1722,6 +1849,7 @@ public class ProfilerManager {
                 .append("body{font-family:Segoe UI,Arial,sans-serif;background:#0f1115;color:#e5e7eb;margin:24px;}h1,h2{color:#f8fafc;}section{background:#171a21;border:1px solid #2b3240;border-radius:10px;padding:16px;margin:12px 0;}code{color:#93c5fd;}table{border-collapse:collapse;width:100%;}td,th{border-bottom:1px solid #2b3240;padding:6px 8px;text-align:left;} .warn{color:#fbbf24;} .good{color:#86efac;}")
                 .append("</style></head><body>");
         html.append("<h1>Task Manager Session Report</h1>");
+        html.append("<section><h2>Executive Summary</h2><pre>").append(escapeHtml(EXPORT_GSON.toJson(executiveSummary))).append("</pre></section>");
         html.append("<section><h2>Diagnosis</h2><p>").append(escapeHtml(diagnosis)).append("</p></section>");
         html.append("<section><h2>Metadata</h2><pre>").append(escapeHtml(EXPORT_GSON.toJson(buildExportMetadata()))).append("</pre></section>");
         html.append("<section><h2>Summary</h2><table>");
@@ -1800,6 +1928,9 @@ public class ProfilerManager {
         sessionLogging = false;
         sessionRecorded = false;
         sessionRecordedAtMillis = 0L;
+        sessionMissedSamples = 0;
+        sessionMaxSampleGapMillis = 0L;
+        sessionExpectedSampleIntervalMillis = 50L;
     }
 }
 

@@ -38,6 +38,8 @@ public class TaskManagerScreen extends Screen {
 
     private record TooltipTarget(int x, int y, int width, int height, String text) {}
 
+    private record MemoryListLayout(int tableWidth, int listY, int listHeight) {}
+
     private enum TableId {
         TASKS,
         GPU,
@@ -1904,26 +1906,65 @@ public class TaskManagerScreen extends Screen {
 
         if (activeTab == 11) {
             int left = PADDING;
-            int top = getContentY() + PADDING + 18 - scrollOffset;
-            int[] offsets = {0, 22, 44, 66, 116, 138, 160, 182, 204, 226, 248, 270, 292, 314, 336, 358, 380, 432, 454, 476, 498, 520, 542, 564, 586, 608, 630, 652};
-            Runnable[] actions = {
+            int actionY = getContentY() + PADDING + 18 - scrollOffset;
+            Runnable[] sessionActions = {
                 () -> ProfilerManager.getInstance().toggleSessionLogging(),
                 ConfigManager::cycleSessionDurationSeconds,
                 ConfigManager::cycleMetricsUpdateIntervalMs,
-                ConfigManager::cycleProfilerUpdateDelayMs,
+                ConfigManager::cycleProfilerUpdateDelayMs
+            };
+            for (Runnable action : sessionActions) {
+                if (isInside(mouseX, mouseY, left, actionY, getScreenWidth() - 16, 16)) {
+                    action.run();
+                    return true;
+                }
+                actionY += 22;
+            }
+
+            actionY += 32;
+            Runnable[] hudBaseActions = {
                 () -> ConfigManager.setHudEnabled(!ConfigManager.isHudEnabled()),
                 ConfigManager::cycleHudPosition,
                 ConfigManager::cycleHudLayoutMode,
                 ConfigManager::cycleHudTriggerMode,
-                ConfigManager::toggleHudShowFps,
-                ConfigManager::toggleHudShowFrame,
-                ConfigManager::toggleHudShowTicks,
-                ConfigManager::toggleHudShowUtilization,
-                ConfigManager::toggleHudShowTemperatures,
-                ConfigManager::toggleHudShowParallelism,
-                ConfigManager::toggleHudShowMemory,
-                ConfigManager::toggleHudShowWorld,
-                ConfigManager::toggleHudShowSession,
+                ConfigManager::cycleHudConfigMode
+            };
+            for (Runnable action : hudBaseActions) {
+                if (isInside(mouseX, mouseY, left, actionY, getScreenWidth() - 16, 16)) {
+                    action.run();
+                    return true;
+                }
+                actionY += 22;
+            }
+
+            boolean presetMode = ConfigManager.getHudConfigMode() == ConfigManager.HudConfigMode.PRESET;
+            Runnable[] hudModeActions = presetMode
+                    ? new Runnable[] {
+                        ConfigManager::cycleHudPreset,
+                        () -> ConfigManager.setHudExpandedOnWarning(!ConfigManager.isHudExpandedOnWarning())
+                    }
+                    : new Runnable[] {
+                        ConfigManager::toggleHudShowFps,
+                        ConfigManager::toggleHudShowFrame,
+                        ConfigManager::toggleHudShowTicks,
+                        ConfigManager::toggleHudShowUtilization,
+                        ConfigManager::toggleHudShowTemperatures,
+                        ConfigManager::toggleHudShowParallelism,
+                        ConfigManager::toggleHudShowMemory,
+                        ConfigManager::toggleHudShowWorld,
+                        ConfigManager::toggleHudShowSession,
+                        () -> ConfigManager.setHudExpandedOnWarning(!ConfigManager.isHudExpandedOnWarning())
+                    };
+            for (Runnable action : hudModeActions) {
+                if (isInside(mouseX, mouseY, left, actionY, getScreenWidth() - 16, 16)) {
+                    action.run();
+                    return true;
+                }
+                actionY += 22;
+            }
+
+            actionY += presetMode ? 54 : 32;
+            Runnable[] tableActions = {
                 () -> ConfigManager.toggleTasksColumn("cpu"),
                 () -> ConfigManager.toggleTasksColumn("threads"),
                 () -> ConfigManager.toggleTasksColumn("samples"),
@@ -1936,22 +1977,25 @@ public class TaskManagerScreen extends Screen {
                 () -> ConfigManager.toggleMemoryColumn("mb"),
                 () -> ConfigManager.toggleMemoryColumn("pct")
             };
-            for (int i = 0; i < offsets.length; i++) {
-                if (isInside(mouseX, mouseY, left, top + offsets[i], getScreenWidth() - 16, 16)) {
-                    actions[i].run();
+            for (Runnable action : tableActions) {
+                if (isInside(mouseX, mouseY, left, actionY, getScreenWidth() - 16, 16)) {
+                    action.run();
                     return true;
                 }
+                actionY += 22;
             }
-            int[] colorOffsets = {706, 728};
+
+            actionY += 32;
             ColorSetting[] colorSettings = {ColorSetting.CPU, ColorSetting.GPU};
-            for (int i = 0; i < colorOffsets.length; i++) {
-                if (isInside(mouseX, mouseY, left, top + colorOffsets[i], getScreenWidth() - 16, 16)) {
-                    focusedColorSetting = colorSettings[i];
+            for (ColorSetting colorSetting : colorSettings) {
+                if (isInside(mouseX, mouseY, left, actionY, getScreenWidth() - 16, 16)) {
+                    focusedColorSetting = colorSetting;
                     colorEditValue = getColorSettingHex(focusedColorSetting);
                     return true;
                 }
+                actionY += 22;
             }
-            if (isInside(mouseX, mouseY, left, top + 750, getScreenWidth() - 16, 16)) {
+            if (isInside(mouseX, mouseY, left, actionY, getScreenWidth() - 16, 16)) {
                 ConfigManager.resetGraphColors();
                 focusedColorSetting = null;
                 colorEditValue = "";
@@ -2022,6 +2066,10 @@ public class TaskManagerScreen extends Screen {
 
     @Override
     public boolean keyPressed(KeyInput input) {
+        if (wueffi.taskmanager.client.util.KeyBindHandler.matchesOpenKey(input)) {
+            close();
+            return true;
+        }
         if (focusedColorSetting != null) {
             if (input.key() == 259) {
                 if (!colorEditValue.isEmpty()) {
@@ -2344,9 +2392,11 @@ public class TaskManagerScreen extends Screen {
         if (activeTab != 4) {
             return null;
         }
-        int sharedPanelW = snapshot.sharedMemoryFamilies().isEmpty() ? 0 : Math.min(280, Math.max(220, getScreenWidth() / 4));
-        int tableW = getScreenWidth() - sharedPanelW - (sharedPanelW > 0 ? PADDING : 0);
-        return findRowAt(mouseX, mouseY, getContentY() + PADDING + 110, tableW, getMemoryRows());
+        MemoryListLayout layout = getMemoryListLayout();
+        if (!isInside(mouseX, mouseY, 0, layout.listY(), layout.tableWidth(), layout.listHeight())) {
+            return null;
+        }
+        return findRowAt(mouseX, mouseY, layout.listY(), layout.tableWidth(), getMemoryRows());
     }
 
     private String findSharedFamilyAt(double mouseX, double mouseY) {
@@ -2400,10 +2450,28 @@ public class TaskManagerScreen extends Screen {
         return null;
     }
 
+    private MemoryListLayout getMemoryListLayout() {
+        int sharedPanelW = snapshot.sharedMemoryFamilies().isEmpty() ? 0 : Math.min(280, Math.max(220, getScreenWidth() / 4));
+        int detailH = 116;
+        int panelGap = sharedPanelW > 0 ? PADDING : 0;
+        int tableW = getScreenWidth() - sharedPanelW - panelGap;
+        int top = getContentY() + PADDING;
+        int controlsY = top + 28;
+        int barY = controlsY + 24;
+        int headerY = barY + 58;
+        int listY = headerY + 16;
+        int listH = getScreenHeight() - getContentY() - PADDING - (listY - getContentY()) - detailH;
+        return new MemoryListLayout(tableW, listY, listH);
+    }
+
 
     public static boolean isProfilingActive() {
         MinecraftClient client = MinecraftClient.getInstance();
         return client != null && client.currentScreen instanceof TaskManagerScreen;
+    }
+
+    public static boolean isLiveMetricsActive() {
+        return ProfilerManager.getInstance().shouldCollectFrameMetrics();
     }
 
     public static boolean isMemoryTabActive(MinecraftClient client) {
@@ -3028,24 +3096,37 @@ public class TaskManagerScreen extends Screen {
         top += 22;
         drawSettingRow(ctx, left, top, w - 24, "Trigger Mode", String.valueOf(ConfigManager.getHudTriggerMode()), mouseX, mouseY);
         top += 22;
-        drawSettingRow(ctx, left, top, w - 24, "FPS", ConfigManager.isHudShowFps() ? "On" : "Off", mouseX, mouseY);
+        drawSettingRow(ctx, left, top, w - 24, "HUD Mode", String.valueOf(ConfigManager.getHudConfigMode()), mouseX, mouseY);
         top += 22;
-        drawSettingRow(ctx, left, top, w - 24, "Frame Stats", ConfigManager.isHudShowFrame() ? "On" : "Off", mouseX, mouseY);
-        top += 22;
-        drawSettingRow(ctx, left, top, w - 24, "Tick Stats", ConfigManager.isHudShowTicks() ? "On" : "Off", mouseX, mouseY);
-        top += 22;
-        drawSettingRow(ctx, left, top, w - 24, "Utilization", ConfigManager.isHudShowUtilization() ? "On" : "Off", mouseX, mouseY);
-        top += 22;
-        drawSettingRow(ctx, left, top, w - 24, "Temperatures", ConfigManager.isHudShowTemperatures() ? "On" : "Off", mouseX, mouseY);
-        top += 22;
-        drawSettingRow(ctx, left, top, w - 24, "Parallelism", ConfigManager.isHudShowParallelism() ? "On" : "Off", mouseX, mouseY);
-        top += 22;
-        drawSettingRow(ctx, left, top, w - 24, "Memory", ConfigManager.isHudShowMemory() ? "On" : "Off", mouseX, mouseY);
-        top += 22;
-        drawSettingRow(ctx, left, top, w - 24, "World", ConfigManager.isHudShowWorld() ? "On" : "Off", mouseX, mouseY);
-        top += 22;
-        drawSettingRow(ctx, left, top, w - 24, "Session Status", ConfigManager.isHudShowSession() ? "On" : "Off", mouseX, mouseY);
-        top += 32;
+        if (ConfigManager.getHudConfigMode() == ConfigManager.HudConfigMode.PRESET) {
+            drawSettingRow(ctx, left, top, w - 24, "Preset", String.valueOf(ConfigManager.getHudPreset()), mouseX, mouseY);
+            top += 22;
+            drawSettingRow(ctx, left, top, w - 24, "Expand On Warning", ConfigManager.isHudExpandedOnWarning() ? "On" : "Off", mouseX, mouseY);
+            top += 20;
+            ctx.drawText(textRenderer, textRenderer.trimToWidth("Preset mode drives the HUD contents for you. Switch HUD Mode to CUSTOM to pick individual sections.", w - 24), left, top, TEXT_DIM, false);
+            top += 34;
+        } else {
+            drawSettingRow(ctx, left, top, w - 24, "FPS", ConfigManager.isHudShowFps() ? "On" : "Off", mouseX, mouseY);
+            top += 22;
+            drawSettingRow(ctx, left, top, w - 24, "Frame Stats", ConfigManager.isHudShowFrame() ? "On" : "Off", mouseX, mouseY);
+            top += 22;
+            drawSettingRow(ctx, left, top, w - 24, "Tick Stats", ConfigManager.isHudShowTicks() ? "On" : "Off", mouseX, mouseY);
+            top += 22;
+            drawSettingRow(ctx, left, top, w - 24, "Utilization", ConfigManager.isHudShowUtilization() ? "On" : "Off", mouseX, mouseY);
+            top += 22;
+            drawSettingRow(ctx, left, top, w - 24, "Temperatures", ConfigManager.isHudShowTemperatures() ? "On" : "Off", mouseX, mouseY);
+            top += 22;
+            drawSettingRow(ctx, left, top, w - 24, "Parallelism", ConfigManager.isHudShowParallelism() ? "On" : "Off", mouseX, mouseY);
+            top += 22;
+            drawSettingRow(ctx, left, top, w - 24, "Memory", ConfigManager.isHudShowMemory() ? "On" : "Off", mouseX, mouseY);
+            top += 22;
+            drawSettingRow(ctx, left, top, w - 24, "World", ConfigManager.isHudShowWorld() ? "On" : "Off", mouseX, mouseY);
+            top += 22;
+            drawSettingRow(ctx, left, top, w - 24, "Session Status", ConfigManager.isHudShowSession() ? "On" : "Off", mouseX, mouseY);
+            top += 22;
+            drawSettingRow(ctx, left, top, w - 24, "Expand On Warning", ConfigManager.isHudExpandedOnWarning() ? "On" : "Off", mouseX, mouseY);
+            top += 32;
+        }
         ctx.drawText(textRenderer, "Table Columns", left, top, TEXT_PRIMARY, false);
         top += 18;
         drawSettingRow(ctx, left, top, w - 24, "Tasks: %CPU", ConfigManager.isTasksColumnVisible("cpu") ? "On" : "Off", mouseX, mouseY);

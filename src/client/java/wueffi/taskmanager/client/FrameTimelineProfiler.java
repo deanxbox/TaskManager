@@ -8,7 +8,7 @@ public class FrameTimelineProfiler {
     public static FrameTimelineProfiler getInstance() { return INSTANCE; }
 
     private static final int SIZE = 300;
-    private static final long FPS_WINDOW_NS = 50_000_000L;
+    private static final long FPS_WINDOW_NS = 250_000_000L;
 
     private final long[] frameTimes = new long[SIZE];
     private final long[] frameTimestamps = new long[SIZE];
@@ -17,8 +17,6 @@ public class FrameTimelineProfiler {
     private int count = 0;
     private long latestFrameNs = 0;
     private long frameSequence = 0;
-    private long fpsWindowStartNs = 0;
-    private int fpsWindowFrames = 0;
     private double currentFps = 0.0;
 
     private long frameStart;
@@ -29,29 +27,32 @@ public class FrameTimelineProfiler {
 
     public void endFrame() {
         long now = System.nanoTime();
-        long duration = now - frameStart;
+        recordFrame(now - frameStart, now);
+    }
 
-        if (fpsWindowStartNs == 0L) {
-            fpsWindowStartNs = now;
-        }
-        fpsWindowFrames++;
-        long elapsed = now - fpsWindowStartNs;
-        if (elapsed >= FPS_WINDOW_NS) {
-            double measuredFps = fpsWindowFrames * 1_000_000_000.0 / elapsed;
-            currentFps = currentFps == 0.0 ? measuredFps : (currentFps * 0.35) + (measuredFps * 0.65);
-            fpsWindowFrames = 0;
-            fpsWindowStartNs = now;
-        }
-
-        frameTimes[index] = duration;
-        frameTimestamps[index] = now;
-        fpsHistory[index] = currentFps > 0.0 ? currentFps : 1_000_000_000.0 / Math.max(1L, duration);
-        latestFrameNs = duration;
+    void recordFrame(long durationNs, long timestampNs) {
+        frameTimes[index] = durationNs;
+        frameTimestamps[index] = timestampNs;
+        latestFrameNs = durationNs;
         frameSequence++;
+        currentFps = computeRollingFps(timestampNs, index, Math.min(count + 1, SIZE));
+        fpsHistory[index] = currentFps > 0.0 ? currentFps : 1_000_000_000.0 / Math.max(1L, durationNs);
         index = (index + 1) % SIZE;
         if (count < SIZE) {
             count++;
         }
+    }
+
+    void reset() {
+        Arrays.fill(frameTimes, 0L);
+        Arrays.fill(frameTimestamps, 0L);
+        Arrays.fill(fpsHistory, 0.0);
+        index = 0;
+        count = 0;
+        latestFrameNs = 0L;
+        frameSequence = 0L;
+        currentFps = 0.0;
+        frameStart = 0L;
     }
 
     public long[] getFrames() {
@@ -79,7 +80,12 @@ public class FrameTimelineProfiler {
     }
 
     public double getCurrentFps() {
-        return currentFps > 0.0 ? currentFps : getAverageFps();
+        if (count == 0) {
+            return 0.0;
+        }
+        int latestIndex = (index - 1 + SIZE) % SIZE;
+        double rolling = computeRollingFps(frameTimestamps[latestIndex], latestIndex, count);
+        return rolling > 0.0 ? rolling : (currentFps > 0.0 ? currentFps : getAverageFps());
     }
 
     public double getAverageFps() {
@@ -172,6 +178,15 @@ public class FrameTimelineProfiler {
         return ordered;
     }
 
+    public long[] getOrderedFrameTimestampHistory() {
+        long[] ordered = new long[count];
+        for (int i = 0; i < count; i++) {
+            int sourceIndex = (index - count + i + SIZE) % SIZE;
+            ordered[i] = frameTimestamps[sourceIndex];
+        }
+        return ordered;
+    }
+
     public double[] getOrderedFpsHistory() {
         double[] ordered = new double[count];
         for (int i = 0; i < count; i++) {
@@ -193,6 +208,35 @@ public class FrameTimelineProfiler {
             return 0.0;
         }
         return (last - first) / 1_000_000_000.0;
+    }
+
+    private double computeRollingFps(long endTimestampNs, int newestIndex, int availableSamples) {
+        if (availableSamples <= 1 || endTimestampNs <= 0L) {
+            long newestFrame = frameTimes[newestIndex];
+            return newestFrame > 0L ? 1_000_000_000.0 / newestFrame : 0.0;
+        }
+
+        long windowStartNs = endTimestampNs - FPS_WINDOW_NS;
+        int framesInWindow = 1;
+        int oldestIndexInWindow = newestIndex;
+
+        for (int i = 1; i < availableSamples; i++) {
+            int candidateIndex = (newestIndex - i + SIZE) % SIZE;
+            long candidateTimestamp = frameTimestamps[candidateIndex];
+            if (candidateTimestamp <= 0L || candidateTimestamp < windowStartNs) {
+                break;
+            }
+            oldestIndexInWindow = candidateIndex;
+            framesInWindow++;
+        }
+
+        long oldestTimestamp = frameTimestamps[oldestIndexInWindow];
+        if (oldestTimestamp <= 0L || endTimestampNs <= oldestTimestamp) {
+            long newestFrame = frameTimes[newestIndex];
+            return newestFrame > 0L ? 1_000_000_000.0 / newestFrame : 0.0;
+        }
+
+        return framesInWindow * 1_000_000_000.0 / Math.max(1L, endTimestampNs - oldestTimestamp);
     }
 
     public java.util.Map<String, Double> getFrameTimeHistogram() {

@@ -12,6 +12,7 @@ import net.minecraft.client.util.ObjectAllocator;
 import org.joml.Matrix4f;
 import org.joml.Vector4f;
 import org.spongepowered.asm.mixin.Mixin;
+import wueffi.taskmanager.client.ProfilerManager;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
@@ -36,7 +37,7 @@ public class WorldRendererMixin {
             boolean shouldRenderSky,
             CallbackInfo ci) {
 
-        if (!TaskManagerScreen.isProfilingActive()) return;
+        if (!ProfilerManager.getInstance().shouldCollectDetailedMetrics()) return;
         RenderPhaseProfiler.getInstance().beginCpuPhase("worldRenderer.render");
         GpuTimer.begin("worldRenderer.render");
     }
@@ -58,7 +59,7 @@ public class WorldRendererMixin {
             boolean shouldRenderSky,
             CallbackInfo ci) {
 
-        if (!TaskManagerScreen.isProfilingActive()) return;
+        if (!ProfilerManager.getInstance().shouldCollectDetailedMetrics()) return;
         GpuTimer.end("worldRenderer.render");
         RenderPhaseProfiler.getInstance().endCpuPhase("worldRenderer.render");
     }
@@ -68,7 +69,7 @@ public class WorldRendererMixin {
         at = @At("HEAD")
     )
     private void taskmanager$onOutlinesHead(CallbackInfo ci) {
-        if (!TaskManagerScreen.isProfilingActive()) return;
+        if (!ProfilerManager.getInstance().shouldCollectDetailedMetrics()) return;
         RenderPhaseProfiler.getInstance().beginCpuPhase("worldRenderer.entityOutlines");
         GpuTimer.begin("worldRenderer.entityOutlines");
     }
@@ -78,7 +79,7 @@ public class WorldRendererMixin {
         at = @At("TAIL")
     )
     private void taskmanager$onOutlinesTail(CallbackInfo ci) {
-        if (!TaskManagerScreen.isProfilingActive()) return;
+        if (!ProfilerManager.getInstance().shouldCollectDetailedMetrics()) return;
         GpuTimer.end("worldRenderer.entityOutlines");
         RenderPhaseProfiler.getInstance().endCpuPhase("worldRenderer.entityOutlines");
     }

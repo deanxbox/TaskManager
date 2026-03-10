@@ -19,7 +19,7 @@ public class GameRendererMixin {
 
     @Inject(method = "render", at = @At("HEAD"))
     private void taskmanager$onRenderHead(RenderTickCounter tickCounter, boolean tick, CallbackInfo ci) {
-        if (!TaskManagerScreen.isProfilingActive()) return;
+        if (!TaskManagerScreen.isLiveMetricsActive()) return;
 
         FrameTimelineProfiler.getInstance().beginFrame();
         SystemMetricsProfiler.getInstance().sample(MemoryProfiler.getInstance().getDetailedSnapshot());
@@ -29,7 +29,7 @@ public class GameRendererMixin {
 
     @Inject(method = "render", at = @At("TAIL"))
     private void taskmanager$onRenderTail(RenderTickCounter tickCounter, boolean tick, CallbackInfo ci) {
-        if (!TaskManagerScreen.isProfilingActive()) return;
+        if (!TaskManagerScreen.isLiveMetricsActive()) return;
 
         RenderPhaseProfiler.getInstance().endCpuPhase("frame.total");
         FrameTimelineProfiler.getInstance().endFrame();
@@ -38,14 +38,14 @@ public class GameRendererMixin {
 
     @Inject(method = "renderWorld", at = @At("HEAD"))
     private void taskmanager$onRenderWorldHead(CallbackInfo ci) {
-        if (!TaskManagerScreen.isProfilingActive()) return;
+        if (!TaskManagerScreen.isLiveMetricsActive()) return;
         RenderPhaseProfiler.getInstance().beginCpuPhase("gameRenderer.renderWorld");
         GpuTimer.begin("gameRenderer.renderWorld");
     }
 
     @Inject(method = "renderWorld", at = @At("TAIL"))
     private void taskmanager$onRenderWorldTail(CallbackInfo ci) {
-        if (!TaskManagerScreen.isProfilingActive()) return;
+        if (!TaskManagerScreen.isLiveMetricsActive()) return;
         GpuTimer.end("gameRenderer.renderWorld");
         RenderPhaseProfiler.getInstance().endCpuPhase("gameRenderer.renderWorld");
     }

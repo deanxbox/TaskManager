@@ -62,6 +62,30 @@ java {
     withSourcesJar()
 }
 
+sourceSets {
+    test {
+        java.srcDirs = ['src/test/java']
+        compileClasspath += sourceSets.main.output + sourceSets.client.output + configurations.compileClasspath + configurations.clientCompileClasspath
+        runtimeClasspath += output + compileClasspath + sourceSets.main.output + sourceSets.client.output + configurations.runtimeClasspath + configurations.clientRuntimeClasspath
+    }
+}
+
+tasks.register('runTaskManagerTests', JavaExec) {
+    group = 'verification'
+    description = 'Runs TaskManager deterministic unit checks.'
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'wueffi.taskmanager.client.TaskManagerTestRunner'
+    dependsOn tasks.named('testClasses')
+}
+
+tasks.named('test') {
+    failOnNoDiscoveredTests = false
+}
+
+tasks.named('check') {
+    dependsOn tasks.named('runTaskManagerTests')
+}
+
 jar {
     from("LICENSE") {
         rename { "${it}_${project.archives_base_name}" }

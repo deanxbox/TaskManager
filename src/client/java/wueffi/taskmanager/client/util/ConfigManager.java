@@ -53,6 +53,26 @@ public class ConfigManager {
         }
     }
 
+    public enum HudPreset {
+        COMPACT,
+        FULL;
+
+        public HudPreset next() {
+            HudPreset[] values = values();
+            return values[(ordinal() + 1) % values.length];
+        }
+    }
+
+    public enum HudConfigMode {
+        PRESET,
+        CUSTOM;
+
+        public HudConfigMode next() {
+            HudConfigMode[] values = values();
+            return values[(ordinal() + 1) % values.length];
+        }
+    }
+
     private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
     private static final Path CONFIG_PATH = FabricLoader.getInstance().getConfigDir().resolve("taskmanager.json");
     private static ConfigData config = new ConfigData();
@@ -192,6 +212,41 @@ public class ConfigManager {
         }
     }
 
+    public static HudPreset getHudPreset() {
+        try {
+            return HudPreset.valueOf(config.hudPreset);
+        } catch (Exception ignored) {
+            return HudPreset.COMPACT;
+        }
+    }
+
+    public static void cycleHudPreset() {
+        config.hudPreset = getHudPreset().next().name();
+        saveConfig();
+    }
+
+    public static HudConfigMode getHudConfigMode() {
+        try {
+            return HudConfigMode.valueOf(config.hudConfigMode);
+        } catch (Exception ignored) {
+            return HudConfigMode.PRESET;
+        }
+    }
+
+    public static void cycleHudConfigMode() {
+        config.hudConfigMode = getHudConfigMode().next().name();
+        saveConfig();
+    }
+
+    public static boolean isHudExpandedOnWarning() {
+        return config.hudExpandedOnWarning;
+    }
+
+    public static void setHudExpandedOnWarning(boolean value) {
+        config.hudExpandedOnWarning = value;
+        saveConfig();
+    }
+
     public static void toggleHudShowFps() { config.hudShowFps = !config.hudShowFps; saveConfig(); }
     public static void toggleHudShowFrame() { config.hudShowFrame = !config.hudShowFrame; saveConfig(); }
     public static void toggleHudShowTicks() { config.hudShowTicks = !config.hudShowTicks; saveConfig(); }
@@ -326,6 +381,12 @@ public class ConfigManager {
         if (config.hudTriggerMode == null || config.hudTriggerMode.isBlank()) {
             config.hudTriggerMode = config.hudSpikeOnly ? HudTriggerMode.SPIKES_ONLY.name() : HudTriggerMode.ALWAYS.name();
         }
+        if (config.hudPreset == null || config.hudPreset.isBlank()) {
+            config.hudPreset = HudPreset.COMPACT.name();
+        }
+        if (config.hudConfigMode == null || config.hudConfigMode.isBlank()) {
+            config.hudConfigMode = HudConfigMode.PRESET.name();
+        }
         if (config.sessionDurationSeconds <= 0) {
             config.sessionDurationSeconds = 30;
         }
@@ -379,6 +440,9 @@ public class ConfigManager {
         public boolean hudShowSession = true;
         public boolean hudSpikeOnly = false;
         public String hudTriggerMode = HudTriggerMode.ALWAYS.name();
+        public String hudPreset = HudPreset.COMPACT.name();
+        public String hudConfigMode = HudConfigMode.PRESET.name();
+        public boolean hudExpandedOnWarning = true;
         public String tasksColumns = "cpu,threads,samples,invokes";
         public String gpuColumns = "pct,threads,gpums,rsamples";
         public String memoryColumns = "classes,mb,pct";
