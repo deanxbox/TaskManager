@@ -14,8 +14,8 @@ public class CpuSamplingProfiler {
     public static CpuSamplingProfiler getInstance() { return INSTANCE; }
 
     private static final int SAMPLE_INTERVAL_MS = 2;
-    private static final int READY_CPU_SAMPLES = 180;
-    private static final int READY_RENDER_SAMPLES = 90;
+    private static final int READY_CPU_SAMPLES = 300;
+    private static final int READY_RENDER_SAMPLES = 200;
 
     private final Map<String, Counter> counters = new ConcurrentHashMap<>();
     private final Map<String, String> classModCache = new ConcurrentHashMap<>();

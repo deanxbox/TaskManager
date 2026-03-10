@@ -2712,7 +2712,15 @@ public class TaskManagerScreen extends Screen {
     private void drawMetricRow(DrawContext ctx, int x, int y, int width, String label, String value) {
         ctx.drawText(textRenderer, label, x, y, TEXT_DIM, false);
         String shown = textRenderer.trimToWidth(value, Math.max(80, width - 120));
-        ctx.drawText(textRenderer, shown, x + width - textRenderer.getWidth(shown), y, TEXT_PRIMARY, false);
+
+        int color = TEXT_PRIMARY;
+        if (shown.equalsIgnoreCase("On") || shown.equalsIgnoreCase("Yes")) {
+            color = ACCENT_GREEN;
+        } else if (shown.equalsIgnoreCase("Off") || shown.equalsIgnoreCase("No")) {
+            color = ACCENT_RED;
+        }
+
+        ctx.drawText(textRenderer, shown, x + width - textRenderer.getWidth(shown), y, color, false);
     }
 
     private String formatBytesMb(long bytes) {
