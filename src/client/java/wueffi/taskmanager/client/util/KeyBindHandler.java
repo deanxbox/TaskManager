@@ -2,6 +2,7 @@ package wueffi.taskmanager.client.util;
 
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
+import net.minecraft.client.input.KeyInput;
 import net.minecraft.client.option.KeyBinding;
 import net.minecraft.client.util.InputUtil;
 import net.minecraft.util.Identifier;
@@ -15,6 +16,10 @@ public class KeyBindHandler {
     private static KeyBinding openKey;
     private static KeyBinding sessionKey;
     private static KeyBinding hudToggleKey;
+
+    public static boolean matchesOpenKey(KeyInput input) {
+        return openKey != null && input != null && openKey.matchesKey(input);
+    }
 
     public static void register() {
         openKey = KeyBindingHelper.registerKeyBinding(new KeyBinding(
@@ -38,7 +43,11 @@ public class KeyBindHandler {
 
         ClientTickEvents.END_CLIENT_TICK.register(client -> {
             while (openKey.wasPressed()) {
-                client.setScreen(new TaskManagerScreen());
+                if (client.currentScreen instanceof TaskManagerScreen) {
+                    client.setScreen(null);
+                } else {
+                    client.setScreen(new TaskManagerScreen());
+                }
             }
             while (sessionKey.wasPressed()) {
                 ProfilerManager.getInstance().toggleSessionLogging();

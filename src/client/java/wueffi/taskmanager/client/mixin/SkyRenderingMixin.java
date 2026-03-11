@@ -9,6 +9,7 @@ import net.minecraft.client.render.SkyRendering;
 import net.minecraft.client.util.math.MatrixStack;
 import net.minecraft.client.render.VertexConsumerProvider;
 import org.spongepowered.asm.mixin.Mixin;
+import wueffi.taskmanager.client.ProfilerManager;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
@@ -30,7 +31,7 @@ public class SkyRenderingMixin {
             float starBrightness,
             CallbackInfo ci) {
 
-        if (!TaskManagerScreen.isProfilingActive()) return;
+        if (!ProfilerManager.getInstance().shouldCollectDetailedMetrics()) return;
         RenderPhaseProfiler.getInstance().beginCpuPhase("sky.renderCelestialBodies");
         GpuTimer.begin("sky.renderCelestialBodies");
     }
@@ -49,7 +50,7 @@ public class SkyRenderingMixin {
             float starBrightness,
             CallbackInfo ci) {
 
-        if (!TaskManagerScreen.isProfilingActive()) return;
+        if (!ProfilerManager.getInstance().shouldCollectDetailedMetrics()) return;
         GpuTimer.end("sky.renderCelestialBodies");
         RenderPhaseProfiler.getInstance().endCpuPhase("sky.renderCelestialBodies");
     }

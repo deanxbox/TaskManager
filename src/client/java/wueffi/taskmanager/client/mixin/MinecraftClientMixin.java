@@ -14,13 +14,13 @@ public class MinecraftClientMixin {
 
     @Inject(method = "tick", at = @At("HEAD"))
     private void taskmanager$onTickStart(CallbackInfo ci) {
-        if (!TaskManagerScreen.isProfilingActive()) return;
+        if (!TaskManagerScreen.isLiveMetricsActive()) return;
         TickProfiler.getInstance().beginTick();
     }
 
     @Inject(method = "tick", at = @At("TAIL"))
     private void taskmanager$onTickEnd(CallbackInfo ci) {
-        if (!TaskManagerScreen.isProfilingActive()) return;
+        if (!TaskManagerScreen.isLiveMetricsActive()) return;
         TickProfiler.getInstance().endTick();
     }
 }

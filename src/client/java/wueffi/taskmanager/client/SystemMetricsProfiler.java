@@ -36,6 +36,10 @@ public class SystemMetricsProfiler {
             double gpuCoreLoadPercent,
             double gpuTemperatureC,
             double cpuTemperatureC,
+            double cpuLoadChangePerSecond,
+            double gpuLoadChangePerSecond,
+            double cpuTemperatureChangePerSecond,
+            double gpuTemperatureChangePerSecond,
             double mouseInputLatencyMs,
             long bytesReceivedPerSecond,
             long bytesSentPerSecond,
@@ -76,7 +80,68 @@ public class SystemMetricsProfiler {
             double distanceTravelledBlocks
     ) {
         public static Snapshot empty() {
-            return new Snapshot("", "", -1, -1, 0, false, -1, 0, -1, false, "Unavailable", "Unavailable", "No bridge data", "No provider exposed a readable CPU package temperature", -1, -1, -1, -1, 0.0, -1, -1, -1, -1, Map.of(), Map.of(), "No scheduling conflict detected", "Parallelism unknown", "CPU sensor unavailable", 0, Math.max(1, Runtime.getRuntime().availableProcessors() / 2), "Main Logic: unknown", "Background: unknown", 0.0, "Parallelism unknown", 0L, 0L, 0, 0, 0.0, 0L, -1.0, "Unknown", -1.0, "unknown", "unavailable", 0, -1, -1, -1, -1, -1L, -1L, -1L, -1.0, -1, 0.0);
+            return new Snapshot(
+                    "",
+                    "",
+                    -1L,
+                    -1L,
+                    0L,
+                    false,
+                    -1L,
+                    0L,
+                    -1L,
+                    false,
+                    "Unavailable",
+                    "Unavailable",
+                    "No bridge data",
+                    "No provider exposed a readable CPU package temperature",
+                    -1.0,
+                    -1.0,
+                    -1.0,
+                    -1.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    -1L,
+                    -1L,
+                    -1L,
+                    -1L,
+                    Map.of(),
+                    Map.of(),
+                    "No scheduling conflict detected",
+                    "Parallelism unknown",
+                    "CPU sensor unavailable",
+                    0,
+                    Math.max(1, Runtime.getRuntime().availableProcessors() / 2),
+                    "Main Logic: unknown",
+                    "Background: unknown",
+                    0.0,
+                    "Parallelism unknown",
+                    0L,
+                    0L,
+                    0,
+                    0,
+                    0.0,
+                    0L,
+                    -1.0,
+                    "Unknown",
+                    -1.0,
+                    "unknown",
+                    "unavailable",
+                    0,
+                    -1,
+                    -1,
+                    -1,
+                    -1,
+                    -1L,
+                    -1L,
+                    -1L,
+                    -1.0,
+                    -1,
+                    0.0
+            );
         }
     }
 
@@ -93,15 +158,26 @@ public class SystemMetricsProfiler {
     private final long[] diskWriteHistory = new long[HISTORY_SIZE];
     private final double[] cpuLoadHistory = new double[HISTORY_SIZE];
     private final double[] gpuLoadHistory = new double[HISTORY_SIZE];
+    private final double[] cpuTemperatureHistory = new double[HISTORY_SIZE];
+    private final double[] gpuTemperatureHistory = new double[HISTORY_SIZE];
+    private final double[] vramUsedHistory = new double[HISTORY_SIZE];
     private final double[] memoryUsedHistory = new double[HISTORY_SIZE];
     private final double[] memoryCommittedHistory = new double[HISTORY_SIZE];
+    private final double[] entityCountHistory = new double[HISTORY_SIZE];
+    private final double[] loadedChunkHistory = new double[HISTORY_SIZE];
+    private final double[] renderedChunkHistory = new double[HISTORY_SIZE];
     private final WindowsTelemetryBridge windowsBridge = new WindowsTelemetryBridge();
     private int historyIndex;
     private int historyCount;
 
     private volatile Snapshot snapshot = Snapshot.empty();
     private long lastSampleAtMillis;
+    private int lastSampleIntervalMillis = ConfigManager.getMetricsUpdateIntervalMs();
     private long lastDirectMemoryUsedBytes = -1L;
+    private double lastCpuLoadPercent = Double.NaN;
+    private double lastGpuLoadPercent = Double.NaN;
+    private double lastCpuTemperatureC = Double.NaN;
+    private double lastGpuTemperatureC = Double.NaN;
     private double lastPlayerX;
     private double lastPlayerY;
     private double lastPlayerZ;
@@ -113,12 +189,16 @@ public class SystemMetricsProfiler {
     private double distanceTravelledBlocks;
     private final Deque<Long> chunkEntryTimes = new ArrayDeque<>();
 
-    public void sample(MemoryProfiler.Snapshot memorySnapshot) {
+    public void sample(MemoryProfiler.Snapshot memorySnapshot, ProfilerManager.EntityCounts entityCounts, ProfilerManager.ChunkCounts chunkCounts) {
         long now = System.currentTimeMillis();
-        if (now - lastSampleAtMillis < ConfigManager.getMetricsUpdateIntervalMs()) {
+        int sampleIntervalMillis = ProfilerManager.getInstance().shouldCollectFrameMetrics() ? 50 : ConfigManager.getMetricsUpdateIntervalMs();
+        if (now - lastSampleAtMillis < sampleIntervalMillis) {
             return;
         }
+        long previousSampleAtMillis = lastSampleAtMillis;
+        long elapsedMillis = previousSampleAtMillis <= 0L ? sampleIntervalMillis : Math.max(1L, now - previousSampleAtMillis);
         lastSampleAtMillis = now;
+        lastSampleIntervalMillis = sampleIntervalMillis;
 
         String vendor = stringOrEmpty(GL11.glGetString(GL11.GL_VENDOR));
         String renderer = stringOrEmpty(GL11.glGetString(GL11.GL_RENDERER));
@@ -149,7 +229,6 @@ public class SystemMetricsProfiler {
         Map<String, Double> threadLoads = new LinkedHashMap<>();
         threadDetails.forEach((name, details) -> threadLoads.put(name, details.loadPercent()));
         double totalThreadLoad = threadDetails.values().stream().mapToDouble(ThreadLoadProfiler.ThreadSnapshot::loadPercent).sum();
-        long elapsedMillis = Math.max(1L, now - Math.max(0L, lastSampleAtMillis));
         long offHeapAllocationRate = 0L;
         if (lastDirectMemoryUsedBytes >= 0L) {
             offHeapAllocationRate = Math.max(0L, Math.round((directMemoryUsedBytes - lastDirectMemoryUsedBytes) * 1000.0 / elapsedMillis));
@@ -159,7 +238,7 @@ public class SystemMetricsProfiler {
         int activeWorkers = countWorkers(threadDetails, true);
         int idleWorkers = countWorkers(threadDetails, false);
         double workerRatio = idleWorkers > 0 ? activeWorkers / (double) idleWorkers : activeWorkers;
-        int totalEntities = ProfilerManager.getInstance().getCurrentSnapshot().entityCounts().totalEntities();
+        int totalEntities = entityCounts.totalEntities();
         double bytesPerEntity = totalEntities > 0 && bridgeSample.bytesReceivedPerSecond() >= 0 ? bridgeSample.bytesReceivedPerSecond() / (double) totalEntities : -1.0;
         NetworkPacketProfiler.Snapshot latestPacketSnapshot = NetworkPacketProfiler.getInstance().getLatestSnapshot();
         long packetVolume = latestPacketSnapshot.inboundPackets() + latestPacketSnapshot.outboundPackets();
@@ -178,6 +257,14 @@ public class SystemMetricsProfiler {
         PlayerMotionSnapshot motion = samplePlayerMotion(now);
         List<ProfilerManager.HotChunkSnapshot> hotChunks = ProfilerManager.getInstance().getLatestHotChunks();
         int maxEntitiesInHotChunk = hotChunks.isEmpty() ? 0 : hotChunks.getFirst().entityCount();
+        double cpuLoadChangePerSecond = computeDeltaPerSecond(bridgeSample.cpuCoreLoadPercent(), lastCpuLoadPercent, elapsedMillis);
+        double gpuLoadChangePerSecond = computeDeltaPerSecond(bridgeSample.gpuCoreLoadPercent(), lastGpuLoadPercent, elapsedMillis);
+        double cpuTemperatureChangePerSecond = computeDeltaPerSecond(bridgeSample.cpuTemperatureC(), lastCpuTemperatureC, elapsedMillis);
+        double gpuTemperatureChangePerSecond = computeDeltaPerSecond(bridgeSample.gpuTemperatureC(), lastGpuTemperatureC, elapsedMillis);
+        lastCpuLoadPercent = bridgeSample.cpuCoreLoadPercent();
+        lastGpuLoadPercent = bridgeSample.gpuCoreLoadPercent();
+        lastCpuTemperatureC = bridgeSample.cpuTemperatureC();
+        lastGpuTemperatureC = bridgeSample.gpuTemperatureC();
 
         snapshot = new Snapshot(
                 vendor,
@@ -198,6 +285,10 @@ public class SystemMetricsProfiler {
                 bridgeSample.gpuCoreLoadPercent(),
                 bridgeSample.gpuTemperatureC(),
                 bridgeSample.cpuTemperatureC(),
+                cpuLoadChangePerSecond,
+                gpuLoadChangePerSecond,
+                cpuTemperatureChangePerSecond,
+                gpuTemperatureChangePerSecond,
                 InputLatencyProfiler.getInstance().getLastPresentedLatencyMs(),
                 bridgeSample.bytesReceivedPerSecond(),
                 bridgeSample.bytesSentPerSecond(),
@@ -244,8 +335,14 @@ public class SystemMetricsProfiler {
         pushHistory(diskWriteHistory, Math.max(0L, snapshot.diskWriteBytesPerSecond()));
         pushHistory(cpuLoadHistory, Math.max(0.0, snapshot.cpuCoreLoadPercent()));
         pushHistory(gpuLoadHistory, Math.max(0.0, snapshot.gpuCoreLoadPercent()));
+        pushHistory(cpuTemperatureHistory, snapshot.cpuTemperatureC());
+        pushHistory(gpuTemperatureHistory, snapshot.gpuTemperatureC());
+        pushHistory(vramUsedHistory, snapshot.vramUsedBytes() >= 0L ? Math.max(0.0, snapshot.vramUsedBytes() / (1024.0 * 1024.0)) : -1.0);
         pushHistory(memoryUsedHistory, Math.max(0.0, memorySnapshot.heapUsedBytes() / (1024.0 * 1024.0)));
         pushHistory(memoryCommittedHistory, Math.max(0.0, memorySnapshot.heapCommittedBytes() / (1024.0 * 1024.0)));
+        pushHistory(entityCountHistory, Math.max(0.0, entityCounts.totalEntities()));
+        pushHistory(loadedChunkHistory, Math.max(0.0, chunkCounts.loadedChunks()));
+        pushHistory(renderedChunkHistory, Math.max(0.0, chunkCounts.renderedChunks()));
         advanceHistory();
     }
 
@@ -265,9 +362,15 @@ public class SystemMetricsProfiler {
     public long[] getOrderedDiskWriteHistory() { return orderedHistory(diskWriteHistory); }
     public double[] getOrderedCpuLoadHistory() { return orderedHistory(cpuLoadHistory); }
     public double[] getOrderedGpuLoadHistory() { return orderedHistory(gpuLoadHistory); }
+    public double[] getOrderedCpuTemperatureHistory() { return orderedHistory(cpuTemperatureHistory); }
+    public double[] getOrderedGpuTemperatureHistory() { return orderedHistory(gpuTemperatureHistory); }
+    public double[] getOrderedVramUsedHistory() { return orderedHistory(vramUsedHistory); }
     public double[] getOrderedMemoryUsedHistory() { return orderedHistory(memoryUsedHistory); }
     public double[] getOrderedMemoryCommittedHistory() { return orderedHistory(memoryCommittedHistory); }
-    public double getHistorySpanSeconds() { return historyCount <= 1 ? 0.0 : (historyCount - 1) * (ConfigManager.getMetricsUpdateIntervalMs() / 1000.0); }
+    public double[] getOrderedEntityCountHistory() { return orderedHistory(entityCountHistory); }
+    public double[] getOrderedLoadedChunkHistory() { return orderedHistory(loadedChunkHistory); }
+    public double[] getOrderedRenderedChunkHistory() { return orderedHistory(renderedChunkHistory); }
+    public double getHistorySpanSeconds() { return historyCount <= 1 ? 0.0 : (historyCount - 1) * (lastSampleIntervalMillis / 1000.0); }
 
     private void pushHistory(long[] history, long value) {
         history[historyIndex] = value;
@@ -275,6 +378,13 @@ public class SystemMetricsProfiler {
 
     private void pushHistory(double[] history, double value) {
         history[historyIndex] = value;
+    }
+
+    private double computeDeltaPerSecond(double currentValue, double previousValue, long elapsedMillis) {
+        if (!Double.isFinite(currentValue) || currentValue < 0.0 || !Double.isFinite(previousValue) || previousValue < 0.0 || elapsedMillis <= 0L) {
+            return 0.0;
+        }
+        return (currentValue - previousValue) * 1000.0 / elapsedMillis;
     }
 
     private void advanceHistory() {

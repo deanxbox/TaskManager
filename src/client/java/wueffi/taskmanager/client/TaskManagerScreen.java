@@ -38,6 +38,10 @@ public class TaskManagerScreen extends Screen {
 
     private record TooltipTarget(int x, int y, int width, int height, String text) {}
 
+    private record MemoryListLayout(int tableWidth, int listY, int listHeight) {}
+
+    private record SliderLayout(int x, int y, int width, int height) {}
+
     private enum TableId {
         TASKS,
         GPU,
@@ -46,6 +50,8 @@ public class TaskManagerScreen extends Screen {
 
     private enum WorldMiniTab {
         LAG_MAP,
+        ENTITIES,
+        CHUNKS,
         BLOCK_ENTITIES
     }
 
@@ -56,9 +62,17 @@ public class TaskManagerScreen extends Screen {
         MEMORY_GRAPH
     }
 
+    private enum GraphMetricTab {
+        LOAD,
+        TEMPERATURE
+    }
+
     private enum ColorSetting {
         CPU,
-        GPU
+        GPU,
+        WORLD_ENTITIES,
+        WORLD_CHUNKS_LOADED,
+        WORLD_CHUNKS_RENDERED
     }
 
     private enum StartupSort {
@@ -161,6 +175,8 @@ public class TaskManagerScreen extends Screen {
     private boolean startupSortDescending = true;
     private WorldMiniTab worldMiniTab = WorldMiniTab.LAG_MAP;
     private SystemMiniTab systemMiniTab = SystemMiniTab.OVERVIEW;
+    private GraphMetricTab cpuGraphMetricTab = GraphMetricTab.LOAD;
+    private GraphMetricTab gpuGraphMetricTab = GraphMetricTab.LOAD;
     private float uiScale = 1.0f;
     private float uiOffsetX = 0.0f;
     private float uiOffsetY = 0.0f;
@@ -171,6 +187,7 @@ public class TaskManagerScreen extends Screen {
     private String selectedFindingKey;
     private ProfilerManager.ProfilerSnapshot snapshot = ProfilerManager.getInstance().getCurrentSnapshot();
     private LagMapLayout lastRenderedLagMapLayout;
+    private boolean draggingHudTransparency;
 
     public TaskManagerScreen() {
         this(lastOpenedTab);
@@ -1086,11 +1103,17 @@ public class TaskManagerScreen extends Screen {
         if (systemMiniTab == SystemMiniTab.CPU_GRAPH) {
             int graphWidth = getPreferredGraphWidth(w);
             int graphLeft = x + Math.max(PADDING, (w - graphWidth) / 2);
-            renderFixedScaleSeriesGraph(ctx, graphLeft, top, graphWidth, 146, metrics.getOrderedCpuLoadHistory(), "CPU Load", "% load", getCpuGraphColor(), 100.0, metrics.getHistorySpanSeconds());
+            renderGraphMetricTabs(ctx, graphLeft, top, graphWidth, cpuGraphMetricTab);
+            top += 24;
+            if (cpuGraphMetricTab == GraphMetricTab.LOAD) {
+                renderFixedScaleSeriesGraph(ctx, graphLeft, top, graphWidth, 146, metrics.getOrderedCpuLoadHistory(), "CPU Load", "%", getCpuGraphColor(), 100.0, metrics.getHistorySpanSeconds());
+            } else {
+                renderSensorSeriesGraph(ctx, graphLeft, top, graphWidth, 146, metrics.getOrderedCpuTemperatureHistory(), "CPU Temperature", "C", getCpuGraphColor(), 110.0, metrics.getHistorySpanSeconds(), system.cpuTemperatureC() >= 0.0, textRenderer.trimToWidth(system.cpuTemperatureUnavailableReason(), Math.max(80, graphWidth - 12)));
+            }
             top += 164;
-            drawMetricRow(ctx, graphLeft, top, graphWidth, "Current CPU Load", formatPercent(system.cpuCoreLoadPercent()));
+            drawMetricRow(ctx, graphLeft, top, graphWidth, "Current CPU Load", formatPercentWithTrend(system.cpuCoreLoadPercent(), system.cpuLoadChangePerSecond()));
             top += 16;
-            drawMetricRow(ctx, graphLeft, top, graphWidth, "CPU Temperature", formatTemperature(system.cpuTemperatureC()));
+            drawMetricRow(ctx, graphLeft, top, graphWidth, "CPU Temperature", formatTemperatureWithTrend(system.cpuTemperatureC(), system.cpuTemperatureChangePerSecond()));
             top += 16;
             drawMetricRow(ctx, graphLeft, top, graphWidth, "CPU Info", formatCpuInfo());
             endFullPageScissor(ctx);
@@ -1100,11 +1123,20 @@ public class TaskManagerScreen extends Screen {
         if (systemMiniTab == SystemMiniTab.GPU_GRAPH) {
             int graphWidth = getPreferredGraphWidth(w);
             int graphLeft = x + Math.max(PADDING, (w - graphWidth) / 2);
-            renderFixedScaleSeriesGraph(ctx, graphLeft, top, graphWidth, 146, metrics.getOrderedGpuLoadHistory(), "GPU Load", "% load", getGpuGraphColor(), 100.0, metrics.getHistorySpanSeconds());
+            renderGraphMetricTabs(ctx, graphLeft, top, graphWidth, gpuGraphMetricTab);
+            top += 24;
+            if (gpuGraphMetricTab == GraphMetricTab.LOAD) {
+                renderFixedScaleSeriesGraph(ctx, graphLeft, top, graphWidth, 146, metrics.getOrderedGpuLoadHistory(), "GPU Load", "%", getGpuGraphColor(), 100.0, metrics.getHistorySpanSeconds());
+            } else {
+                renderSensorSeriesGraph(ctx, graphLeft, top, graphWidth, 146, metrics.getOrderedGpuTemperatureHistory(), "GPU Temperature", "C", getGpuGraphColor(), 110.0, metrics.getHistorySpanSeconds(), system.gpuTemperatureC() >= 0.0, "Sensor not available from telemetry bridge");
+            }
             top += 164;
-            drawMetricRow(ctx, graphLeft, top, graphWidth, "Current GPU Load", formatPercent(system.gpuCoreLoadPercent()));
+            double vramMaxMb = Math.max(1.0, system.vramTotalBytes() > 0L ? system.vramTotalBytes() / (1024.0 * 1024.0) : 1.0);
+            renderFixedScaleSeriesGraph(ctx, graphLeft, top, graphWidth, 118, metrics.getOrderedVramUsedHistory(), "VRAM Usage", "MB", getGpuGraphColor(), vramMaxMb, metrics.getHistorySpanSeconds());
+            top += 132;
+            drawMetricRow(ctx, graphLeft, top, graphWidth, "Current GPU Load", formatPercentWithTrend(system.gpuCoreLoadPercent(), system.gpuLoadChangePerSecond()));
             top += 16;
-            drawMetricRow(ctx, graphLeft, top, graphWidth, "GPU Temperature", formatTemperature(system.gpuTemperatureC()));
+            drawMetricRow(ctx, graphLeft, top, graphWidth, "GPU Temperature", formatTemperatureWithTrend(system.gpuTemperatureC(), system.gpuTemperatureChangePerSecond()));
             top += 16;
             drawMetricRow(ctx, graphLeft, top, graphWidth, "GPU Info", blankToUnknown(system.gpuVendor()) + " | " + blankToUnknown(system.gpuRenderer()));
             top += 16;
@@ -1124,6 +1156,7 @@ public class TaskManagerScreen extends Screen {
                     "Memory Load", "MB", getMemoryGraphColor(), 0x6688B5FF, heapMaxMb,
                     metrics.getHistorySpanSeconds());
             top += 164;
+            top += renderGraphLegend(ctx, graphLeft, top, new String[]{"Heap Used", "Heap Allocated"}, new int[]{getMemoryGraphColor(), 0x6688B5FF}) + 8;
             drawMetricRow(ctx, graphLeft, top, graphWidth, "Heap Used", formatBytesMb(snapshot.memory().heapUsedBytes()));
             top += 16;
             drawMetricRow(ctx, graphLeft, top, graphWidth, "Heap Allocated", formatBytesMb(snapshot.memory().heapCommittedBytes()));
@@ -1148,9 +1181,9 @@ public class TaskManagerScreen extends Screen {
         top += 16;
         drawMetricRow(ctx, left, top, w - 32, "Off-Heap Direct", formatBytesMb(system.directMemoryUsedBytes()) + " / " + formatBytesMb(system.directMemoryMaxBytes()));
         top += 16;
-        drawMetricRow(ctx, left, top, w - 32, "CPU Core Load", formatPercent(system.cpuCoreLoadPercent()));
+        drawMetricRow(ctx, left, top, w - 32, "CPU", formatCpuGpuSummary(system, true));
         top += 16;
-        drawMetricRow(ctx, left, top, w - 32, "GPU Core Load", formatPercent(system.gpuCoreLoadPercent()));
+        drawMetricRow(ctx, left, top, w - 32, "GPU", formatCpuGpuSummary(system, false));
         top += 16;
         drawMetricRow(ctx, left, top, w - 32, "CPU Temperature", formatTemperature(system.cpuTemperatureC()));
         top += 16;
@@ -1249,14 +1282,31 @@ public class TaskManagerScreen extends Screen {
         int top = getFullPageScrollTop(y);
         top = renderSectionHeader(ctx, left, top, "World", "Chunk pressure, entity hotspots, and block-entity drilldown grouped into world-focused views.");
         int lagTabW = 76;
+        int entitiesTabW = 70;
+        int chunksTabW = 72;
         int blockTabW = 108;
-        drawTopChip(ctx, left, layout.miniTabY(), lagTabW, 16, worldMiniTab == WorldMiniTab.LAG_MAP);
-        drawTopChip(ctx, left + lagTabW + 6, layout.miniTabY(), blockTabW, 16, worldMiniTab == WorldMiniTab.BLOCK_ENTITIES);
-        ctx.drawText(textRenderer, "Lag Map", left + 16, layout.miniTabY() + 4, worldMiniTab == WorldMiniTab.LAG_MAP ? TEXT_PRIMARY : TEXT_DIM, false);
-        ctx.drawText(textRenderer, "Block Entities", left + lagTabW + 20, layout.miniTabY() + 4, worldMiniTab == WorldMiniTab.BLOCK_ENTITIES ? TEXT_PRIMARY : TEXT_DIM, false);
+        int tabX = left;
+        drawTopChip(ctx, tabX, layout.miniTabY(), lagTabW, 16, worldMiniTab == WorldMiniTab.LAG_MAP);
+        tabX += lagTabW + 6;
+        drawTopChip(ctx, tabX, layout.miniTabY(), entitiesTabW, 16, worldMiniTab == WorldMiniTab.ENTITIES);
+        tabX += entitiesTabW + 6;
+        drawTopChip(ctx, tabX, layout.miniTabY(), chunksTabW, 16, worldMiniTab == WorldMiniTab.CHUNKS);
+        tabX += chunksTabW + 6;
+        drawTopChip(ctx, tabX, layout.miniTabY(), blockTabW, 16, worldMiniTab == WorldMiniTab.BLOCK_ENTITIES);
+        tabX = left;
+        ctx.drawText(textRenderer, "Lag Map", tabX + 16, layout.miniTabY() + 4, worldMiniTab == WorldMiniTab.LAG_MAP ? TEXT_PRIMARY : TEXT_DIM, false);
+        tabX += lagTabW + 6;
+        ctx.drawText(textRenderer, "Entities", tabX + 12, layout.miniTabY() + 4, worldMiniTab == WorldMiniTab.ENTITIES ? TEXT_PRIMARY : TEXT_DIM, false);
+        tabX += entitiesTabW + 6;
+        ctx.drawText(textRenderer, "Chunks", tabX + 14, layout.miniTabY() + 4, worldMiniTab == WorldMiniTab.CHUNKS ? TEXT_PRIMARY : TEXT_DIM, false);
+        tabX += chunksTabW + 6;
+        ctx.drawText(textRenderer, "Block Entities", tabX + 14, layout.miniTabY() + 4, worldMiniTab == WorldMiniTab.BLOCK_ENTITIES ? TEXT_PRIMARY : TEXT_DIM, false);
         int findingsCount = ProfilerManager.getInstance().getLatestRuleFindings().size();
         ctx.drawText(textRenderer, String.format(Locale.ROOT, "Selected chunk: %s | hot chunks: %d | findings: %d", selectedLagChunk == null ? "none" : (selectedLagChunk.x + "," + selectedLagChunk.z), ProfilerManager.getInstance().getLatestHotChunks().size(), findingsCount), left, layout.summaryY(), TEXT_DIM, false);
-        top = layout.mapRenderY();
+        SystemMetricsProfiler metrics = SystemMetricsProfiler.getInstance();
+        int worldGraphWidth = getPreferredGraphWidth(w);
+        int worldGraphX = x + Math.max(PADDING, (w - worldGraphWidth) / 2);
+        top = layout.summaryY() + 18;
 
         if (worldMiniTab == WorldMiniTab.LAG_MAP) {
             renderLagMap(ctx, layout.left(), layout.mapRenderY(), layout.mapWidth(), layout.mapHeight());
@@ -1283,6 +1333,33 @@ public class TaskManagerScreen extends Screen {
             }
             top += 8;
             top = renderEntityHotspotSection(ctx, left, top, w - 24, ProfilerManager.getInstance().getLatestEntityHotspots(), "Entity Hotspots") + 8;
+            top += renderRuleFindingsSection(ctx, left, top, w - 24, ProfilerManager.getInstance().getLatestRuleFindings()) + 8;
+        } else if (worldMiniTab == WorldMiniTab.ENTITIES) {
+            drawMetricRow(ctx, worldGraphX, top, worldGraphWidth, "Entities", Integer.toString(snapshot.entityCounts().totalEntities()));
+            top += 18;
+            renderSeriesGraph(ctx, worldGraphX, top, worldGraphWidth, 120, metrics.getOrderedEntityCountHistory(), null, "Entities Over Time", "entities", getWorldEntityGraphColor(), 0, metrics.getHistorySpanSeconds());
+            top += 138;
+            top += renderGraphLegend(ctx, worldGraphX, top, new String[]{"Entities"}, new int[]{getWorldEntityGraphColor()}) + 8;
+            drawMetricRow(ctx, worldGraphX, top, worldGraphWidth, "Living", Integer.toString(snapshot.entityCounts().livingEntities()));
+            top += 16;
+            drawMetricRow(ctx, worldGraphX, top, worldGraphWidth, "Block Entities", Integer.toString(snapshot.entityCounts().blockEntities()));
+            top += 20;
+            top = renderEntityHotspotSection(ctx, left, top, w - 24, ProfilerManager.getInstance().getLatestEntityHotspots(), "Entity Hotspots") + 8;
+            top += renderRuleFindingsSection(ctx, left, top, w - 24, ProfilerManager.getInstance().getLatestRuleFindings()) + 8;
+        } else if (worldMiniTab == WorldMiniTab.CHUNKS) {
+            drawMetricRow(ctx, worldGraphX, top, worldGraphWidth, "Chunks", snapshot.chunkCounts().loadedChunks() + " loaded | " + snapshot.chunkCounts().renderedChunks() + " rendered");
+            top += 18;
+            renderSeriesGraph(ctx, worldGraphX, top, worldGraphWidth, 120, metrics.getOrderedLoadedChunkHistory(), metrics.getOrderedRenderedChunkHistory(), "Chunks Over Time", "chunks", getWorldLoadedChunkGraphColor(), getWorldRenderedChunkGraphColor(), metrics.getHistorySpanSeconds());
+            top += 138;
+            top += renderGraphLegend(ctx, worldGraphX, top, new String[]{"Loaded", "Rendered"}, new int[]{getWorldLoadedChunkGraphColor(), getWorldRenderedChunkGraphColor()}) + 8;
+            drawMetricRow(ctx, worldGraphX, top, worldGraphWidth, "Chunk Generating", Integer.toString(snapshot.systemMetrics().chunksGenerating()));
+            top += 16;
+            drawMetricRow(ctx, worldGraphX, top, worldGraphWidth, "Chunk Meshing", Integer.toString(snapshot.systemMetrics().chunksMeshing()));
+            top += 16;
+            drawMetricRow(ctx, worldGraphX, top, worldGraphWidth, "Chunk Uploading", Integer.toString(snapshot.systemMetrics().chunksUploading()));
+            top += 16;
+            drawMetricRow(ctx, worldGraphX, top, worldGraphWidth, "Light Updates", Integer.toString(snapshot.systemMetrics().lightsUpdatePending()));
+            top += 20;
             top += renderRuleFindingsSection(ctx, left, top, w - 24, ProfilerManager.getInstance().getLatestRuleFindings()) + 8;
         } else {
             top = renderBlockEntityHotspotSection(ctx, left, top, w - 24, ProfilerManager.getInstance().getLatestBlockEntityHotspots(), "Block Entity Hotspots") + 8;
@@ -1616,9 +1693,11 @@ public class TaskManagerScreen extends Screen {
 
     private int renderSimpleHistoryGraph(DrawContext ctx, int x, int y, int width, int height, java.util.List<Integer> history, String title, String units, int explicitMax) {
         ctx.drawText(textRenderer, title + " (" + units + ")", x, y, TEXT_DIM, false);
+        int axisLabelWidth = 34;
         int gx = x;
         int gy = y + 14;
-        int graphWidth = Math.max(80, width);
+        int graphWidth = Math.max(80, width - axisLabelWidth - 6);
+        int axisX = gx + graphWidth + 8;
         int graphHeight = Math.max(36, height - 18);
         ctx.fill(gx - 2, gy - 2, gx + graphWidth + 2, gy + graphHeight + 2, 0x66000000);
         if (history == null || history.isEmpty()) {
@@ -1628,9 +1707,9 @@ public class TaskManagerScreen extends Screen {
         int max = explicitMax > 0 ? explicitMax : history.stream().mapToInt(Integer::intValue).max().orElse(1);
         String topLabel = String.valueOf(max);
         String midLabel = String.valueOf(Math.max(0, max / 2));
-        ctx.drawText(textRenderer, topLabel, gx + graphWidth - textRenderer.getWidth(topLabel), gy - 10, TEXT_DIM, false);
-        ctx.drawText(textRenderer, midLabel, gx + graphWidth - textRenderer.getWidth(midLabel), gy + graphHeight / 2 - 4, TEXT_DIM, false);
-        ctx.drawText(textRenderer, "0", gx + graphWidth - textRenderer.getWidth("0"), gy + graphHeight - 8, TEXT_DIM, false);
+        ctx.drawText(textRenderer, topLabel, axisX, gy - 4, TEXT_DIM, false);
+        ctx.drawText(textRenderer, midLabel, axisX, gy + graphHeight / 2 - 4, TEXT_DIM, false);
+        ctx.drawText(textRenderer, "0", axisX, gy + graphHeight - 8, TEXT_DIM, false);
         for (int px = 0; px < graphWidth; px++) {
             int start = (int) Math.floor(px * history.size() / (double) graphWidth);
             int end = (int) Math.floor((px + 1) * history.size() / (double) graphWidth) - 1;
@@ -1649,6 +1728,8 @@ public class TaskManagerScreen extends Screen {
             }
             ctx.fill(gx + px, gy + graphHeight - barHeight, gx + px + 1, gy + graphHeight, 0xFF5EA9FF);
         }
+        double[] markerValues = history.stream().mapToDouble(Integer::doubleValue).toArray();
+        drawCurrentValueMarker(ctx, gx, gy, graphWidth, graphHeight, axisX, markerValues, max, 0xFF5EA9FF, "", 0);
         return height;
     }
 
@@ -1868,7 +1949,15 @@ public class TaskManagerScreen extends Screen {
                 worldMiniTab = WorldMiniTab.LAG_MAP;
                 return true;
             }
-            if (isInside(mouseX, mouseY, left + 82, top, 108, 16)) {
+            if (isInside(mouseX, mouseY, left + 82, top, 70, 16)) {
+                worldMiniTab = WorldMiniTab.ENTITIES;
+                return true;
+            }
+            if (isInside(mouseX, mouseY, left + 158, top, 72, 16)) {
+                worldMiniTab = WorldMiniTab.CHUNKS;
+                return true;
+            }
+            if (isInside(mouseX, mouseY, left + 236, top, 108, 16)) {
                 worldMiniTab = WorldMiniTab.BLOCK_ENTITIES;
                 return true;
             }
@@ -1900,30 +1989,134 @@ public class TaskManagerScreen extends Screen {
                 systemMiniTab = SystemMiniTab.MEMORY_GRAPH;
                 return true;
             }
+            int graphTabsY = top + 24;
+            int graphTabsX = Math.max(PADDING, (getScreenWidth() - getPreferredGraphWidth(getScreenWidth())) / 2);
+            if (systemMiniTab == SystemMiniTab.CPU_GRAPH) {
+                if (isInside(mouseX, mouseY, graphTabsX, graphTabsY, 84, 16)) {
+                    cpuGraphMetricTab = GraphMetricTab.LOAD;
+                    return true;
+                }
+                if (isInside(mouseX, mouseY, graphTabsX + 90, graphTabsY, 120, 16)) {
+                    cpuGraphMetricTab = GraphMetricTab.TEMPERATURE;
+                    return true;
+                }
+            }
+            if (systemMiniTab == SystemMiniTab.GPU_GRAPH) {
+                if (isInside(mouseX, mouseY, graphTabsX, graphTabsY, 84, 16)) {
+                    gpuGraphMetricTab = GraphMetricTab.LOAD;
+                    return true;
+                }
+                if (isInside(mouseX, mouseY, graphTabsX + 90, graphTabsY, 120, 16)) {
+                    gpuGraphMetricTab = GraphMetricTab.TEMPERATURE;
+                    return true;
+                }
+            }
         }
 
         if (activeTab == 11) {
             int left = PADDING;
-            int top = getContentY() + PADDING + 18 - scrollOffset;
-            int[] offsets = {0, 22, 44, 66, 116, 138, 160, 182, 204, 226, 248, 270, 292, 314, 336, 358, 380, 432, 454, 476, 498, 520, 542, 564, 586, 608, 630, 652};
-            Runnable[] actions = {
+            int actionY = getContentY() + PADDING + 18 - scrollOffset;
+            Runnable[] sessionActions = {
                 () -> ProfilerManager.getInstance().toggleSessionLogging(),
                 ConfigManager::cycleSessionDurationSeconds,
                 ConfigManager::cycleMetricsUpdateIntervalMs,
-                ConfigManager::cycleProfilerUpdateDelayMs,
+                ConfigManager::cycleProfilerUpdateDelayMs
+            };
+            for (Runnable action : sessionActions) {
+                if (isInside(mouseX, mouseY, left, actionY, getScreenWidth() - 16, 16)) {
+                    action.run();
+                    return true;
+                }
+                actionY += 22;
+            }
+
+            actionY += 32;
+            Runnable[] hudBaseActions = {
                 () -> ConfigManager.setHudEnabled(!ConfigManager.isHudEnabled()),
                 ConfigManager::cycleHudPosition,
                 ConfigManager::cycleHudLayoutMode,
-                ConfigManager::cycleHudTriggerMode,
-                ConfigManager::toggleHudShowFps,
-                ConfigManager::toggleHudShowFrame,
-                ConfigManager::toggleHudShowTicks,
-                ConfigManager::toggleHudShowUtilization,
-                ConfigManager::toggleHudShowTemperatures,
-                ConfigManager::toggleHudShowParallelism,
-                ConfigManager::toggleHudShowMemory,
-                ConfigManager::toggleHudShowWorld,
-                ConfigManager::toggleHudShowSession,
+                ConfigManager::cycleHudTriggerMode
+            };
+            for (Runnable action : hudBaseActions) {
+                if (isInside(mouseX, mouseY, left, actionY, getScreenWidth() - 16, 16)) {
+                    action.run();
+                    return true;
+                }
+                actionY += 22;
+            }
+            if (handleHudTransparencySliderClick(mouseX, mouseY, left, actionY, getScreenWidth() - 24)) {
+                return true;
+            }
+            actionY += 24;
+            if (isInside(mouseX, mouseY, left, actionY, getScreenWidth() - 16, 16)) {
+                ConfigManager.cycleHudConfigMode();
+                return true;
+            }
+            actionY += 22;
+
+            boolean presetMode = ConfigManager.getHudConfigMode() == ConfigManager.HudConfigMode.PRESET;
+            Runnable[] hudModeActions = presetMode
+                    ? new Runnable[] {
+                        ConfigManager::cycleHudPreset,
+                        () -> ConfigManager.setHudExpandedOnWarning(!ConfigManager.isHudExpandedOnWarning()),
+                        ConfigManager::toggleHudBudgetColorMode,
+                        ConfigManager::toggleHudAutoFocusAlertRow
+                    }
+                    : new Runnable[] {
+                        ConfigManager::toggleHudShowFps,
+                        ConfigManager::toggleHudShowFrame,
+                        ConfigManager::toggleHudShowTicks,
+                        ConfigManager::toggleHudShowUtilization,
+                        ConfigManager::toggleHudShowTemperatures,
+                        ConfigManager::toggleHudShowParallelism,
+                        ConfigManager::toggleHudShowLogic,
+                        ConfigManager::toggleHudShowBackground,
+                        ConfigManager::toggleHudShowFrameBudget,
+                        ConfigManager::toggleHudShowMemory,
+                        ConfigManager::toggleHudShowVram,
+                        ConfigManager::toggleHudShowNetwork,
+                        ConfigManager::toggleHudShowChunkActivity,
+                        ConfigManager::toggleHudShowWorld,
+                        ConfigManager::toggleHudShowDiskIo,
+                        ConfigManager::toggleHudShowInputLatency,
+                        ConfigManager::toggleHudShowSession,
+                        () -> ConfigManager.setHudExpandedOnWarning(!ConfigManager.isHudExpandedOnWarning()),
+                        ConfigManager::toggleHudBudgetColorMode,
+                        ConfigManager::toggleHudAutoFocusAlertRow
+                    };
+            for (Runnable action : hudModeActions) {
+                if (isInside(mouseX, mouseY, left, actionY, getScreenWidth() - 16, 16)) {
+                    action.run();
+                    return true;
+                }
+                actionY += 22;
+            }
+
+            actionY += presetMode ? 20 : 20;
+            Runnable[] hudRateActions = {
+                ConfigManager::toggleHudShowZeroRateOfChange,
+                ConfigManager::toggleHudShowFpsRateOfChange,
+                ConfigManager::toggleHudShowFrameRateOfChange,
+                ConfigManager::toggleHudShowTickRateOfChange,
+                ConfigManager::toggleHudShowUtilizationRateOfChange,
+                ConfigManager::toggleHudShowMemoryAllocationRate,
+                ConfigManager::toggleHudShowVramRateOfChange,
+                ConfigManager::toggleHudShowNetworkRateOfChange,
+                ConfigManager::toggleHudShowChunkActivityRateOfChange,
+                ConfigManager::toggleHudShowWorldRateOfChange,
+                ConfigManager::toggleHudShowDiskIoRateOfChange,
+                ConfigManager::toggleHudShowInputLatencyRateOfChange
+            };
+            for (Runnable action : hudRateActions) {
+                if (isInside(mouseX, mouseY, left, actionY, getScreenWidth() - 16, 16)) {
+                    action.run();
+                    return true;
+                }
+                actionY += 22;
+            }
+
+            actionY += 32;
+            Runnable[] tableActions = {
                 () -> ConfigManager.toggleTasksColumn("cpu"),
                 () -> ConfigManager.toggleTasksColumn("threads"),
                 () -> ConfigManager.toggleTasksColumn("samples"),
@@ -1936,22 +2129,25 @@ public class TaskManagerScreen extends Screen {
                 () -> ConfigManager.toggleMemoryColumn("mb"),
                 () -> ConfigManager.toggleMemoryColumn("pct")
             };
-            for (int i = 0; i < offsets.length; i++) {
-                if (isInside(mouseX, mouseY, left, top + offsets[i], getScreenWidth() - 16, 16)) {
-                    actions[i].run();
+            for (Runnable action : tableActions) {
+                if (isInside(mouseX, mouseY, left, actionY, getScreenWidth() - 16, 16)) {
+                    action.run();
                     return true;
                 }
+                actionY += 22;
             }
-            int[] colorOffsets = {706, 728};
-            ColorSetting[] colorSettings = {ColorSetting.CPU, ColorSetting.GPU};
-            for (int i = 0; i < colorOffsets.length; i++) {
-                if (isInside(mouseX, mouseY, left, top + colorOffsets[i], getScreenWidth() - 16, 16)) {
-                    focusedColorSetting = colorSettings[i];
+
+            actionY += 32;
+            ColorSetting[] colorSettings = {ColorSetting.CPU, ColorSetting.GPU, ColorSetting.WORLD_ENTITIES, ColorSetting.WORLD_CHUNKS_LOADED, ColorSetting.WORLD_CHUNKS_RENDERED};
+            for (ColorSetting colorSetting : colorSettings) {
+                if (isInside(mouseX, mouseY, left, actionY, getScreenWidth() - 16, 16)) {
+                    focusedColorSetting = colorSetting;
                     colorEditValue = getColorSettingHex(focusedColorSetting);
                     return true;
                 }
+                actionY += 22;
             }
-            if (isInside(mouseX, mouseY, left, top + 750, getScreenWidth() - 16, 16)) {
+            if (isInside(mouseX, mouseY, left, actionY, getScreenWidth() - 16, 16)) {
                 ConfigManager.resetGraphColors();
                 focusedColorSetting = null;
                 colorEditValue = "";
@@ -1962,6 +2158,26 @@ public class TaskManagerScreen extends Screen {
         return super.mouseClicked(click, doubled);
     }
 
+
+
+    @Override
+    public boolean mouseDragged(Click click, double deltaX, double deltaY) {
+        if (draggingHudTransparency && activeTab == 11) {
+            int left = PADDING;
+            int actionY = getContentY() + PADDING + 18 - scrollOffset;
+            actionY += (22 * hudBaseActionCount()) + 32 + (22 * hudBaseActionCount());
+            SliderLayout slider = getHudTransparencySliderLayout(left, actionY, getScreenWidth() - 24);
+            updateHudTransparencyFromMouse(toLogicalX(click.x()), slider);
+            return true;
+        }
+        return super.mouseDragged(click, deltaX, deltaY);
+    }
+
+    @Override
+    public boolean mouseReleased(Click click) {
+        draggingHudTransparency = false;
+        return super.mouseReleased(click);
+    }
 
     @Override
     public boolean mouseScrolled(double mouseX, double mouseY, double horizontalAmount, double verticalAmount) {
@@ -1988,12 +2204,53 @@ public class TaskManagerScreen extends Screen {
             case 6 -> Math.max(visibleHeight, 430);
             case 7 -> Math.max(visibleHeight, 560);
             case 8 -> Math.max(visibleHeight, 240);
-            case 9 -> Math.max(visibleHeight, 1160);
+            case 9 -> Math.max(visibleHeight, 980);
             case 10 -> Math.max(visibleHeight, 1240);
-            case 11 -> Math.max(visibleHeight, 980);
+            case 11 -> Math.max(visibleHeight, getSettingsContentHeight());
             default -> visibleHeight;
         };
         return Math.max(0, contentHeight - visibleHeight);
+    }
+
+    private int getSettingsContentHeight() {
+        int contentHeight = 18;
+        contentHeight += 4 * 22;
+        contentHeight += 32;
+        contentHeight += 18;
+        contentHeight += 4 * 22;
+        contentHeight += 24;
+        contentHeight += 22;
+        if (ConfigManager.getHudConfigMode() == ConfigManager.HudConfigMode.PRESET) {
+            contentHeight += hudModeActionCount(true) * 22;
+            contentHeight += 20;
+            contentHeight += 34;
+        } else {
+            contentHeight += hudModeActionCount(false) * 22;
+            contentHeight += 20;
+        }
+        contentHeight += 18;
+        contentHeight += hudRateActionCount() * 22;
+        contentHeight += 32;
+        contentHeight += 18;
+        contentHeight += 11 * 22;
+        contentHeight += 32;
+        contentHeight += 18;
+        contentHeight += 6 * 22;
+        contentHeight += 34;
+        return contentHeight;
+    }
+
+
+    static int hudBaseActionCount() {
+        return 4;
+    }
+
+    static int hudModeActionCount(boolean presetMode) {
+        return presetMode ? 4 : 20;
+    }
+
+    static int hudRateActionCount() {
+        return 12;
     }
 
     private boolean isInside(double mouseX, double mouseY, int x, int y, int width, int height) {
@@ -2022,6 +2279,10 @@ public class TaskManagerScreen extends Screen {
 
     @Override
     public boolean keyPressed(KeyInput input) {
+        if (wueffi.taskmanager.client.util.KeyBindHandler.matchesOpenKey(input)) {
+            close();
+            return true;
+        }
         if (focusedColorSetting != null) {
             if (input.key() == 259) {
                 if (!colorEditValue.isEmpty()) {
@@ -2344,9 +2605,11 @@ public class TaskManagerScreen extends Screen {
         if (activeTab != 4) {
             return null;
         }
-        int sharedPanelW = snapshot.sharedMemoryFamilies().isEmpty() ? 0 : Math.min(280, Math.max(220, getScreenWidth() / 4));
-        int tableW = getScreenWidth() - sharedPanelW - (sharedPanelW > 0 ? PADDING : 0);
-        return findRowAt(mouseX, mouseY, getContentY() + PADDING + 110, tableW, getMemoryRows());
+        MemoryListLayout layout = getMemoryListLayout();
+        if (!isInside(mouseX, mouseY, 0, layout.listY(), layout.tableWidth(), layout.listHeight())) {
+            return null;
+        }
+        return findRowAt(mouseX, mouseY, layout.listY(), layout.tableWidth(), getMemoryRows());
     }
 
     private String findSharedFamilyAt(double mouseX, double mouseY) {
@@ -2400,10 +2663,28 @@ public class TaskManagerScreen extends Screen {
         return null;
     }
 
+    private MemoryListLayout getMemoryListLayout() {
+        int sharedPanelW = snapshot.sharedMemoryFamilies().isEmpty() ? 0 : Math.min(280, Math.max(220, getScreenWidth() / 4));
+        int detailH = 116;
+        int panelGap = sharedPanelW > 0 ? PADDING : 0;
+        int tableW = getScreenWidth() - sharedPanelW - panelGap;
+        int top = getContentY() + PADDING;
+        int controlsY = top + 28;
+        int barY = controlsY + 24;
+        int headerY = barY + 58;
+        int listY = headerY + 16;
+        int listH = getScreenHeight() - getContentY() - PADDING - (listY - getContentY()) - detailH;
+        return new MemoryListLayout(tableW, listY, listH);
+    }
+
 
     public static boolean isProfilingActive() {
         MinecraftClient client = MinecraftClient.getInstance();
         return client != null && client.currentScreen instanceof TaskManagerScreen;
+    }
+
+    public static boolean isLiveMetricsActive() {
+        return ProfilerManager.getInstance().shouldCollectFrameMetrics();
     }
 
     public static boolean isMemoryTabActive(MinecraftClient client) {
@@ -2462,6 +2743,52 @@ public class TaskManagerScreen extends Screen {
             ctx.fill(x - 4, y - 2, x + width + 4, y + 14, 0x1AFFFFFF);
         }
         drawMetricRow(ctx, x, y, width, label, value);
+    }
+
+
+    private void drawSettingRowWithTooltip(DrawContext ctx, int x, int y, int width, String label, String value, int mouseX, int mouseY, String tooltip) {
+        drawSettingRow(ctx, x, y, width, label, value, mouseX, mouseY);
+        addTooltip(x - 4, y - 2, width + 8, 16, tooltip);
+    }
+
+    private void drawSliderSetting(DrawContext ctx, int x, int y, int width, String label, int percent, int mouseX, int mouseY) {
+        if (isInside(mouseX, mouseY, x - 4, y - 2, width + 8, 20)) {
+            ctx.fill(x - 4, y - 2, x + width + 4, y + 18, 0x1AFFFFFF);
+        }
+        ctx.drawText(textRenderer, label, x, y, TEXT_DIM, false);
+        String value = percent + "%";
+        ctx.drawText(textRenderer, value, x + width - textRenderer.getWidth(value), y, TEXT_PRIMARY, false);
+        SliderLayout slider = getHudTransparencySliderLayout(x, y, width);
+        ctx.fill(slider.x(), slider.y(), slider.x() + slider.width(), slider.y() + slider.height(), 0x332A2A2A);
+        ctx.fill(slider.x(), slider.y(), slider.x() + slider.width(), slider.y() + 1, PANEL_OUTLINE);
+        ctx.fill(slider.x(), slider.y() + slider.height() - 1, slider.x() + slider.width(), slider.y() + slider.height(), PANEL_OUTLINE);
+        int filledWidth = Math.max(6, slider.width() * percent / 100);
+        ctx.fill(slider.x(), slider.y(), slider.x() + filledWidth, slider.y() + slider.height(), ACCENT_GREEN);
+        int knobX = slider.x() + Math.max(0, Math.min(slider.width() - 6, filledWidth - 3));
+        ctx.fill(knobX, slider.y() - 2, knobX + 6, slider.y() + slider.height() + 2, TEXT_PRIMARY);
+    }
+
+    private SliderLayout getHudTransparencySliderLayout(int x, int y, int width) {
+        int sliderWidth = Math.min(140, Math.max(96, width / 4));
+        int sliderX = x + width - sliderWidth;
+        int sliderY = y + 10;
+        return new SliderLayout(sliderX, sliderY, sliderWidth, 6);
+    }
+
+    private boolean handleHudTransparencySliderClick(double mouseX, double mouseY, int x, int y, int width) {
+        SliderLayout slider = getHudTransparencySliderLayout(x, y, width);
+        if (!isInside(mouseX, mouseY, slider.x(), slider.y() - 3, slider.width(), slider.height() + 6)) {
+            return false;
+        }
+        draggingHudTransparency = true;
+        updateHudTransparencyFromMouse(mouseX, slider);
+        return true;
+    }
+
+    private void updateHudTransparencyFromMouse(double mouseX, SliderLayout slider) {
+        double ratio = Math.max(0.0, Math.min(1.0, (mouseX - slider.x()) / Math.max(1.0, slider.width())));
+        int percent = (int) Math.round(10 + (ratio * 90.0));
+        ConfigManager.setHudTransparencyPercent(percent);
     }
 
     private void renderStripedRow(DrawContext ctx, int x, int width, int rowY, int rowIdx, int mouseX, int mouseY) {
@@ -2670,6 +2997,46 @@ public class TaskManagerScreen extends Screen {
         return String.format(Locale.ROOT, "%.1f C", value);
     }
 
+    private String formatPercentWithTrend(double value, double deltaPerSecond) {
+        String base = formatPercent(value);
+        if ("N/A".equals(base)) {
+            return base;
+        }
+        return base + " (" + formatSignedRate(deltaPerSecond, "%/s") + ")";
+    }
+
+    private String formatTemperatureWithTrend(double value, double deltaPerSecond) {
+        String base = formatTemperature(value);
+        if ("N/A".equals(base)) {
+            return base;
+        }
+        return base + " (" + formatSignedRate(deltaPerSecond, "C/s") + ")";
+    }
+
+    private String formatCpuGpuSummary(SystemMetricsProfiler.Snapshot system, boolean cpu) {
+        double load = cpu ? system.cpuCoreLoadPercent() : system.gpuCoreLoadPercent();
+        double temp = cpu ? system.cpuTemperatureC() : system.gpuTemperatureC();
+        double loadDelta = cpu ? system.cpuLoadChangePerSecond() : system.gpuLoadChangePerSecond();
+        double tempDelta = cpu ? system.cpuTemperatureChangePerSecond() : system.gpuTemperatureChangePerSecond();
+        String loadText = formatPercent(load);
+        String tempText = formatTemperature(temp);
+        String loadRate = formatSignedRate(loadDelta, "%/s");
+        if ("N/A".equals(tempText)) {
+            return loadText + " (" + loadRate + ")";
+        }
+        return loadText + " / " + tempText + " (" + loadRate + " / " + formatSignedRate(tempDelta, "C/s") + ")";
+    }
+
+    private String formatSignedRate(double value, String units) {
+        if (!Double.isFinite(value)) {
+            return "~0 " + units;
+        }
+        if (Math.abs(value) < 0.05) {
+            return "~0 " + units;
+        }
+        return String.format(Locale.ROOT, "%+.1f %s", value, units);
+    }
+
     private String formatCpuInfo() {
         String identifier = System.getenv("PROCESSOR_IDENTIFIER");
         int logicalCores = Runtime.getRuntime().availableProcessors();
@@ -2712,6 +3079,18 @@ public class TaskManagerScreen extends Screen {
         return ConfigManager.getGpuGraphColor();
     }
 
+    private int getWorldEntityGraphColor() {
+        return ConfigManager.getWorldEntityGraphColor();
+    }
+
+    private int getWorldLoadedChunkGraphColor() {
+        return ConfigManager.getWorldLoadedChunkGraphColor();
+    }
+
+    private int getWorldRenderedChunkGraphColor() {
+        return ConfigManager.getWorldRenderedChunkGraphColor();
+    }
+
     private int getMemoryGraphColor() {
         return 0xFF325C99;
     }
@@ -2720,6 +3099,9 @@ public class TaskManagerScreen extends Screen {
         return switch (setting) {
             case CPU -> ConfigManager.getCpuGraphColorHex();
             case GPU -> ConfigManager.getGpuGraphColorHex();
+            case WORLD_ENTITIES -> ConfigManager.getWorldEntityGraphColorHex();
+            case WORLD_CHUNKS_LOADED -> ConfigManager.getWorldLoadedChunkGraphColorHex();
+            case WORLD_CHUNKS_RENDERED -> ConfigManager.getWorldRenderedChunkGraphColorHex();
         };
     }
 
@@ -2727,6 +3109,9 @@ public class TaskManagerScreen extends Screen {
         switch (setting) {
             case CPU -> ConfigManager.setCpuGraphColorHex(value);
             case GPU -> ConfigManager.setGpuGraphColorHex(value);
+            case WORLD_ENTITIES -> ConfigManager.setWorldEntityGraphColorHex(value);
+            case WORLD_CHUNKS_LOADED -> ConfigManager.setWorldLoadedChunkGraphColorHex(value);
+            case WORLD_CHUNKS_RENDERED -> ConfigManager.setWorldRenderedChunkGraphColorHex(value);
         }
     }
 
@@ -2792,10 +3177,14 @@ public class TaskManagerScreen extends Screen {
 
     private void renderMetricGraph(DrawContext ctx, int x, int y, int width, int height, long[] primary, long[] secondary, String title, String units, double spanSeconds) {
         int graphHeight = Math.max(96, height);
-        renderSeriesGraph(ctx, x + PADDING, y, width - (PADDING * 2), graphHeight, toDoubleArray(primary), toDoubleArray(secondary), title, units, INTEL_COLOR, ACCENT_YELLOW, spanSeconds);
+        renderSeriesGraph(ctx, x + PADDING, y, width - (PADDING * 2), graphHeight, toDoubleArray(primary), toDoubleArray(secondary), title, units, INTEL_COLOR, ACCENT_YELLOW, spanSeconds, true);
     }
 
     private void renderSeriesGraph(DrawContext ctx, int x, int y, int width, int height, double[] primary, double[] secondary, String title, String units, int primaryColor, int secondaryColor, double spanSeconds) {
+        renderSeriesGraph(ctx, x, y, width, height, primary, secondary, title, units, primaryColor, secondaryColor, spanSeconds, false);
+    }
+
+    private void renderSeriesGraph(DrawContext ctx, int x, int y, int width, int height, double[] primary, double[] secondary, String title, String units, int primaryColor, int secondaryColor, double spanSeconds, boolean drawSmallerOnTop) {
         ctx.drawText(textRenderer, title + " (" + units + ")", x, y, TEXT_PRIMARY, false);
         int graphX = x;
         int graphY = y + 14;
@@ -2829,9 +3218,14 @@ public class TaskManagerScreen extends Screen {
         ctx.drawText(textRenderer, formatHistoryWindowLabel(spanSeconds), graphX, graphY + graphHeight + 4, TEXT_DIM, false);
         ctx.drawText(textRenderer, "now", graphX + plotWidth - textRenderer.getWidth("now"), graphY + graphHeight + 4, TEXT_DIM, false);
 
-        drawSeriesBars(ctx, graphX, graphY, plotWidth, graphHeight, primary, max, primaryColor);
         if (secondary != null && secondary.length > 0) {
-            drawSeriesBars(ctx, graphX, graphY, plotWidth, graphHeight, secondary, max, secondaryColor);
+            drawOverlappingSeriesBars(ctx, graphX, graphY, plotWidth, graphHeight, primary, secondary, max, primaryColor, secondaryColor, drawSmallerOnTop);
+        } else {
+            drawSeriesBars(ctx, graphX, graphY, plotWidth, graphHeight, primary, max, primaryColor);
+        }
+        drawCurrentValueMarker(ctx, graphX, graphY, plotWidth, graphHeight, axisX, primary, max, primaryColor, units, 0);
+        if (secondary != null && secondary.length > 0) {
+            drawCurrentValueMarker(ctx, graphX, graphY, plotWidth, graphHeight, axisX, secondary, max, secondaryColor, units, 12);
         }
     }
 
@@ -2851,6 +3245,91 @@ public class TaskManagerScreen extends Screen {
 
     private void renderFixedScaleSeriesGraph(DrawContext ctx, int x, int y, int width, int height, double[] values, String title, String units, int color, double fixedMax, double spanSeconds) {
         renderFixedScaleSeriesGraph(ctx, x, y, width, height, values, null, title, units, color, 0, fixedMax, spanSeconds);
+    }
+
+    private void renderGraphMetricTabs(DrawContext ctx, int x, int y, int width, GraphMetricTab activeMetricTab) {
+        int loadWidth = 84;
+        int temperatureWidth = 120;
+        drawTopChip(ctx, x, y, loadWidth, 16, activeMetricTab == GraphMetricTab.LOAD);
+        drawTopChip(ctx, x + loadWidth + 6, y, temperatureWidth, 16, activeMetricTab == GraphMetricTab.TEMPERATURE);
+        ctx.drawText(textRenderer, "Load Graph", x + 12, y + 4, activeMetricTab == GraphMetricTab.LOAD ? TEXT_PRIMARY : TEXT_DIM, false);
+        ctx.drawText(textRenderer, "Temperature Graph", x + loadWidth + 18, y + 4, activeMetricTab == GraphMetricTab.TEMPERATURE ? TEXT_PRIMARY : TEXT_DIM, false);
+    }
+
+    private void renderFixedScaleLineGraph(DrawContext ctx, int x, int y, int width, int height, double[] values, String title, String units, int color, double fixedMax, double spanSeconds) {
+        ctx.drawText(textRenderer, title + " (" + units + ")", x, y, TEXT_PRIMARY, false);
+        int graphX = x;
+        int graphY = y + 14;
+        int graphWidth = Math.max(120, width);
+        int graphHeight = Math.max(64, height - 30);
+        int plotRightPadding = 74;
+        int plotWidth = Math.max(72, graphWidth - plotRightPadding);
+        int axisX = graphX + plotWidth + 8;
+        int cardColor = 0x28101010;
+        int borderColor = 0x44383838;
+        int majorGridColor = 0x26FFFFFF;
+        int minorGridColor = 0x12FFFFFF;
+        ctx.fill(graphX - 3, graphY - 3, graphX + graphWidth + 3, graphY + graphHeight + 3, borderColor);
+        ctx.fill(graphX - 2, graphY - 2, graphX + graphWidth + 2, graphY + graphHeight + 2, cardColor);
+
+        double max = Math.max(1.0, fixedMax);
+        double mid = max / 2.0;
+        int midY = graphY + graphHeight / 2;
+        int quarterY = graphY + graphHeight / 4;
+        int threeQuarterY = graphY + (graphHeight * 3) / 4;
+        ctx.fill(graphX, graphY, graphX + plotWidth, graphY + 1, majorGridColor);
+        ctx.fill(graphX, midY, graphX + plotWidth, midY + 1, majorGridColor);
+        ctx.fill(graphX, quarterY, graphX + plotWidth, quarterY + 1, minorGridColor);
+        ctx.fill(graphX, threeQuarterY, graphX + plotWidth, threeQuarterY + 1, minorGridColor);
+        ctx.fill(graphX, graphY + graphHeight - 1, graphX + plotWidth, graphY + graphHeight, majorGridColor);
+
+        drawAxisLabel(ctx, axisX, graphY - 4, formatGraphValue(max, units));
+        drawAxisLabel(ctx, axisX, midY - 4, formatGraphValue(mid, units));
+        drawAxisLabel(ctx, axisX, graphY + graphHeight - 8, formatGraphValue(0.0, units));
+        ctx.drawText(textRenderer, formatHistoryWindowLabel(spanSeconds), graphX, graphY + graphHeight + 4, TEXT_DIM, false);
+        ctx.drawText(textRenderer, "now", graphX + plotWidth - textRenderer.getWidth("now"), graphY + graphHeight + 4, TEXT_DIM, false);
+        drawSeriesLine(ctx, graphX, graphY, plotWidth, graphHeight, values, max, color);
+        drawCurrentValueMarker(ctx, graphX, graphY, plotWidth, graphHeight, axisX, values, max, color, units, 0);
+    }
+
+    private void renderSensorSeriesGraph(DrawContext ctx, int x, int y, int width, int height, double[] values, String title, String units, int color, double fixedMax, double spanSeconds, boolean sensorAvailable, String unavailableLabel) {
+        renderFixedScaleLineGraph(ctx, x, y, width, height, sanitizeSeries(values), title, units, color, fixedMax, spanSeconds);
+        if (sensorAvailable || hasValidSeriesValue(values)) {
+            return;
+        }
+        int graphY = y + 14;
+        int graphWidth = Math.max(120, width);
+        int graphHeight = Math.max(64, height - 30);
+        int plotRightPadding = 74;
+        int plotWidth = Math.max(72, graphWidth - plotRightPadding);
+        String overlay = "Sensor not available";
+        int overlayX = x + Math.max(0, (plotWidth - textRenderer.getWidth(overlay)) / 2);
+        int overlayY = graphY + Math.max(8, (graphHeight / 2) - 4);
+        ctx.drawText(textRenderer, overlay, overlayX, overlayY, TEXT_DIM, false);
+        ctx.drawText(textRenderer, unavailableLabel, x, graphY + graphHeight + 4, TEXT_DIM, false);
+    }
+
+    private boolean hasValidSeriesValue(double[] values) {
+        if (values == null) {
+            return false;
+        }
+        for (double value : values) {
+            if (value >= 0.0 && Double.isFinite(value)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private double[] sanitizeSeries(double[] values) {
+        if (values == null) {
+            return new double[0];
+        }
+        double[] sanitized = new double[values.length];
+        for (int i = 0; i < values.length; i++) {
+            sanitized[i] = values[i] >= 0.0 && Double.isFinite(values[i]) ? values[i] : 0.0;
+        }
+        return sanitized;
     }
 
     private void renderFixedScaleSeriesGraph(DrawContext ctx, int x, int y, int width, int height, double[] primary, double[] secondary, String title, String units, int primaryColor, int secondaryColor, double fixedMax, double spanSeconds) {
@@ -2889,6 +3368,44 @@ public class TaskManagerScreen extends Screen {
         if (secondary != null && secondary.length > 0) {
             drawSeriesBars(ctx, graphX, graphY, plotWidth, graphHeight, secondary, max, secondaryColor);
         }
+        drawCurrentValueMarker(ctx, graphX, graphY, plotWidth, graphHeight, axisX, primary, max, primaryColor, units, 0);
+        if (secondary != null && secondary.length > 0) {
+            drawCurrentValueMarker(ctx, graphX, graphY, plotWidth, graphHeight, axisX, secondary, max, secondaryColor, units, 12);
+        }
+    }
+
+    private void drawSeriesLine(DrawContext ctx, int graphX, int graphY, int graphWidth, int graphHeight, double[] values, double max, int color) {
+        if (values == null || values.length == 0) {
+            return;
+        }
+        int previousX = -1;
+        int previousY = -1;
+        for (int px = 0; px < graphWidth; px++) {
+            int sampleIndex = Math.max(0, Math.min(values.length - 1, (int) Math.round(px * (values.length - 1) / (double) Math.max(1, graphWidth - 1))));
+            double value = values[sampleIndex];
+            int valueHeight = (int) Math.min(graphHeight - 1, Math.round((Math.max(0.0, value) / Math.max(1.0, max)) * (graphHeight - 1)));
+            int currentX = graphX + px;
+            int currentY = graphY + graphHeight - 1 - valueHeight;
+            ctx.fill(currentX, currentY, currentX + 1, currentY + 1, color);
+            if (previousX >= 0) {
+                drawLineSegment(ctx, previousX, previousY, currentX, currentY, color);
+            }
+            previousX = currentX;
+            previousY = currentY;
+        }
+    }
+
+    private void drawLineSegment(DrawContext ctx, int x1, int y1, int x2, int y2, int color) {
+        int steps = Math.max(Math.abs(x2 - x1), Math.abs(y2 - y1));
+        if (steps <= 0) {
+            ctx.fill(x1, y1, x1 + 1, y1 + 1, color);
+            return;
+        }
+        for (int step = 0; step <= steps; step++) {
+            int x = x1 + Math.round((x2 - x1) * (step / (float) steps));
+            int y = y1 + Math.round((y2 - y1) * (step / (float) steps));
+            ctx.fill(x, y, x + 1, y + 1, color);
+        }
     }
 
     private void drawSeriesBars(DrawContext ctx, int graphX, int graphY, int graphWidth, int graphHeight, double[] values, double max, int color) {
@@ -2896,24 +3413,77 @@ public class TaskManagerScreen extends Screen {
             return;
         }
         for (int px = 0; px < graphWidth; px++) {
-            int start = (int) Math.floor(px * values.length / (double) graphWidth);
-            int end = (int) Math.floor((px + 1) * values.length / (double) graphWidth) - 1;
-            if (end < start) {
-                end = start;
-            }
-            start = Math.max(0, Math.min(values.length - 1, start));
-            end = Math.max(0, Math.min(values.length - 1, end));
-            double peak = 0.0;
-            for (int i = start; i <= end; i++) {
-                peak = Math.max(peak, values[i]);
-            }
-            int valueHeight = (int) Math.min(graphHeight, Math.round((peak / Math.max(1.0, max)) * graphHeight));
-            if (valueHeight <= 0) {
+            double peak = peakSeriesValue(values, px, graphWidth);
+            drawSeriesBarColumn(ctx, graphX, graphY, graphHeight, max, color, px, peak);
+        }
+    }
+
+    private void drawOverlappingSeriesBars(DrawContext ctx, int graphX, int graphY, int graphWidth, int graphHeight, double[] primary, double[] secondary, double max, int primaryColor, int secondaryColor, boolean drawSmallerOnTop) {
+        for (int px = 0; px < graphWidth; px++) {
+            double primaryPeak = peakSeriesValue(primary, px, graphWidth);
+            double secondaryPeak = peakSeriesValue(secondary, px, graphWidth);
+            if (!drawSmallerOnTop || primaryPeak == secondaryPeak) {
+                drawSeriesBarColumn(ctx, graphX, graphY, graphHeight, max, primaryColor, px, primaryPeak);
+                drawSeriesBarColumn(ctx, graphX, graphY, graphHeight, max, secondaryColor, px, secondaryPeak);
                 continue;
             }
-            int barX = graphX + px;
-            ctx.fill(barX, graphY + graphHeight - valueHeight, barX + 1, graphY + graphHeight, color);
+            boolean primarySmaller = primaryPeak < secondaryPeak;
+            drawSeriesBarColumn(ctx, graphX, graphY, graphHeight, max, primarySmaller ? secondaryColor : primaryColor, px, primarySmaller ? secondaryPeak : primaryPeak);
+            drawSeriesBarColumn(ctx, graphX, graphY, graphHeight, max, primarySmaller ? primaryColor : secondaryColor, px, primarySmaller ? primaryPeak : secondaryPeak);
         }
+    }
+
+    private double peakSeriesValue(double[] values, int px, int graphWidth) {
+        if (values == null || values.length == 0) {
+            return 0.0;
+        }
+        int start = (int) Math.floor(px * values.length / (double) graphWidth);
+        int end = (int) Math.floor((px + 1) * values.length / (double) graphWidth) - 1;
+        if (end < start) {
+            end = start;
+        }
+        start = Math.max(0, Math.min(values.length - 1, start));
+        end = Math.max(0, Math.min(values.length - 1, end));
+        double peak = 0.0;
+        for (int i = start; i <= end; i++) {
+            peak = Math.max(peak, values[i]);
+        }
+        return peak;
+    }
+
+    private void drawSeriesBarColumn(DrawContext ctx, int graphX, int graphY, int graphHeight, double max, int color, int px, double peak) {
+        int valueHeight = (int) Math.min(graphHeight, Math.round((peak / Math.max(1.0, max)) * graphHeight));
+        if (valueHeight <= 0) {
+            return;
+        }
+        int barX = graphX + px;
+        ctx.fill(barX, graphY + graphHeight - valueHeight, barX + 1, graphY + graphHeight, color);
+    }
+
+    private void drawCurrentValueMarker(DrawContext ctx, int graphX, int graphY, int plotWidth, int graphHeight, int axisX, double[] values, double max, int color, String units, int yOffset) {
+        double currentValue = latestGraphValue(values);
+        if (!Double.isFinite(currentValue)) {
+            return;
+        }
+        int markerY = graphY + graphHeight - 1 - (int) Math.min(graphHeight - 1, Math.round((Math.max(0.0, currentValue) / Math.max(1.0, max)) * (graphHeight - 1)));
+        markerY = Math.max(graphY, Math.min(graphY + graphHeight - 8, markerY + yOffset));
+        int tickX = graphX + plotWidth - 4;
+        ctx.fill(tickX, markerY, tickX + 8, markerY + 1, color);
+        String label = formatGraphValue(currentValue, units);
+        int labelY = Math.max(graphY - 4, Math.min(graphY + graphHeight - 8, markerY - 4));
+        ctx.drawText(textRenderer, label, axisX, labelY, color, false);
+    }
+
+    private double latestGraphValue(double[] values) {
+        if (values == null || values.length == 0) {
+            return Double.NaN;
+        }
+        for (int i = values.length - 1; i >= 0; i--) {
+            if (Double.isFinite(values[i]) && values[i] >= 0.0) {
+                return values[i];
+            }
+        }
+        return Double.NaN;
     }
 
     private void drawAxisLabel(DrawContext ctx, int x, int y, String text) {
@@ -2951,6 +3521,9 @@ public class TaskManagerScreen extends Screen {
     private String formatGraphValue(double value, String units) {
         if ("B/s".equals(units)) {
             return formatBytesPerSecond(Math.round(value));
+        }
+        if (units == null || units.isBlank()) {
+            return String.format(Locale.ROOT, "%.0f", value);
         }
         return String.format(Locale.ROOT, "%.1f %s", value, units);
     }
@@ -3036,23 +3609,88 @@ public class TaskManagerScreen extends Screen {
         top += 22;
         drawSettingRow(ctx, left, top, w - 24, "Trigger Mode", String.valueOf(ConfigManager.getHudTriggerMode()), mouseX, mouseY);
         top += 22;
-        drawSettingRow(ctx, left, top, w - 24, "FPS", ConfigManager.isHudShowFps() ? "On" : "Off", mouseX, mouseY);
+        drawSliderSetting(ctx, left, top, w - 24, "HUD Transparency", ConfigManager.getHudTransparencyPercent(), mouseX, mouseY);
+        top += 24;
+        drawSettingRow(ctx, left, top, w - 24, "HUD Mode", String.valueOf(ConfigManager.getHudConfigMode()), mouseX, mouseY);
         top += 22;
-        drawSettingRow(ctx, left, top, w - 24, "Frame Stats", ConfigManager.isHudShowFrame() ? "On" : "Off", mouseX, mouseY);
+        if (ConfigManager.getHudConfigMode() == ConfigManager.HudConfigMode.PRESET) {
+            drawSettingRow(ctx, left, top, w - 24, "Preset", String.valueOf(ConfigManager.getHudPreset()), mouseX, mouseY);
+            top += 22;
+            drawSettingRow(ctx, left, top, w - 24, "Expand On Warning", ConfigManager.isHudExpandedOnWarning() ? "On" : "Off", mouseX, mouseY);
+            top += 22;
+            drawSettingRowWithTooltip(ctx, left, top, w - 24, "Budget Color Mode", ConfigManager.isHudBudgetColorMode() ? "On" : "Off", mouseX, mouseY, "Colors HUD rows by pressure so frame, tick, VRAM, and latency problems are easier to spot.");
+            top += 22;
+            drawSettingRowWithTooltip(ctx, left, top, w - 24, "Auto-Focus Alert", ConfigManager.isHudAutoFocusAlertRow() ? "On" : "Off", mouseX, mouseY, "Pins the strongest current issue to the top of the HUD instead of making you scan every row.");
+            top += 20;
+            ctx.drawText(textRenderer, textRenderer.trimToWidth("Preset mode drives the HUD contents for you. Switch HUD Mode to CUSTOM to pick individual sections.", w - 24), left, top, TEXT_DIM, false);
+            top += 34;
+        } else {
+            drawSettingRow(ctx, left, top, w - 24, "FPS", ConfigManager.isHudShowFps() ? "On" : "Off", mouseX, mouseY);
+            top += 22;
+            drawSettingRow(ctx, left, top, w - 24, "Frame Stats", ConfigManager.isHudShowFrame() ? "On" : "Off", mouseX, mouseY);
+            top += 22;
+            drawSettingRow(ctx, left, top, w - 24, "Tick Stats", ConfigManager.isHudShowTicks() ? "On" : "Off", mouseX, mouseY);
+            top += 22;
+            drawSettingRow(ctx, left, top, w - 24, "Utilization", ConfigManager.isHudShowUtilization() ? "On" : "Off", mouseX, mouseY);
+            top += 22;
+            drawSettingRow(ctx, left, top, w - 24, "Temperatures", ConfigManager.isHudShowTemperatures() ? "On" : "Off", mouseX, mouseY);
+            top += 22;
+            drawSettingRow(ctx, left, top, w - 24, "Parallelism", ConfigManager.isHudShowParallelism() ? "On" : "Off", mouseX, mouseY);
+            top += 22;
+            drawSettingRow(ctx, left, top, w - 24, "Logic", ConfigManager.isHudShowLogic() ? "On" : "Off", mouseX, mouseY);
+            top += 22;
+            drawSettingRow(ctx, left, top, w - 24, "Background", ConfigManager.isHudShowBackground() ? "On" : "Off", mouseX, mouseY);
+            top += 22;
+            drawSettingRowWithTooltip(ctx, left, top, w - 24, "Frame Budget", ConfigManager.isHudShowFrameBudget() ? "On" : "Off", mouseX, mouseY, "Shows the latest frame time against the 16.7ms 60 FPS target and how far over or under budget it is.");
+            top += 22;
+            drawSettingRow(ctx, left, top, w - 24, "Memory", ConfigManager.isHudShowMemory() ? "On" : "Off", mouseX, mouseY);
+            top += 22;
+            drawSettingRowWithTooltip(ctx, left, top, w - 24, "VRAM", ConfigManager.isHudShowVram() ? "On" : "Off", mouseX, mouseY, "Shows GPU memory use and paging pressure when the driver exposes VRAM counters.");
+            top += 22;
+            drawSettingRowWithTooltip(ctx, left, top, w - 24, "Network", ConfigManager.isHudShowNetwork() ? "On" : "Off", mouseX, mouseY, "Shows inbound and outbound throughput so server and packet spikes are easier to correlate.");
+            top += 22;
+            drawSettingRowWithTooltip(ctx, left, top, w - 24, "Chunk Activity", ConfigManager.isHudShowChunkActivity() ? "On" : "Off", mouseX, mouseY, "Tracks chunk generation, meshing, and upload pressure in the HUD.");
+            top += 22;
+            drawSettingRow(ctx, left, top, w - 24, "World", ConfigManager.isHudShowWorld() ? "On" : "Off", mouseX, mouseY);
+            top += 22;
+            drawSettingRow(ctx, left, top, w - 24, "Disk I/O", ConfigManager.isHudShowDiskIo() ? "On" : "Off", mouseX, mouseY);
+            top += 22;
+            drawSettingRowWithTooltip(ctx, left, top, w - 24, "Input Latency", ConfigManager.isHudShowInputLatency() ? "On" : "Off", mouseX, mouseY, "Shows the latest presented input latency beside the rest of the live performance metrics.");
+            top += 22;
+            drawSettingRow(ctx, left, top, w - 24, "Session Status", ConfigManager.isHudShowSession() ? "On" : "Off", mouseX, mouseY);
+            top += 22;
+            drawSettingRow(ctx, left, top, w - 24, "Expand On Warning", ConfigManager.isHudExpandedOnWarning() ? "On" : "Off", mouseX, mouseY);
+            top += 22;
+            drawSettingRowWithTooltip(ctx, left, top, w - 24, "Budget Color Mode", ConfigManager.isHudBudgetColorMode() ? "On" : "Off", mouseX, mouseY, "Colors HUD rows by pressure so frame, tick, VRAM, and latency problems are easier to spot.");
+            top += 22;
+            drawSettingRowWithTooltip(ctx, left, top, w - 24, "Auto-Focus Alert", ConfigManager.isHudAutoFocusAlertRow() ? "On" : "Off", mouseX, mouseY, "Pins the strongest current issue to the top of the HUD instead of making you scan every row.");
+            top += 20;
+        }
+        ctx.drawText(textRenderer, "HUD Rate Of Change", left, top, TEXT_PRIMARY, false);
+        top += 18;
+        drawSettingRow(ctx, left, top, w - 24, "Display Zero Rates", ConfigManager.isHudShowZeroRateOfChange() ? "On" : "Off", mouseX, mouseY);
         top += 22;
-        drawSettingRow(ctx, left, top, w - 24, "Tick Stats", ConfigManager.isHudShowTicks() ? "On" : "Off", mouseX, mouseY);
+        drawSettingRow(ctx, left, top, w - 24, "FPS Rates", ConfigManager.isHudShowFpsRateOfChange() ? "On" : "Off", mouseX, mouseY);
         top += 22;
-        drawSettingRow(ctx, left, top, w - 24, "Utilization", ConfigManager.isHudShowUtilization() ? "On" : "Off", mouseX, mouseY);
+        drawSettingRow(ctx, left, top, w - 24, "Frame Rates", ConfigManager.isHudShowFrameRateOfChange() ? "On" : "Off", mouseX, mouseY);
         top += 22;
-        drawSettingRow(ctx, left, top, w - 24, "Temperatures", ConfigManager.isHudShowTemperatures() ? "On" : "Off", mouseX, mouseY);
+        drawSettingRow(ctx, left, top, w - 24, "Tick Rates", ConfigManager.isHudShowTickRateOfChange() ? "On" : "Off", mouseX, mouseY);
         top += 22;
-        drawSettingRow(ctx, left, top, w - 24, "Parallelism", ConfigManager.isHudShowParallelism() ? "On" : "Off", mouseX, mouseY);
+        drawSettingRow(ctx, left, top, w - 24, "Utilization Rates", ConfigManager.isHudShowUtilizationRateOfChange() ? "On" : "Off", mouseX, mouseY);
         top += 22;
-        drawSettingRow(ctx, left, top, w - 24, "Memory", ConfigManager.isHudShowMemory() ? "On" : "Off", mouseX, mouseY);
+        drawSettingRow(ctx, left, top, w - 24, "Memory Rates", ConfigManager.isHudShowMemoryAllocationRate() ? "On" : "Off", mouseX, mouseY);
         top += 22;
-        drawSettingRow(ctx, left, top, w - 24, "World", ConfigManager.isHudShowWorld() ? "On" : "Off", mouseX, mouseY);
+        drawSettingRow(ctx, left, top, w - 24, "VRAM Rates", ConfigManager.isHudShowVramRateOfChange() ? "On" : "Off", mouseX, mouseY);
         top += 22;
-        drawSettingRow(ctx, left, top, w - 24, "Session Status", ConfigManager.isHudShowSession() ? "On" : "Off", mouseX, mouseY);
+        drawSettingRow(ctx, left, top, w - 24, "Network Rates", ConfigManager.isHudShowNetworkRateOfChange() ? "On" : "Off", mouseX, mouseY);
+        top += 22;
+        drawSettingRow(ctx, left, top, w - 24, "Chunk Activity Rates", ConfigManager.isHudShowChunkActivityRateOfChange() ? "On" : "Off", mouseX, mouseY);
+        top += 22;
+        drawSettingRow(ctx, left, top, w - 24, "World Rates", ConfigManager.isHudShowWorldRateOfChange() ? "On" : "Off", mouseX, mouseY);
+        top += 22;
+        drawSettingRow(ctx, left, top, w - 24, "Disk I/O Rates", ConfigManager.isHudShowDiskIoRateOfChange() ? "On" : "Off", mouseX, mouseY);
+        top += 22;
+        drawSettingRow(ctx, left, top, w - 24, "Input Latency Rates", ConfigManager.isHudShowInputLatencyRateOfChange() ? "On" : "Off", mouseX, mouseY);
         top += 32;
         ctx.drawText(textRenderer, "Table Columns", left, top, TEXT_PRIMARY, false);
         top += 18;
@@ -3083,6 +3721,12 @@ public class TaskManagerScreen extends Screen {
         drawSettingRow(ctx, left, top, w - 24, "CPU Colour", focusedColorSetting == ColorSetting.CPU ? colorEditValue + "_" : getColorSettingHex(ColorSetting.CPU), mouseX, mouseY);
         top += 22;
         drawSettingRow(ctx, left, top, w - 24, "GPU Colour", focusedColorSetting == ColorSetting.GPU ? colorEditValue + "_" : getColorSettingHex(ColorSetting.GPU), mouseX, mouseY);
+        top += 22;
+        drawSettingRow(ctx, left, top, w - 24, "World Entities Colour", focusedColorSetting == ColorSetting.WORLD_ENTITIES ? colorEditValue + "_" : getColorSettingHex(ColorSetting.WORLD_ENTITIES), mouseX, mouseY);
+        top += 22;
+        drawSettingRow(ctx, left, top, w - 24, "Loaded Chunks Colour", focusedColorSetting == ColorSetting.WORLD_CHUNKS_LOADED ? colorEditValue + "_" : getColorSettingHex(ColorSetting.WORLD_CHUNKS_LOADED), mouseX, mouseY);
+        top += 22;
+        drawSettingRow(ctx, left, top, w - 24, "Rendered Chunks Colour", focusedColorSetting == ColorSetting.WORLD_CHUNKS_RENDERED ? colorEditValue + "_" : getColorSettingHex(ColorSetting.WORLD_CHUNKS_RENDERED), mouseX, mouseY);
         top += 22;
         drawSettingRow(ctx, left, top, w - 24, "Reset Graph Colours", "Defaults", mouseX, mouseY);
         top += 20;

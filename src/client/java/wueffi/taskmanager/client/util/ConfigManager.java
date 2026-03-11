@@ -53,9 +53,40 @@ public class ConfigManager {
         }
     }
 
+    public enum HudPreset {
+        COMPACT,
+        FULL;
+
+        public HudPreset next() {
+            HudPreset[] values = values();
+            return values[(ordinal() + 1) % values.length];
+        }
+    }
+
+    public enum HudConfigMode {
+        PRESET,
+        CUSTOM;
+
+        public HudConfigMode next() {
+            HudConfigMode[] values = values();
+            return values[(ordinal() + 1) % values.length];
+        }
+    }
+
     private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
-    private static final Path CONFIG_PATH = FabricLoader.getInstance().getConfigDir().resolve("taskmanager.json");
+    private static final Path CONFIG_PATH = resolveConfigPath();
     private static ConfigData config = new ConfigData();
+
+    private static Path resolveConfigPath() {
+        try {
+            Path configDir = FabricLoader.getInstance().getConfigDir();
+            if (configDir != null) {
+                return configDir.resolve("taskmanager.json");
+            }
+        } catch (Throwable ignored) {
+        }
+        return Path.of("taskmanager-test-config.json");
+    }
 
     public static ProfilerManager.CaptureMode getCaptureMode() {
         try {
@@ -158,19 +189,74 @@ public class ConfigManager {
         saveConfig();
     }
 
+    public static int getHudFpsDisplayDelayMs() {
+        return Math.clamp(config.hudFpsDisplayDelayMs, 50, 1000);
+    }
+
+    public static void cycleHudFpsDisplayDelayMs() {
+        int current = getHudFpsDisplayDelayMs();
+        int next = switch (current) {
+            case 50 -> 100;
+            case 100 -> 250;
+            case 250 -> 500;
+            case 500 -> 1000;
+            default -> 50;
+        };
+        config.hudFpsDisplayDelayMs = next;
+        saveConfig();
+    }
+
+    public static int getHudMemoryDisplayDelayMs() {
+        return Math.clamp(config.hudMemoryDisplayDelayMs, 50, 1000);
+    }
+
+    public static void cycleHudMemoryDisplayDelayMs() {
+        int current = getHudMemoryDisplayDelayMs();
+        int next = switch (current) {
+            case 50 -> 100;
+            case 100 -> 250;
+            case 250 -> 500;
+            case 500 -> 1000;
+            default -> 50;
+        };
+        config.hudMemoryDisplayDelayMs = next;
+        saveConfig();
+    }
+
+    public static int getHudTransparencyPercent() {
+        return Math.clamp(config.hudTransparencyPercent, 10, 100);
+    }
+
+    public static void setHudTransparencyPercent(int value) {
+        config.hudTransparencyPercent = Math.clamp(value, 10, 100);
+        saveConfig();
+    }
+
 
     public static int getCpuGraphColor() { return parseColor(config.cpuGraphColor, 0xFF5EA9FF); }
     public static int getGpuGraphColor() { return parseColor(config.gpuGraphColor, 0xFF77DD77); }
+    public static int getWorldEntityGraphColor() { return parseColor(config.worldEntityGraphColor, 0xFFFFC857); }
+    public static int getWorldLoadedChunkGraphColor() { return parseColor(config.worldLoadedChunkGraphColor, 0xFF70C7A7); }
+    public static int getWorldRenderedChunkGraphColor() { return parseColor(config.worldRenderedChunkGraphColor, 0xFF5EA9FF); }
 
     public static String getCpuGraphColorHex() { return normalizeColorHex(config.cpuGraphColor, 0xFF5EA9FF); }
     public static String getGpuGraphColorHex() { return normalizeColorHex(config.gpuGraphColor, 0xFF77DD77); }
+    public static String getWorldEntityGraphColorHex() { return normalizeColorHex(config.worldEntityGraphColor, 0xFFFFC857); }
+    public static String getWorldLoadedChunkGraphColorHex() { return normalizeColorHex(config.worldLoadedChunkGraphColor, 0xFF70C7A7); }
+    public static String getWorldRenderedChunkGraphColorHex() { return normalizeColorHex(config.worldRenderedChunkGraphColor, 0xFF5EA9FF); }
 
     public static void setCpuGraphColorHex(String value) { config.cpuGraphColor = normalizeColorHex(value, 0xFF5EA9FF); saveConfig(); }
     public static void setGpuGraphColorHex(String value) { config.gpuGraphColor = normalizeColorHex(value, 0xFF77DD77); saveConfig(); }
+    public static void setWorldEntityGraphColorHex(String value) { config.worldEntityGraphColor = normalizeColorHex(value, 0xFFFFC857); saveConfig(); }
+    public static void setWorldLoadedChunkGraphColorHex(String value) { config.worldLoadedChunkGraphColor = normalizeColorHex(value, 0xFF70C7A7); saveConfig(); }
+    public static void setWorldRenderedChunkGraphColorHex(String value) { config.worldRenderedChunkGraphColor = normalizeColorHex(value, 0xFF5EA9FF); saveConfig(); }
 
     public static void resetGraphColors() {
         config.cpuGraphColor = "#5EA9FF";
         config.gpuGraphColor = "#77DD77";
+        config.worldEntityGraphColor = "#FFC857";
+        config.worldLoadedChunkGraphColor = "#70C7A7";
+        config.worldRenderedChunkGraphColor = "#5EA9FF";
         saveConfig();
     }
 
@@ -180,9 +266,31 @@ public class ConfigManager {
     public static boolean isHudShowUtilization() { return config.hudShowUtilization; }
     public static boolean isHudShowTemperatures() { return config.hudShowTemperatures; }
     public static boolean isHudShowParallelism() { return config.hudShowParallelism; }
+    public static boolean isHudShowLogic() { return config.hudShowLogic == null || config.hudShowLogic; }
+    public static boolean isHudShowBackground() { return config.hudShowBackground == null || config.hudShowBackground; }
+    public static boolean isHudShowFrameBudget() { return config.hudShowFrameBudget == null || config.hudShowFrameBudget; }
     public static boolean isHudShowMemory() { return config.hudShowMemory; }
+    public static boolean isHudShowMemoryAllocationRate() { return config.hudShowMemoryAllocationRate == null || config.hudShowMemoryAllocationRate; }
+    public static boolean isHudShowVram() { return config.hudShowVram == null || config.hudShowVram; }
+    public static boolean isHudShowNetwork() { return config.hudShowNetwork != null && config.hudShowNetwork; }
+    public static boolean isHudShowChunkActivity() { return config.hudShowChunkActivity != null && config.hudShowChunkActivity; }
     public static boolean isHudShowWorld() { return config.hudShowWorld; }
+    public static boolean isHudShowDiskIo() { return config.hudShowDiskIo != null && config.hudShowDiskIo; }
+    public static boolean isHudShowInputLatency() { return config.hudShowInputLatency != null && config.hudShowInputLatency; }
     public static boolean isHudShowSession() { return config.hudShowSession; }
+    public static boolean isHudShowFpsRateOfChange() { return config.hudShowFpsRateOfChange; }
+    public static boolean isHudShowFrameRateOfChange() { return config.hudShowFrameRateOfChange; }
+    public static boolean isHudShowTickRateOfChange() { return config.hudShowTickRateOfChange; }
+    public static boolean isHudShowUtilizationRateOfChange() { return config.hudShowUtilizationRateOfChange; }
+    public static boolean isHudShowWorldRateOfChange() { return config.hudShowWorldRateOfChange; }
+    public static boolean isHudShowVramRateOfChange() { return config.hudShowVramRateOfChange == null || config.hudShowVramRateOfChange; }
+    public static boolean isHudShowNetworkRateOfChange() { return config.hudShowNetworkRateOfChange == null || config.hudShowNetworkRateOfChange; }
+    public static boolean isHudShowChunkActivityRateOfChange() { return config.hudShowChunkActivityRateOfChange == null || config.hudShowChunkActivityRateOfChange; }
+    public static boolean isHudShowDiskIoRateOfChange() { return config.hudShowDiskIoRateOfChange == null || config.hudShowDiskIoRateOfChange; }
+    public static boolean isHudShowInputLatencyRateOfChange() { return config.hudShowInputLatencyRateOfChange == null || config.hudShowInputLatencyRateOfChange; }
+    public static boolean isHudShowZeroRateOfChange() { return config.hudShowZeroRateOfChange; }
+    public static boolean isHudAutoFocusAlertRow() { return config.hudAutoFocusAlertRow == null || config.hudAutoFocusAlertRow; }
+    public static boolean isHudBudgetColorMode() { return config.hudBudgetColorMode == null || config.hudBudgetColorMode; }
 
     public static HudTriggerMode getHudTriggerMode() {
         try {
@@ -192,15 +300,72 @@ public class ConfigManager {
         }
     }
 
+    public static HudPreset getHudPreset() {
+        try {
+            return HudPreset.valueOf(config.hudPreset);
+        } catch (Exception ignored) {
+            return HudPreset.COMPACT;
+        }
+    }
+
+    public static void cycleHudPreset() {
+        config.hudPreset = getHudPreset().next().name();
+        saveConfig();
+    }
+
+    public static HudConfigMode getHudConfigMode() {
+        try {
+            return HudConfigMode.valueOf(config.hudConfigMode);
+        } catch (Exception ignored) {
+            return HudConfigMode.PRESET;
+        }
+    }
+
+    public static void cycleHudConfigMode() {
+        config.hudConfigMode = getHudConfigMode().next().name();
+        saveConfig();
+    }
+
+    public static boolean isHudExpandedOnWarning() {
+        return config.hudExpandedOnWarning;
+    }
+
+    public static void setHudExpandedOnWarning(boolean value) {
+        config.hudExpandedOnWarning = value;
+        saveConfig();
+    }
+
     public static void toggleHudShowFps() { config.hudShowFps = !config.hudShowFps; saveConfig(); }
     public static void toggleHudShowFrame() { config.hudShowFrame = !config.hudShowFrame; saveConfig(); }
     public static void toggleHudShowTicks() { config.hudShowTicks = !config.hudShowTicks; saveConfig(); }
     public static void toggleHudShowUtilization() { config.hudShowUtilization = !config.hudShowUtilization; saveConfig(); }
     public static void toggleHudShowTemperatures() { config.hudShowTemperatures = !config.hudShowTemperatures; saveConfig(); }
     public static void toggleHudShowParallelism() { config.hudShowParallelism = !config.hudShowParallelism; saveConfig(); }
+    public static void toggleHudShowLogic() { config.hudShowLogic = !isHudShowLogic(); saveConfig(); }
+    public static void toggleHudShowBackground() { config.hudShowBackground = !isHudShowBackground(); saveConfig(); }
+    public static void toggleHudShowFrameBudget() { config.hudShowFrameBudget = !isHudShowFrameBudget(); saveConfig(); }
     public static void toggleHudShowMemory() { config.hudShowMemory = !config.hudShowMemory; saveConfig(); }
+    public static void toggleHudShowMemoryAllocationRate() { config.hudShowMemoryAllocationRate = !isHudShowMemoryAllocationRate(); saveConfig(); }
+    public static void toggleHudShowVram() { config.hudShowVram = !isHudShowVram(); saveConfig(); }
+    public static void toggleHudShowNetwork() { config.hudShowNetwork = !isHudShowNetwork(); saveConfig(); }
+    public static void toggleHudShowChunkActivity() { config.hudShowChunkActivity = !isHudShowChunkActivity(); saveConfig(); }
     public static void toggleHudShowWorld() { config.hudShowWorld = !config.hudShowWorld; saveConfig(); }
+    public static void toggleHudShowDiskIo() { config.hudShowDiskIo = !isHudShowDiskIo(); saveConfig(); }
+    public static void toggleHudShowInputLatency() { config.hudShowInputLatency = !isHudShowInputLatency(); saveConfig(); }
     public static void toggleHudShowSession() { config.hudShowSession = !config.hudShowSession; saveConfig(); }
+    public static void toggleHudShowFpsRateOfChange() { config.hudShowFpsRateOfChange = !config.hudShowFpsRateOfChange; saveConfig(); }
+    public static void toggleHudShowFrameRateOfChange() { config.hudShowFrameRateOfChange = !config.hudShowFrameRateOfChange; saveConfig(); }
+    public static void toggleHudShowTickRateOfChange() { config.hudShowTickRateOfChange = !config.hudShowTickRateOfChange; saveConfig(); }
+    public static void toggleHudShowUtilizationRateOfChange() { config.hudShowUtilizationRateOfChange = !config.hudShowUtilizationRateOfChange; saveConfig(); }
+    public static void toggleHudShowWorldRateOfChange() { config.hudShowWorldRateOfChange = !config.hudShowWorldRateOfChange; saveConfig(); }
+    public static void toggleHudShowVramRateOfChange() { config.hudShowVramRateOfChange = !isHudShowVramRateOfChange(); saveConfig(); }
+    public static void toggleHudShowNetworkRateOfChange() { config.hudShowNetworkRateOfChange = !isHudShowNetworkRateOfChange(); saveConfig(); }
+    public static void toggleHudShowChunkActivityRateOfChange() { config.hudShowChunkActivityRateOfChange = !isHudShowChunkActivityRateOfChange(); saveConfig(); }
+    public static void toggleHudShowDiskIoRateOfChange() { config.hudShowDiskIoRateOfChange = !isHudShowDiskIoRateOfChange(); saveConfig(); }
+    public static void toggleHudShowInputLatencyRateOfChange() { config.hudShowInputLatencyRateOfChange = !isHudShowInputLatencyRateOfChange(); saveConfig(); }
+    public static void toggleHudShowZeroRateOfChange() { config.hudShowZeroRateOfChange = !config.hudShowZeroRateOfChange; saveConfig(); }
+    public static void toggleHudAutoFocusAlertRow() { config.hudAutoFocusAlertRow = !isHudAutoFocusAlertRow(); saveConfig(); }
+    public static void toggleHudBudgetColorMode() { config.hudBudgetColorMode = !isHudBudgetColorMode(); saveConfig(); }
     public static void cycleHudTriggerMode() { config.hudTriggerMode = getHudTriggerMode().next().name(); saveConfig(); }
 
     public static boolean isTasksColumnVisible(String key) { return isColumnVisible(config.tasksColumns, key); }
@@ -326,6 +491,12 @@ public class ConfigManager {
         if (config.hudTriggerMode == null || config.hudTriggerMode.isBlank()) {
             config.hudTriggerMode = config.hudSpikeOnly ? HudTriggerMode.SPIKES_ONLY.name() : HudTriggerMode.ALWAYS.name();
         }
+        if (config.hudPreset == null || config.hudPreset.isBlank()) {
+            config.hudPreset = HudPreset.COMPACT.name();
+        }
+        if (config.hudConfigMode == null || config.hudConfigMode.isBlank()) {
+            config.hudConfigMode = HudConfigMode.PRESET.name();
+        }
         if (config.sessionDurationSeconds <= 0) {
             config.sessionDurationSeconds = 30;
         }
@@ -335,6 +506,33 @@ public class ConfigManager {
         if (config.profilerUpdateDelayMs <= 0) {
             config.profilerUpdateDelayMs = 100;
         }
+        if (config.hudFpsDisplayDelayMs <= 0) {
+            config.hudFpsDisplayDelayMs = 100;
+        }
+        if (config.hudMemoryDisplayDelayMs <= 0) {
+            config.hudMemoryDisplayDelayMs = 100;
+        }
+        if (config.hudTransparencyPercent <= 0) {
+            config.hudTransparencyPercent = 100;
+        }
+        if (config.hudShowMemoryAllocationRate == null) {
+            config.hudShowMemoryAllocationRate = true;
+        }
+        if (config.hudShowLogic == null) config.hudShowLogic = true;
+        if (config.hudShowBackground == null) config.hudShowBackground = true;
+        if (config.hudShowFrameBudget == null) config.hudShowFrameBudget = true;
+        if (config.hudShowVram == null) config.hudShowVram = true;
+        if (config.hudShowNetwork == null) config.hudShowNetwork = false;
+        if (config.hudShowChunkActivity == null) config.hudShowChunkActivity = false;
+        if (config.hudShowDiskIo == null) config.hudShowDiskIo = false;
+        if (config.hudShowInputLatency == null) config.hudShowInputLatency = false;
+        if (config.hudShowVramRateOfChange == null) config.hudShowVramRateOfChange = true;
+        if (config.hudShowNetworkRateOfChange == null) config.hudShowNetworkRateOfChange = true;
+        if (config.hudShowChunkActivityRateOfChange == null) config.hudShowChunkActivityRateOfChange = true;
+        if (config.hudShowDiskIoRateOfChange == null) config.hudShowDiskIoRateOfChange = true;
+        if (config.hudShowInputLatencyRateOfChange == null) config.hudShowInputLatencyRateOfChange = true;
+        if (config.hudAutoFocusAlertRow == null) config.hudAutoFocusAlertRow = true;
+        if (config.hudBudgetColorMode == null) config.hudBudgetColorMode = true;
         if (config.tasksColumns == null || config.tasksColumns.isBlank()) {
             config.tasksColumns = "cpu,threads,samples,invokes";
         }
@@ -356,6 +554,9 @@ public class ConfigManager {
         if ((config.gpuGraphColor == null || config.gpuGraphColor.isBlank()) && config.gpuNvidiaColor != null) config.gpuGraphColor = config.gpuNvidiaColor;
         config.cpuGraphColor = normalizeColorHex(config.cpuGraphColor, 0xFF5EA9FF);
         config.gpuGraphColor = normalizeColorHex(config.gpuGraphColor, 0xFF77DD77);
+        config.worldEntityGraphColor = normalizeColorHex(config.worldEntityGraphColor, 0xFFFFC857);
+        config.worldLoadedChunkGraphColor = normalizeColorHex(config.worldLoadedChunkGraphColor, 0xFF70C7A7);
+        config.worldRenderedChunkGraphColor = normalizeColorHex(config.worldRenderedChunkGraphColor, 0xFF5EA9FF);
         saveConfig();
     }
 
@@ -368,17 +569,45 @@ public class ConfigManager {
         public int sessionDurationSeconds = 30;
         public int metricsUpdateIntervalMs = 100;
         public int profilerUpdateDelayMs = 100;
+        public int hudFpsDisplayDelayMs = 100;
+        public int hudMemoryDisplayDelayMs = 100;
+        public int hudTransparencyPercent = 100;
         public boolean hudShowFps = true;
         public boolean hudShowFrame = true;
         public boolean hudShowTicks = true;
         public boolean hudShowUtilization = true;
         public boolean hudShowTemperatures = true;
         public boolean hudShowParallelism = false;
+        public Boolean hudShowLogic = true;
+        public Boolean hudShowBackground = true;
+        public Boolean hudShowFrameBudget = true;
         public boolean hudShowMemory = true;
+        public Boolean hudShowMemoryAllocationRate = true;
+        public Boolean hudShowVram = true;
+        public Boolean hudShowNetwork = false;
+        public Boolean hudShowChunkActivity = false;
         public boolean hudShowWorld = true;
+        public Boolean hudShowDiskIo = false;
+        public Boolean hudShowInputLatency = false;
         public boolean hudShowSession = true;
+        public boolean hudShowFpsRateOfChange = true;
+        public boolean hudShowFrameRateOfChange = true;
+        public boolean hudShowTickRateOfChange = true;
+        public boolean hudShowUtilizationRateOfChange = true;
+        public boolean hudShowWorldRateOfChange = true;
+        public Boolean hudShowVramRateOfChange = true;
+        public Boolean hudShowNetworkRateOfChange = true;
+        public Boolean hudShowChunkActivityRateOfChange = true;
+        public Boolean hudShowDiskIoRateOfChange = true;
+        public Boolean hudShowInputLatencyRateOfChange = true;
+        public boolean hudShowZeroRateOfChange = false;
+        public Boolean hudAutoFocusAlertRow = true;
+        public Boolean hudBudgetColorMode = true;
         public boolean hudSpikeOnly = false;
         public String hudTriggerMode = HudTriggerMode.ALWAYS.name();
+        public String hudPreset = HudPreset.COMPACT.name();
+        public String hudConfigMode = HudConfigMode.PRESET.name();
+        public boolean hudExpandedOnWarning = true;
         public String tasksColumns = "cpu,threads,samples,invokes";
         public String gpuColumns = "pct,threads,gpums,rsamples";
         public String memoryColumns = "classes,mb,pct";
@@ -396,6 +625,9 @@ public class ConfigManager {
         public boolean startupSortDescending = true;
         public String cpuGraphColor = "#5EA9FF";
         public String gpuGraphColor = "#77DD77";
+        public String worldEntityGraphColor = "#FFC857";
+        public String worldLoadedChunkGraphColor = "#70C7A7";
+        public String worldRenderedChunkGraphColor = "#5EA9FF";
         public String cpuIntelColor = "#5EA9FF";
         public String cpuAmdColor = "#FF6B6B";
         public String gpuNvidiaColor = "#77DD77";

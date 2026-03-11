@@ -8,9 +8,7 @@ import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 import wueffi.taskmanager.client.FrameTimelineProfiler;
 import wueffi.taskmanager.client.InputLatencyProfiler;
-import wueffi.taskmanager.client.MemoryProfiler;
 import wueffi.taskmanager.client.RenderPhaseProfiler;
-import wueffi.taskmanager.client.SystemMetricsProfiler;
 import wueffi.taskmanager.client.TaskManagerScreen;
 import wueffi.taskmanager.client.util.GpuTimer;
 
@@ -19,17 +17,16 @@ public class GameRendererMixin {
 
     @Inject(method = "render", at = @At("HEAD"))
     private void taskmanager$onRenderHead(RenderTickCounter tickCounter, boolean tick, CallbackInfo ci) {
-        if (!TaskManagerScreen.isProfilingActive()) return;
+        if (!TaskManagerScreen.isLiveMetricsActive()) return;
 
         FrameTimelineProfiler.getInstance().beginFrame();
-        SystemMetricsProfiler.getInstance().sample(MemoryProfiler.getInstance().getDetailedSnapshot());
         GpuTimer.collectResults();
         RenderPhaseProfiler.getInstance().beginCpuPhase("frame.total");
     }
 
     @Inject(method = "render", at = @At("TAIL"))
     private void taskmanager$onRenderTail(RenderTickCounter tickCounter, boolean tick, CallbackInfo ci) {
-        if (!TaskManagerScreen.isProfilingActive()) return;
+        if (!TaskManagerScreen.isLiveMetricsActive()) return;
 
         RenderPhaseProfiler.getInstance().endCpuPhase("frame.total");
         FrameTimelineProfiler.getInstance().endFrame();
@@ -38,14 +35,14 @@ public class GameRendererMixin {
 
     @Inject(method = "renderWorld", at = @At("HEAD"))
     private void taskmanager$onRenderWorldHead(CallbackInfo ci) {
-        if (!TaskManagerScreen.isProfilingActive()) return;
+        if (!TaskManagerScreen.isLiveMetricsActive()) return;
         RenderPhaseProfiler.getInstance().beginCpuPhase("gameRenderer.renderWorld");
         GpuTimer.begin("gameRenderer.renderWorld");
     }
 
     @Inject(method = "renderWorld", at = @At("TAIL"))
     private void taskmanager$onRenderWorldTail(CallbackInfo ci) {
-        if (!TaskManagerScreen.isProfilingActive()) return;
+        if (!TaskManagerScreen.isLiveMetricsActive()) return;
         GpuTimer.end("gameRenderer.renderWorld");
         RenderPhaseProfiler.getInstance().endCpuPhase("gameRenderer.renderWorld");
     }

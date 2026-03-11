@@ -419,7 +419,8 @@ final class WindowsTelemetryBridge {
         }
 
         long now = System.currentTimeMillis();
-        if (now - lastRequestAtMillis < ConfigManager.getMetricsUpdateIntervalMs() || !requestInFlight.compareAndSet(false, true)) {
+        int requestIntervalMillis = ProfilerManager.getInstance().shouldCollectFrameMetrics() ? 50 : ConfigManager.getMetricsUpdateIntervalMs();
+        if (now - lastRequestAtMillis < requestIntervalMillis || !requestInFlight.compareAndSet(false, true)) {
             return;
         }
         lastRequestAtMillis = now;
@@ -450,16 +451,14 @@ final class WindowsTelemetryBridge {
             byte[] output = readAll(process.getInputStream());
             int exitCode = process.waitFor();
             if (exitCode != 0) {
-                latest = Sample.empty();
                 return;
             }
             String json = new String(output, StandardCharsets.UTF_8).trim();
             if (json.isEmpty()) {
-                latest = Sample.empty();
                 return;
             }
             JsonObject root = JsonParser.parseString(json).getAsJsonObject();
-            latest = new Sample(
+            Sample parsed = new Sample(
                     getBoolean(root, "bridgeActive"),
                     getString(root, "counterSource"),
                     getString(root, "sensorSource"),
@@ -473,12 +472,50 @@ final class WindowsTelemetryBridge {
                     getLong(root, "diskReadBytesPerSecond"),
                     getLong(root, "diskWriteBytesPerSecond")
             );
+            latest = mergeWithPrevious(parsed, latest);
         } catch (Exception e) {
-            latest = Sample.empty();
             taskmanagerClient.LOGGER.debug("Windows telemetry bridge failed: {}", e.getMessage());
         } finally {
             requestInFlight.set(false);
         }
+    }
+
+    private Sample mergeWithPrevious(Sample current, Sample previous) {
+        if (previous == null) {
+            previous = Sample.empty();
+        }
+        return new Sample(
+                current.bridgeActive() || previous.bridgeActive(),
+                chooseText(current.counterSource(), previous.counterSource(), "Unavailable"),
+                chooseText(current.sensorSource(), previous.sensorSource(), "Unavailable"),
+                chooseText(current.sensorErrorCode(), previous.sensorErrorCode(), "No bridge data"),
+                chooseDouble(current.cpuCoreLoadPercent(), previous.cpuCoreLoadPercent()),
+                chooseDouble(current.gpuCoreLoadPercent(), previous.gpuCoreLoadPercent()),
+                chooseDouble(current.gpuTemperatureC(), previous.gpuTemperatureC()),
+                chooseDouble(current.cpuTemperatureC(), previous.cpuTemperatureC()),
+                chooseLong(current.bytesReceivedPerSecond(), previous.bytesReceivedPerSecond()),
+                chooseLong(current.bytesSentPerSecond(), previous.bytesSentPerSecond()),
+                chooseLong(current.diskReadBytesPerSecond(), previous.diskReadBytesPerSecond()),
+                chooseLong(current.diskWriteBytesPerSecond(), previous.diskWriteBytesPerSecond())
+        );
+    }
+
+    private String chooseText(String current, String previous, String fallback) {
+        if (current != null && !current.isBlank() && !current.equalsIgnoreCase("Unavailable") && !current.equalsIgnoreCase("No bridge data")) {
+            return current;
+        }
+        if (previous != null && !previous.isBlank() && !previous.equalsIgnoreCase("Unavailable") && !previous.equalsIgnoreCase("No bridge data")) {
+            return previous;
+        }
+        return fallback;
+    }
+
+    private double chooseDouble(double current, double previous) {
+        return current >= 0.0 ? current : previous;
+    }
+
+    private long chooseLong(long current, long previous) {
+        return current >= 0L ? current : previous;
     }
 
     private byte[] readAll(InputStream inputStream) throws Exception {
