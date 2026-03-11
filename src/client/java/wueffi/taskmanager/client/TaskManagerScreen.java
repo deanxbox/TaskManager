@@ -40,6 +40,8 @@ public class TaskManagerScreen extends Screen {
 
     private record MemoryListLayout(int tableWidth, int listY, int listHeight) {}
 
+    private record SliderLayout(int x, int y, int width, int height) {}
+
     private enum TableId {
         TASKS,
         GPU,
@@ -173,6 +175,7 @@ public class TaskManagerScreen extends Screen {
     private String selectedFindingKey;
     private ProfilerManager.ProfilerSnapshot snapshot = ProfilerManager.getInstance().getCurrentSnapshot();
     private LagMapLayout lastRenderedLagMapLayout;
+    private boolean draggingHudTransparency;
 
     public TaskManagerScreen() {
         this(lastOpenedTab);
@@ -1927,7 +1930,7 @@ public class TaskManagerScreen extends Screen {
                 ConfigManager::cycleHudPosition,
                 ConfigManager::cycleHudLayoutMode,
                 ConfigManager::cycleHudTriggerMode,
-                ConfigManager::cycleHudConfigMode
+                ConfigManager::cycleHudFpsDisplayDelayMs
             };
             for (Runnable action : hudBaseActions) {
                 if (isInside(mouseX, mouseY, left, actionY, getScreenWidth() - 16, 16)) {
@@ -1936,6 +1939,15 @@ public class TaskManagerScreen extends Screen {
                 }
                 actionY += 22;
             }
+            if (handleHudTransparencySliderClick(mouseX, mouseY, left, actionY, getScreenWidth() - 24)) {
+                return true;
+            }
+            actionY += 24;
+            if (isInside(mouseX, mouseY, left, actionY, getScreenWidth() - 16, 16)) {
+                ConfigManager.cycleHudConfigMode();
+                return true;
+            }
+            actionY += 22;
 
             boolean presetMode = ConfigManager.getHudConfigMode() == ConfigManager.HudConfigMode.PRESET;
             Runnable[] hudModeActions = presetMode
@@ -2006,6 +2018,26 @@ public class TaskManagerScreen extends Screen {
         return super.mouseClicked(click, doubled);
     }
 
+
+
+    @Override
+    public boolean mouseDragged(Click click, double deltaX, double deltaY) {
+        if (draggingHudTransparency && activeTab == 11) {
+            int left = PADDING;
+            int actionY = getContentY() + PADDING + 18 - scrollOffset;
+            actionY += (22 * 4) + 32 + (22 * 5);
+            SliderLayout slider = getHudTransparencySliderLayout(left, actionY, getScreenWidth() - 24);
+            updateHudTransparencyFromMouse(toLogicalX(click.x()), slider);
+            return true;
+        }
+        return super.mouseDragged(click, deltaX, deltaY);
+    }
+
+    @Override
+    public boolean mouseReleased(Click click) {
+        draggingHudTransparency = false;
+        return super.mouseReleased(click);
+    }
 
     @Override
     public boolean mouseScrolled(double mouseX, double mouseY, double horizontalAmount, double verticalAmount) {
@@ -2530,6 +2562,46 @@ public class TaskManagerScreen extends Screen {
             ctx.fill(x - 4, y - 2, x + width + 4, y + 14, 0x1AFFFFFF);
         }
         drawMetricRow(ctx, x, y, width, label, value);
+    }
+
+    private void drawSliderSetting(DrawContext ctx, int x, int y, int width, String label, int percent, int mouseX, int mouseY) {
+        if (isInside(mouseX, mouseY, x - 4, y - 2, width + 8, 20)) {
+            ctx.fill(x - 4, y - 2, x + width + 4, y + 18, 0x1AFFFFFF);
+        }
+        ctx.drawText(textRenderer, label, x, y, TEXT_DIM, false);
+        String value = percent + "%";
+        ctx.drawText(textRenderer, value, x + width - textRenderer.getWidth(value), y, TEXT_PRIMARY, false);
+        SliderLayout slider = getHudTransparencySliderLayout(x, y, width);
+        ctx.fill(slider.x(), slider.y(), slider.x() + slider.width(), slider.y() + slider.height(), 0x332A2A2A);
+        ctx.fill(slider.x(), slider.y(), slider.x() + slider.width(), slider.y() + 1, PANEL_OUTLINE);
+        ctx.fill(slider.x(), slider.y() + slider.height() - 1, slider.x() + slider.width(), slider.y() + slider.height(), PANEL_OUTLINE);
+        int filledWidth = Math.max(6, slider.width() * percent / 100);
+        ctx.fill(slider.x(), slider.y(), slider.x() + filledWidth, slider.y() + slider.height(), ACCENT_GREEN);
+        int knobX = slider.x() + Math.max(0, Math.min(slider.width() - 6, filledWidth - 3));
+        ctx.fill(knobX, slider.y() - 2, knobX + 6, slider.y() + slider.height() + 2, TEXT_PRIMARY);
+    }
+
+    private SliderLayout getHudTransparencySliderLayout(int x, int y, int width) {
+        int sliderWidth = Math.min(140, Math.max(96, width / 4));
+        int sliderX = x + width - sliderWidth;
+        int sliderY = y + 10;
+        return new SliderLayout(sliderX, sliderY, sliderWidth, 6);
+    }
+
+    private boolean handleHudTransparencySliderClick(double mouseX, double mouseY, int x, int y, int width) {
+        SliderLayout slider = getHudTransparencySliderLayout(x, y, width);
+        if (!isInside(mouseX, mouseY, slider.x(), slider.y() - 3, slider.width(), slider.height() + 6)) {
+            return false;
+        }
+        draggingHudTransparency = true;
+        updateHudTransparencyFromMouse(mouseX, slider);
+        return true;
+    }
+
+    private void updateHudTransparencyFromMouse(double mouseX, SliderLayout slider) {
+        double ratio = Math.max(0.0, Math.min(1.0, (mouseX - slider.x()) / Math.max(1.0, slider.width())));
+        int percent = (int) Math.round(10 + (ratio * 90.0));
+        ConfigManager.setHudTransparencyPercent(percent);
     }
 
     private void renderStripedRow(DrawContext ctx, int x, int width, int rowY, int rowIdx, int mouseX, int mouseY) {
@@ -3104,6 +3176,10 @@ public class TaskManagerScreen extends Screen {
         top += 22;
         drawSettingRow(ctx, left, top, w - 24, "Trigger Mode", String.valueOf(ConfigManager.getHudTriggerMode()), mouseX, mouseY);
         top += 22;
+        drawSettingRow(ctx, left, top, w - 24, "FPS Display Delay", ConfigManager.getHudFpsDisplayDelayMs() + "ms", mouseX, mouseY);
+        top += 22;
+        drawSliderSetting(ctx, left, top, w - 24, "HUD Transparency", ConfigManager.getHudTransparencyPercent(), mouseX, mouseY);
+        top += 24;
         drawSettingRow(ctx, left, top, w - 24, "HUD Mode", String.valueOf(ConfigManager.getHudConfigMode()), mouseX, mouseY);
         top += 22;
         if (ConfigManager.getHudConfigMode() == ConfigManager.HudConfigMode.PRESET) {

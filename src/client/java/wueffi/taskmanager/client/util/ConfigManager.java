@@ -178,6 +178,32 @@ public class ConfigManager {
         saveConfig();
     }
 
+    public static int getHudFpsDisplayDelayMs() {
+        return Math.clamp(config.hudFpsDisplayDelayMs, 50, 1000);
+    }
+
+    public static void cycleHudFpsDisplayDelayMs() {
+        int current = getHudFpsDisplayDelayMs();
+        int next = switch (current) {
+            case 50 -> 100;
+            case 100 -> 250;
+            case 250 -> 500;
+            case 500 -> 1000;
+            default -> 50;
+        };
+        config.hudFpsDisplayDelayMs = next;
+        saveConfig();
+    }
+
+    public static int getHudTransparencyPercent() {
+        return Math.clamp(config.hudTransparencyPercent, 10, 100);
+    }
+
+    public static void setHudTransparencyPercent(int value) {
+        config.hudTransparencyPercent = Math.clamp(value, 10, 100);
+        saveConfig();
+    }
+
 
     public static int getCpuGraphColor() { return parseColor(config.cpuGraphColor, 0xFF5EA9FF); }
     public static int getGpuGraphColor() { return parseColor(config.gpuGraphColor, 0xFF77DD77); }
@@ -396,6 +422,12 @@ public class ConfigManager {
         if (config.profilerUpdateDelayMs <= 0) {
             config.profilerUpdateDelayMs = 100;
         }
+        if (config.hudFpsDisplayDelayMs <= 0) {
+            config.hudFpsDisplayDelayMs = 100;
+        }
+        if (config.hudTransparencyPercent <= 0) {
+            config.hudTransparencyPercent = 100;
+        }
         if (config.tasksColumns == null || config.tasksColumns.isBlank()) {
             config.tasksColumns = "cpu,threads,samples,invokes";
         }
@@ -429,6 +461,8 @@ public class ConfigManager {
         public int sessionDurationSeconds = 30;
         public int metricsUpdateIntervalMs = 100;
         public int profilerUpdateDelayMs = 100;
+        public int hudFpsDisplayDelayMs = 100;
+        public int hudTransparencyPercent = 100;
         public boolean hudShowFps = true;
         public boolean hudShowFrame = true;
         public boolean hudShowTicks = true;

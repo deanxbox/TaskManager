@@ -27,6 +27,9 @@ public final class HudOverlayRenderer {
     private static final int TWO_COLUMN_WIDTH = 176;
     private static final int THREE_COLUMN_WIDTH = 138;
     private static final int LABEL_WIDTH = 54;
+    private static long lastDisplayedFpsUpdateAtMillis;
+    private static String displayedFpsText = "0 now | 0 avg";
+    private static String displayedLowFpsText = "1% 0 | 0.1% 0";
 
     private HudOverlayRenderer() {
     }
@@ -102,12 +105,15 @@ public final class HudOverlayRenderer {
             }
         }
 
-        ctx.fill(x, y, x + width, y + height, BG);
-        ctx.fill(x, y, x + width, y + 1, borderColor);
-        ctx.fill(x, y, x + 1, y + height, borderColor);
-        ctx.fill(x + width - 1, y, x + width, y + height, borderColor);
-        ctx.fill(x, y + height - 1, x + width, y + height, borderColor);
-        ctx.fill(x, y + HEADER_HEIGHT, x + width, y + HEADER_HEIGHT + 1, 0x443A3F46);
+        int backgroundColor = applyHudTransparency(BG);
+        int borderFillColor = applyHudTransparency(borderColor);
+        int dividerColor = applyHudTransparency(0x443A3F46);
+        ctx.fill(x, y, x + width, y + height, backgroundColor);
+        ctx.fill(x, y, x + width, y + 1, borderFillColor);
+        ctx.fill(x, y, x + 1, y + height, borderFillColor);
+        ctx.fill(x + width - 1, y, x + width, y + height, borderFillColor);
+        ctx.fill(x, y + height - 1, x + width, y + height, borderFillColor);
+        ctx.fill(x, y + HEADER_HEIGHT, x + width, y + HEADER_HEIGHT + 1, dividerColor);
 
         TextRenderer textRenderer = client.textRenderer;
         ctx.drawText(textRenderer, "Task Manager", x + PADDING, y + 5, actionableWarning ? HEADER : DIM, false);
@@ -129,7 +135,7 @@ public final class HudOverlayRenderer {
     }
 
     private static void buildCompactEntries(List<Entry> entries, FrameTimelineProfiler frame, MemoryProfiler.Snapshot memory, SystemMetricsProfiler.Snapshot system) {
-        entries.add(new Entry("FPS", compactFpsText(frame), HEADER, false));
+        entries.add(new Entry("FPS", displayedFpsText(frame), HEADER, false));
         entries.add(new Entry("Frame", compactFrameText(frame), TEXT, false));
         entries.add(new Entry("CPU", formatUtilAndTemp(system.cpuCoreLoadPercent(), system.cpuTemperatureC()), ACCENT, false));
         entries.add(new Entry("GPU", formatUtilAndTemp(system.gpuCoreLoadPercent(), system.gpuTemperatureC()), ACCENT, false));
@@ -137,8 +143,8 @@ public final class HudOverlayRenderer {
     }
 
     private static void buildPresetFullEntries(List<Entry> entries, ProfilerManager.ProfilerSnapshot snapshot, FrameTimelineProfiler frame, MemoryProfiler.Snapshot memory, SystemMetricsProfiler.Snapshot system) {
-        entries.add(new Entry("FPS", compactFpsText(frame), HEADER, false));
-        entries.add(new Entry("Lows", lowFpsText(frame), HEADER, false));
+        entries.add(new Entry("FPS", displayedFpsText(frame), HEADER, false));
+        entries.add(new Entry("Lows", displayedLowFpsText(frame), HEADER, false));
         entries.add(new Entry("Frame", compactFrameText(frame), TEXT, false));
         entries.add(new Entry("Client", millisText(TickProfiler.getInstance().getAverageClientTickNs() / 1_000_000.0), TEXT, false));
         entries.add(new Entry("Server", millisText(TickProfiler.getInstance().getAverageServerTickNs() / 1_000_000.0), TEXT, false));
@@ -154,8 +160,8 @@ public final class HudOverlayRenderer {
 
     private static void buildCustomEntries(List<Entry> entries, ProfilerManager.ProfilerSnapshot snapshot, FrameTimelineProfiler frame, MemoryProfiler.Snapshot memory, SystemMetricsProfiler.Snapshot system) {
         if (ConfigManager.isHudShowFps()) {
-            entries.add(new Entry("FPS", compactFpsText(frame), HEADER, false));
-            entries.add(new Entry("Lows", lowFpsText(frame), HEADER, false));
+            entries.add(new Entry("FPS", displayedFpsText(frame), HEADER, false));
+            entries.add(new Entry("Lows", displayedLowFpsText(frame), HEADER, false));
         }
         if (ConfigManager.isHudShowFrame()) {
             entries.add(new Entry("Frame", compactFrameText(frame), TEXT, false));
@@ -262,12 +268,24 @@ public final class HudOverlayRenderer {
         ctx.drawText(textRenderer, value, valueX, y, entry.color(), false);
     }
 
-    private static String compactFpsText(FrameTimelineProfiler frame) {
-        return format0(frame.getCurrentFps()) + " now | " + format0(frame.getAverageFps()) + " avg";
+    private static String displayedFpsText(FrameTimelineProfiler frame) {
+        refreshDisplayedFps(frame);
+        return displayedFpsText;
     }
 
-    private static String lowFpsText(FrameTimelineProfiler frame) {
-        return "1% " + format0(frame.getOnePercentLowFps()) + " | 0.1% " + format0(frame.getPointOnePercentLowFps());
+    private static String displayedLowFpsText(FrameTimelineProfiler frame) {
+        refreshDisplayedFps(frame);
+        return displayedLowFpsText;
+    }
+
+    private static void refreshDisplayedFps(FrameTimelineProfiler frame) {
+        long now = System.currentTimeMillis();
+        if (now - lastDisplayedFpsUpdateAtMillis < ConfigManager.getHudFpsDisplayDelayMs()) {
+            return;
+        }
+        lastDisplayedFpsUpdateAtMillis = now;
+        displayedFpsText = format0(frame.getCurrentFps()) + " now | " + format0(frame.getAverageFps()) + " avg";
+        displayedLowFpsText = "1% " + format0(frame.getOnePercentLowFps()) + " | 0.1% " + format0(frame.getPointOnePercentLowFps());
     }
 
     private static String compactFrameText(FrameTimelineProfiler frame) {
@@ -341,6 +359,12 @@ public final class HudOverlayRenderer {
             case 1 -> WARN;
             default -> actionableWarning ? WARN : DIM;
         };
+    }
+
+    private static int applyHudTransparency(int color) {
+        int alpha = (color >>> 24) & 0xFF;
+        int scaledAlpha = alpha * ConfigManager.getHudTransparencyPercent() / 100;
+        return (color & 0x00FFFFFF) | (scaledAlpha << 24);
     }
 
     private record Entry(String label, String value, int color, boolean fullWidth) {
