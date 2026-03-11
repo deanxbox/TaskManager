@@ -8,9 +8,7 @@ import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 import wueffi.taskmanager.client.FrameTimelineProfiler;
 import wueffi.taskmanager.client.InputLatencyProfiler;
-import wueffi.taskmanager.client.MemoryProfiler;
 import wueffi.taskmanager.client.RenderPhaseProfiler;
-import wueffi.taskmanager.client.SystemMetricsProfiler;
 import wueffi.taskmanager.client.TaskManagerScreen;
 import wueffi.taskmanager.client.util.GpuTimer;
 
@@ -22,7 +20,6 @@ public class GameRendererMixin {
         if (!TaskManagerScreen.isLiveMetricsActive()) return;
 
         FrameTimelineProfiler.getInstance().beginFrame();
-        SystemMetricsProfiler.getInstance().sample(MemoryProfiler.getInstance().getDetailedSnapshot());
         GpuTimer.collectResults();
         RenderPhaseProfiler.getInstance().beginCpuPhase("frame.total");
     }

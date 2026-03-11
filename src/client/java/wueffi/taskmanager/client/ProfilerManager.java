@@ -421,10 +421,10 @@ public class ProfilerManager {
         latestEntityHotspots = sampleEntityHotspots(client);
         latestBlockEntityHotspots = sampleBlockEntityHotspots(client);
 
-        if (client.world != null && client.world.getTime() % 200 == 0) {
+        if (shouldCollectFrameMetrics() || (client.world != null && client.world.getTime() % 200 == 0)) {
             MemoryProfiler.getInstance().sampleJvm();
         }
-        SystemMetricsProfiler.getInstance().sample(MemoryProfiler.getInstance().getDetailedSnapshot());
+        SystemMetricsProfiler.getInstance().sample(MemoryProfiler.getInstance().getDetailedSnapshot(), latestEntityCounts, latestChunkCounts);
         ThreadLoadProfiler.getInstance().sample();
         NetworkPacketProfiler.getInstance().drainWindow();
         latestLockSummaries = buildLockSummaries(SystemMetricsProfiler.getInstance().getSnapshot());
