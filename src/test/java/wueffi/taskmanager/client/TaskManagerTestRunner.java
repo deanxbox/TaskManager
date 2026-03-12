@@ -10,6 +10,7 @@ public final class TaskManagerTestRunner {
         ProfilerManagerTests.run();
         ConfigManagerMigrationTests.run();
         TaskManagerScreenLayoutTests.run();
+        HudOverlayRendererTests.run();
         System.out.println("TaskManager tests passed.");
     }
 }

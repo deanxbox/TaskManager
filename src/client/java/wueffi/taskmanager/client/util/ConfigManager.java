@@ -74,6 +74,7 @@ public class ConfigManager {
     }
 
     private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
+    private static final int[] FRAME_BUDGET_TARGET_FPS_OPTIONS = {30, 45, 60, 72, 90, 120, 144, 165, 240};
     private static final Path CONFIG_PATH = resolveConfigPath();
     private static ConfigData config = new ConfigData();
 
@@ -173,6 +174,19 @@ public class ConfigManager {
 
     public static int getProfilerUpdateDelayMs() {
         return Math.clamp(config.profilerUpdateDelayMs, 50, 2000);
+    }
+
+    public static int getFrameBudgetTargetFps() {
+        return config.frameBudgetTargetFps <= 0 ? 60 : config.frameBudgetTargetFps;
+    }
+
+    public static double getFrameBudgetTargetFrameMs() {
+        return 1000.0 / Math.max(1, getFrameBudgetTargetFps());
+    }
+
+    public static void cycleFrameBudgetTargetFps() {
+        config.frameBudgetTargetFps = cycleIntOption(getFrameBudgetTargetFps(), FRAME_BUDGET_TARGET_FPS_OPTIONS);
+        saveConfig();
     }
 
     public static void cycleProfilerUpdateDelayMs() {
@@ -384,6 +398,12 @@ public class ConfigManager {
     public static boolean isMemorySortDescending() { return config.memorySortDescending; }
     public static String getStartupSort() { return config.startupSort == null || config.startupSort.isBlank() ? "ACTIVE" : config.startupSort; }
     public static boolean isStartupSortDescending() { return config.startupSortDescending; }
+    public static boolean isTaskEffectiveView() { return config.taskEffectiveView == null || config.taskEffectiveView; }
+    public static boolean isTaskShowSharedRows() { return config.taskShowSharedRows != null && config.taskShowSharedRows; }
+    public static boolean isGpuEffectiveView() { return config.gpuEffectiveView == null || config.gpuEffectiveView; }
+    public static boolean isGpuShowSharedRows() { return config.gpuShowSharedRows != null && config.gpuShowSharedRows; }
+    public static boolean isMemoryEffectiveView() { return config.memoryEffectiveView == null || config.memoryEffectiveView; }
+    public static boolean isMemoryShowSharedRows() { return config.memoryShowSharedRows != null && config.memoryShowSharedRows; }
 
     public static void setTasksSearch(String value) { config.tasksSearch = value == null ? "" : value; saveConfig(); }
     public static void setGpuSearch(String value) { config.gpuSearch = value == null ? "" : value; saveConfig(); }
@@ -393,6 +413,9 @@ public class ConfigManager {
     public static void setGpuSortState(String sort, boolean descending) { config.gpuSort = sort; config.gpuSortDescending = descending; saveConfig(); }
     public static void setMemorySortState(String sort, boolean descending) { config.memorySort = sort; config.memorySortDescending = descending; saveConfig(); }
     public static void setStartupSortState(String sort, boolean descending) { config.startupSort = sort; config.startupSortDescending = descending; saveConfig(); }
+    public static void setTaskAttributionView(boolean effectiveView, boolean showSharedRows) { config.taskEffectiveView = effectiveView; config.taskShowSharedRows = showSharedRows; saveConfig(); }
+    public static void setGpuAttributionView(boolean effectiveView, boolean showSharedRows) { config.gpuEffectiveView = effectiveView; config.gpuShowSharedRows = showSharedRows; saveConfig(); }
+    public static void setMemoryAttributionView(boolean effectiveView, boolean showSharedRows) { config.memoryEffectiveView = effectiveView; config.memoryShowSharedRows = showSharedRows; saveConfig(); }
 
     public static void toggleTasksColumn(String key) { config.tasksColumns = toggleColumn(config.tasksColumns, key); saveConfig(); }
     public static void toggleGpuColumn(String key) { config.gpuColumns = toggleColumn(config.gpuColumns, key); saveConfig(); }
@@ -478,6 +501,15 @@ public class ConfigManager {
         return String.join(",", values);
     }
 
+    private static int cycleIntOption(int current, int[] options) {
+        for (int i = 0; i < options.length; i++) {
+            if (options[i] == current) {
+                return options[(i + 1) % options.length];
+            }
+        }
+        return options[0];
+    }
+
     private static void migrateLegacyFields() {
         if (config.captureMode == null || config.captureMode.isBlank()) {
             config.captureMode = config.onlyProfileWhenOpen ? ProfilerManager.CaptureMode.OPEN_ONLY.name() : ProfilerManager.CaptureMode.PASSIVE_LIGHTWEIGHT.name();
@@ -515,6 +547,9 @@ public class ConfigManager {
         if (config.hudTransparencyPercent <= 0) {
             config.hudTransparencyPercent = 100;
         }
+        if (config.frameBudgetTargetFps <= 0) {
+            config.frameBudgetTargetFps = 60;
+        }
         if (config.hudShowMemoryAllocationRate == null) {
             config.hudShowMemoryAllocationRate = true;
         }
@@ -550,6 +585,12 @@ public class ConfigManager {
         if (config.gpuSort == null || config.gpuSort.isBlank()) config.gpuSort = "EST_GPU";
         if (config.memorySort == null || config.memorySort.isBlank()) config.memorySort = "MEMORY_MB";
         if (config.startupSort == null || config.startupSort.isBlank()) config.startupSort = "ACTIVE";
+        if (config.taskEffectiveView == null) config.taskEffectiveView = true;
+        if (config.taskShowSharedRows == null) config.taskShowSharedRows = false;
+        if (config.gpuEffectiveView == null) config.gpuEffectiveView = true;
+        if (config.gpuShowSharedRows == null) config.gpuShowSharedRows = false;
+        if (config.memoryEffectiveView == null) config.memoryEffectiveView = true;
+        if (config.memoryShowSharedRows == null) config.memoryShowSharedRows = false;
         if ((config.cpuGraphColor == null || config.cpuGraphColor.isBlank()) && config.cpuIntelColor != null) config.cpuGraphColor = config.cpuIntelColor;
         if ((config.gpuGraphColor == null || config.gpuGraphColor.isBlank()) && config.gpuNvidiaColor != null) config.gpuGraphColor = config.gpuNvidiaColor;
         config.cpuGraphColor = normalizeColorHex(config.cpuGraphColor, 0xFF5EA9FF);
@@ -572,6 +613,7 @@ public class ConfigManager {
         public int hudFpsDisplayDelayMs = 100;
         public int hudMemoryDisplayDelayMs = 100;
         public int hudTransparencyPercent = 100;
+        public int frameBudgetTargetFps = 60;
         public boolean hudShowFps = true;
         public boolean hudShowFrame = true;
         public boolean hudShowTicks = true;
@@ -623,6 +665,12 @@ public class ConfigManager {
         public boolean memorySortDescending = true;
         public String startupSort = "ACTIVE";
         public boolean startupSortDescending = true;
+        public Boolean taskEffectiveView = true;
+        public Boolean taskShowSharedRows = false;
+        public Boolean gpuEffectiveView = true;
+        public Boolean gpuShowSharedRows = false;
+        public Boolean memoryEffectiveView = true;
+        public Boolean memoryShowSharedRows = false;
         public String cpuGraphColor = "#5EA9FF";
         public String gpuGraphColor = "#77DD77";
         public String worldEntityGraphColor = "#FFC857";

@@ -38,7 +38,7 @@ public class WorldRendererMixin {
             CallbackInfo ci) {
 
         if (!ProfilerManager.getInstance().shouldCollectDetailedMetrics()) return;
-        RenderPhaseProfiler.getInstance().beginCpuPhase("worldRenderer.render");
+        RenderPhaseProfiler.getInstance().beginCpuPhase("worldRenderer.render", "minecraft");
         GpuTimer.begin("worldRenderer.render");
     }
 
@@ -70,7 +70,7 @@ public class WorldRendererMixin {
     )
     private void taskmanager$onOutlinesHead(CallbackInfo ci) {
         if (!ProfilerManager.getInstance().shouldCollectDetailedMetrics()) return;
-        RenderPhaseProfiler.getInstance().beginCpuPhase("worldRenderer.entityOutlines");
+        RenderPhaseProfiler.getInstance().beginCpuPhase("worldRenderer.entityOutlines", "minecraft");
         GpuTimer.begin("worldRenderer.entityOutlines");
     }
 
@@ -84,3 +84,4 @@ public class WorldRendererMixin {
         RenderPhaseProfiler.getInstance().endCpuPhase("worldRenderer.entityOutlines");
     }
 }
+

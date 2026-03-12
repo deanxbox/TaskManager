@@ -13,6 +13,7 @@ public final class ConfigManagerMigrationTests {
 
     public static void run() {
         migrateLegacyFieldsBackfillsNewHudDefaults();
+        frameBudgetTargetDefaultsAndCycles();
     }
 
     private static void migrateLegacyFieldsBackfillsNewHudDefaults() {
@@ -70,6 +71,34 @@ public final class ConfigManagerMigrationTests {
         }
     }
 
+    private static void frameBudgetTargetDefaultsAndCycles() {
+        try {
+            Class<?> configDataClass = Class.forName("wueffi.taskmanager.client.util.ConfigManager$ConfigData");
+            Constructor<?> constructor = configDataClass.getDeclaredConstructor();
+            constructor.setAccessible(true);
+            Object configData = constructor.newInstance();
+            setField(configDataClass, configData, "frameBudgetTargetFps", 0);
+
+            Field configField = ConfigManager.class.getDeclaredField("config");
+            configField.setAccessible(true);
+            Object previous = configField.get(null);
+            configField.set(null, configData);
+            try {
+                Method migrateMethod = ConfigManager.class.getDeclaredMethod("migrateLegacyFields");
+                migrateMethod.setAccessible(true);
+                migrateMethod.invoke(null);
+
+                assertEquals(60, ConfigManager.getFrameBudgetTargetFps(), "frame budget target fps default");
+                ConfigManager.cycleFrameBudgetTargetFps();
+                assertEquals(72, ConfigManager.getFrameBudgetTargetFps(), "frame budget target fps cycle");
+            } finally {
+                configField.set(null, previous);
+            }
+        } catch (Exception e) {
+            throw new AssertionError("frame budget target reflection failed", e);
+        }
+    }
+
     private static void setField(Class<?> type, Object target, String name, Object value) throws Exception {
         Field field = type.getDeclaredField(name);
         field.setAccessible(true);
@@ -85,6 +114,12 @@ public final class ConfigManagerMigrationTests {
     private static void assertFalse(boolean value, String message) {
         if (value) {
             throw new AssertionError(message);
+        }
+    }
+
+    private static void assertEquals(int expected, int actual, String message) {
+        if (expected != actual) {
+            throw new AssertionError(message + ": expected=" + expected + ", actual=" + actual);
         }
     }
 }
