@@ -1,3 +1,4 @@
+![Static Badge](https://img.shields.io/badge/Version-1.2.3-blue) ![Modrinth Downloads](https://img.shields.io/modrinth/dt/taskmanager)
 # Task Manager
 
 Task Manager is a Fabric client profiler for modded Minecraft that helps you identify frame drops, high MSPT, hot mods, rendering spikes, block-entity pressure, and JVM/runtime issues while the game is still running.
