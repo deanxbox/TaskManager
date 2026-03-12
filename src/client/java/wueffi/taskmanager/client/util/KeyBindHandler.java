@@ -22,23 +22,24 @@ public class KeyBindHandler {
     }
 
     public static void register() {
-        openKey = KeyBindingHelper.registerKeyBinding(new KeyBinding(
-                "key.taskmanager.open",
-                InputUtil.Type.KEYSYM,
-                GLFW.GLFW_KEY_F12,
-                new KeyBinding.Category(Identifier.of("taskmanager", "taskmanager"))
-        ));
+        KeyBinding.Category taskManagerCategory = new KeyBinding.Category(Identifier.of("taskmanager", "taskmanager"));
         sessionKey = KeyBindingHelper.registerKeyBinding(new KeyBinding(
                 "key.taskmanager.session",
                 InputUtil.Type.KEYSYM,
-                GLFW.GLFW_KEY_F11,
-                new KeyBinding.Category(Identifier.of("taskmanager", "taskmanager"))
+                GLFW.GLFW_KEY_F9,
+                taskManagerCategory
         ));
         hudToggleKey = KeyBindingHelper.registerKeyBinding(new KeyBinding(
                 "key.taskmanager.hud_toggle",
                 InputUtil.Type.KEYSYM,
                 GLFW.GLFW_KEY_F10,
-                new KeyBinding.Category(Identifier.of("taskmanager", "taskmanager"))
+                taskManagerCategory
+        ));
+        openKey = KeyBindingHelper.registerKeyBinding(new KeyBinding(
+                "key.taskmanager.open",
+                InputUtil.Type.KEYSYM,
+                GLFW.GLFW_KEY_F12,
+                taskManagerCategory
         ));
 
         ClientTickEvents.END_CLIENT_TICK.register(client -> {

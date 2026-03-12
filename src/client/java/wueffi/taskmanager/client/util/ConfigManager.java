@@ -604,7 +604,7 @@ public class ConfigManager {
     private static class ConfigData {
         public boolean onlyProfileWhenOpen = true;
         public String captureMode = ProfilerManager.CaptureMode.OPEN_ONLY.name();
-        public boolean hudEnabled = true;
+        public boolean hudEnabled = false;
         public String hudPosition = HudPosition.TOP_LEFT.name();
         public String hudLayoutMode = HudLayoutMode.SINGLE_COLUMN.name();
         public int sessionDurationSeconds = 30;

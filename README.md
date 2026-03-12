@@ -2,7 +2,7 @@
 
 Task Manager is a Fabric client profiler for modded Minecraft that helps you identify frame drops, high MSPT, hot mods, rendering spikes, block-entity pressure, and JVM/runtime issues while the game is still running.
 
-Open the profiler in-game with `F12`.
+Open the profiler in-game with `F12`. Toggle the HUD with `F10` and export Sessions using `F9`.
 
 ## Key Features
 
