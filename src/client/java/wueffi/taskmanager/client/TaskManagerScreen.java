@@ -38,9 +38,17 @@ public class TaskManagerScreen extends Screen {
 
     private record TooltipTarget(int x, int y, int width, int height, String text) {}
 
-    private record MemoryListLayout(int tableWidth, int listY, int listHeight) {}
+    private record ModalLayout(int x, int y, int width, int height) {}
+
+    private record MemoryListLayout(int tableWidth, int searchY, int headerY, int listY, int listHeight) {}
 
     private record SliderLayout(int x, int y, int width, int height) {}
+
+    private record EffectiveCpuAttribution(Map<String, CpuSamplingProfiler.Snapshot> displaySnapshots, Map<String, Long> redistributedSamplesByMod, Map<String, Long> redistributedRenderSamplesByMod, long totalSamples, long totalRenderSamples) {}
+
+    private record EffectiveMemoryAttribution(Map<String, Long> displayBytes, Map<String, Long> redistributedBytesByMod, long totalBytes) {}
+
+    private record EffectiveGpuAttribution(Map<String, Long> gpuNanosByMod, Map<String, Long> renderSamplesByMod, Map<String, Long> redistributedGpuNanosByMod, Map<String, Long> redistributedRenderSamplesByMod, long totalGpuNanos, long totalRenderSamples) {}
 
     private enum TableId {
         TASKS,
@@ -130,6 +138,7 @@ public class TaskManagerScreen extends Screen {
     private static final int GRAPH_TOP = 34;
     private static final int GRAPH_HEIGHT = 60;
     private static final String[] TAB_NAMES = {"Tasks", "GPU", "Render", "Startup", "Memory", "Flame", "Timeline", "Network", "Disk", "World", "System", "Settings"};
+    private static final int ATTRIBUTION_TREND_WINDOW_SECONDS = 30;
 
     private static final int BG_COLOR = 0xE0101010;
     private static final int PANEL_COLOR = 0xCC1A1A1A;
@@ -177,6 +186,12 @@ public class TaskManagerScreen extends Screen {
     private SystemMiniTab systemMiniTab = SystemMiniTab.OVERVIEW;
     private GraphMetricTab cpuGraphMetricTab = GraphMetricTab.LOAD;
     private GraphMetricTab gpuGraphMetricTab = GraphMetricTab.LOAD;
+    private boolean taskEffectiveView = true;
+    private boolean taskShowSharedRows;
+    private boolean gpuEffectiveView = true;
+    private boolean gpuShowSharedRows;
+    private boolean memoryEffectiveView = true;
+    private boolean memoryShowSharedRows;
     private float uiScale = 1.0f;
     private float uiOffsetX = 0.0f;
     private float uiOffsetY = 0.0f;
@@ -185,6 +200,8 @@ public class TaskManagerScreen extends Screen {
     private final List<FindingClickTarget> findingClickTargets = new ArrayList<>();
     private final List<TooltipTarget> tooltipTargets = new ArrayList<>();
     private String selectedFindingKey;
+    private TableId activeDrilldownTable;
+    private boolean attributionHelpOpen;
     private ProfilerManager.ProfilerSnapshot snapshot = ProfilerManager.getInstance().getCurrentSnapshot();
     private LagMapLayout lastRenderedLagMapLayout;
     private boolean draggingHudTransparency;
@@ -209,6 +226,12 @@ public class TaskManagerScreen extends Screen {
         this.memorySortDescending = ConfigManager.isMemorySortDescending();
         try { this.startupSort = StartupSort.valueOf(ConfigManager.getStartupSort()); } catch (Exception ignored) { this.startupSort = StartupSort.ACTIVE; }
         this.startupSortDescending = ConfigManager.isStartupSortDescending();
+        this.taskEffectiveView = ConfigManager.isTaskEffectiveView();
+        this.taskShowSharedRows = ConfigManager.isTaskShowSharedRows();
+        this.gpuEffectiveView = ConfigManager.isGpuEffectiveView();
+        this.gpuShowSharedRows = ConfigManager.isGpuShowSharedRows();
+        this.memoryEffectiveView = ConfigManager.isMemoryEffectiveView();
+        this.memoryShowSharedRows = ConfigManager.isMemoryShowSharedRows();
         FlamegraphProfiler.getInstance().reset();
         FlamegraphProfiler.getInstance().start();
         ProfilerManager.getInstance().onScreenOpened();
@@ -232,6 +255,9 @@ public class TaskManagerScreen extends Screen {
         ConfigManager.setGpuSortState(gpuSort.name(), gpuSortDescending);
         ConfigManager.setMemorySortState(memorySort.name(), memorySortDescending);
         ConfigManager.setStartupSortState(startupSort.name(), startupSortDescending);
+        ConfigManager.setTaskAttributionView(taskEffectiveView, taskShowSharedRows);
+        ConfigManager.setGpuAttributionView(gpuEffectiveView, gpuShowSharedRows);
+        ConfigManager.setMemoryAttributionView(memoryEffectiveView, memoryShowSharedRows);
         super.close();
     }
 
@@ -305,6 +331,12 @@ public class TaskManagerScreen extends Screen {
         else if (activeTab == 9) renderWorldTab(ctx, 0, contentY, w, contentH);
         else if (activeTab == 10) renderSystem(ctx, 0, contentY, w, contentH);
         else renderSettings(ctx, 0, contentY, w, contentH, logicalMouseX, logicalMouseY);
+
+        if (attributionHelpOpen) {
+            renderAttributionHelpOverlay(ctx, w, h, logicalMouseX, logicalMouseY);
+        } else if (activeDrilldownTable != null) {
+            renderRowDrilldownOverlay(ctx, w, h, logicalMouseX, logicalMouseY);
+        }
 
         renderTooltipOverlay(ctx, logicalMouseX, logicalMouseY);
         ctx.getMatrices().popMatrix();
@@ -408,26 +440,37 @@ public class TaskManagerScreen extends Screen {
         Map<String, CpuSamplingProfiler.Snapshot> cpu = snapshot.cpuMods();
         Map<String, CpuSamplingProfiler.DetailSnapshot> cpuDetails = snapshot.cpuDetails();
         Map<String, ModTimingSnapshot> invokes = snapshot.modInvokes();
-        List<String> rows = getTaskRows();
+        EffectiveCpuAttribution effectiveCpu = buildEffectiveCpuAttribution(cpu, invokes);
+        Map<String, CpuSamplingProfiler.Snapshot> displayCpu = effectiveCpu.displaySnapshots();
+        List<String> rows = getTaskRows(displayCpu, cpuDetails, invokes, !taskEffectiveView && taskShowSharedRows);
 
         int detailW = Math.min(420, Math.max(320, w / 3));
         int gap = PADDING;
         int listW = w - detailW - gap;
         int infoY = y + PADDING;
-        ctx.drawText(textRenderer, "CPU share from rolling sampled stack windows. Event invokes shown separately.", x + PADDING, infoY, TEXT_DIM, false);
-        ctx.drawText(textRenderer, cpuStatusText(snapshot.cpuReady(), snapshot.totalCpuSamples(), snapshot.cpuSampleAgeMillis()), x + PADDING, infoY + 10, getCpuStatusColor(snapshot.cpuReady()), false);
-        drawTopChip(ctx, x + PADDING + 208, infoY + 22, 78, 16, false);
-        ctx.drawText(textRenderer, "CPU Graph", x + PADDING + 226, infoY + 26, TEXT_DIM, false);
-        renderSearchBox(ctx, x + listW - 160, infoY + 24, 152, 16, "Search mods", tasksSearch, focusedSearchTable == TableId.TASKS);
-        renderResetButton(ctx, x + listW - 214, infoY + 24, 48, 16, hasTaskFilter());
-        renderSortSummary(ctx, x + PADDING, infoY + 28, "Sort", formatSort(taskSort, taskSortDescending), TEXT_DIM);
-        ctx.drawText(textRenderer, rows.size() + " mods", x + PADDING + 108, infoY + 28, TEXT_DIM, false);
+        int descriptionBottomY = renderWrappedText(ctx, x + PADDING, infoY, Math.max(260, listW - 16), taskEffectiveView ? "Effective CPU share by mod from rolling sampled stack windows. Shared/framework work is folded into concrete mods for comparison." : "Raw CPU ownership by mod from rolling sampled stack windows. Shared/framework buckets stay separate until you switch back to Effective view.", TEXT_DIM);
+        ctx.drawText(textRenderer, cpuStatusText(snapshot.cpuReady(), snapshot.totalCpuSamples(), snapshot.cpuSampleAgeMillis()), x + PADDING, descriptionBottomY + 2, getCpuStatusColor(snapshot.cpuReady()), false);
+        ctx.drawText(textRenderer, "Tip: Effective view proportionally folds shared/runtime work into mod rows for readability.", x + PADDING, descriptionBottomY + 12, TEXT_DIM, false);
+        addTooltip(x + PADDING, descriptionBottomY + 12, 420, 10, "Effective view proportionally folds shared/runtime work into concrete mods. Raw view keeps true-owned and shared buckets separate.");
+        int controlsY = descriptionBottomY + 26;
+        drawTopChip(ctx, x + PADDING, controlsY, 78, 16, false);
+        ctx.drawText(textRenderer, "CPU Graph", x + PADDING + 18, controlsY + 4, TEXT_DIM, false);
+        drawTopChip(ctx, x + PADDING + 84, controlsY, 98, 16, taskEffectiveView);
+        ctx.drawText(textRenderer, taskEffectiveView ? "Effective" : "Raw", x + PADDING + 110, controlsY + 4, taskEffectiveView ? TEXT_PRIMARY : TEXT_DIM, false);
+        addTooltip(x + PADDING + 84, controlsY, 98, 16, "Toggle between raw ownership and effective ownership with redistributed shared/framework samples.");
+        drawTopChip(ctx, x + PADDING + 188, controlsY, 112, 16, !taskEffectiveView && taskShowSharedRows);
+        ctx.drawText(textRenderer, taskShowSharedRows ? "Shared Rows" : "Hide Shared", x + PADDING + 204, controlsY + 4, (!taskEffectiveView && taskShowSharedRows) ? TEXT_PRIMARY : TEXT_DIM, false);
+        addTooltip(x + PADDING + 188, controlsY, 112, 16, "In Raw view, show or hide shared/jvm, shared/framework, and runtime rows. Effective view already folds them into mod rows.");
+        renderSearchBox(ctx, x + listW - 160, controlsY, 152, 16, "Search mods", tasksSearch, focusedSearchTable == TableId.TASKS);
+        renderResetButton(ctx, x + listW - 214, controlsY, 48, 16, hasTaskFilter());
+        renderSortSummary(ctx, x + PADDING, controlsY + 22, "Sort", formatSort(taskSort, taskSortDescending), TEXT_DIM);
+        ctx.drawText(textRenderer, rows.size() + " rows", x + PADDING + 108, controlsY + 22, TEXT_DIM, false);
 
         if (!rows.isEmpty() && (selectedTaskMod == null || !rows.contains(selectedTaskMod))) {
             selectedTaskMod = rows.getFirst();
         }
 
-        int headerY = infoY + 50;
+        int headerY = controlsY + 42;
         ctx.fill(x, headerY, x + listW, headerY + 14, HEADER_COLOR);
         ctx.drawText(textRenderer, headerLabel("MOD", taskSort == TaskSort.NAME, taskSortDescending), x + PADDING + ICON_SIZE + 6, headerY + 3, TEXT_DIM, false);
         addTooltip(x + PADDING + ICON_SIZE + 6, headerY + 1, 44, 14, "Sort by mod display name.");
@@ -457,10 +500,10 @@ public class TaskManagerScreen extends Screen {
                     Identifier icon = ModIconCache.getInstance().getIcon(modId);
                     ctx.drawTexture(RenderPipelines.GUI_TEXTURED, icon, x + PADDING, rowY + 2, 0f, 0f, ICON_SIZE, ICON_SIZE, ICON_SIZE, ICON_SIZE, 0xFFFFFFFF);
 
-                    CpuSamplingProfiler.Snapshot cpuSnapshot = cpu.getOrDefault(modId, new CpuSamplingProfiler.Snapshot(0, 0, 0));
+                    CpuSamplingProfiler.Snapshot cpuSnapshot = displayCpu.getOrDefault(modId, new CpuSamplingProfiler.Snapshot(0, 0, 0));
                     CpuSamplingProfiler.DetailSnapshot detailSnapshot = cpuDetails.get(modId);
                     long invokesCount = invokes.getOrDefault(modId, new ModTimingSnapshot(0, 0)).calls();
-                    double pct = snapshot.totalCpuSamples() > 0 ? cpuSnapshot.totalSamples() * 100.0 / snapshot.totalCpuSamples() : 0;
+                    double pct = cpuSnapshot.totalSamples() * 100.0 / Math.max(1L, displayCpu.values().stream().mapToLong(CpuSamplingProfiler.Snapshot::totalSamples).sum());
                     int threadCount = detailSnapshot == null ? 0 : detailSnapshot.sampledThreadCount();
 
                     ctx.drawText(textRenderer, getDisplayName(modId), x + PADDING + ICON_SIZE + 6, rowY + 6, TEXT_PRIMARY, false);
@@ -476,40 +519,48 @@ public class TaskManagerScreen extends Screen {
             ctx.disableScissor();
         }
 
-        renderCpuDetailPanel(ctx, x + listW + gap, y + PADDING, detailW, h - (PADDING * 2), selectedTaskMod, cpu.get(selectedTaskMod), cpuDetails.get(selectedTaskMod), invokes.get(selectedTaskMod));
+        renderCpuDetailPanel(ctx, x + listW + gap, y + PADDING, detailW, h - (PADDING * 2), selectedTaskMod, selectedTaskMod == null ? null : cpu.get(selectedTaskMod), selectedTaskMod == null ? null : effectiveCpu.displaySnapshots().get(selectedTaskMod), selectedTaskMod == null ? null : displayCpu.get(selectedTaskMod), selectedTaskMod == null ? 0L : effectiveCpu.redistributedSamplesByMod().getOrDefault(selectedTaskMod, 0L), selectedTaskMod == null ? null : cpuDetails.get(selectedTaskMod), selectedTaskMod == null ? null : invokes.get(selectedTaskMod), Math.max(1L, displayCpu.values().stream().mapToLong(CpuSamplingProfiler.Snapshot::totalSamples).sum()), taskEffectiveView);
     }
 
     private void renderGpu(DrawContext ctx, int x, int y, int w, int h, int mouseX, int mouseY) {
-        Map<String, CpuSamplingProfiler.Snapshot> cpu = snapshot.cpuMods();
         Map<String, CpuSamplingProfiler.DetailSnapshot> cpuDetails = snapshot.cpuDetails();
-        long totalRenderSamples = snapshot.totalRenderSamples();
-        long totalGpuNs = snapshot.renderPhases().values().stream().mapToLong(RenderPhaseProfiler.PhaseSnapshot::gpuNanos).sum();
+        EffectiveGpuAttribution rawGpu = buildEffectiveGpuAttribution(false);
+        EffectiveGpuAttribution displayGpu = buildEffectiveGpuAttribution(gpuEffectiveView);
+        List<String> rows = getGpuRows(displayGpu, cpuDetails, !gpuEffectiveView && gpuShowSharedRows);
 
         int detailW = Math.min(420, Math.max(320, w / 3));
         int gap = PADDING;
         int listW = w - detailW - gap;
         int infoY = y + PADDING;
-        ctx.drawText(textRenderer, "Estimated GPU share from render-thread samples weighted by measured GPU timer-query time.", x + PADDING, infoY, TEXT_DIM, false);
-        ctx.drawText(textRenderer, cpuStatusText(snapshot.gpuReady(), totalRenderSamples, snapshot.cpuSampleAgeMillis()), x + PADDING, infoY + 10, getGpuStatusColor(snapshot.gpuReady()), false);
-        drawTopChip(ctx, x + PADDING + 218, infoY + 22, 78, 16, false);
-        ctx.drawText(textRenderer, "GPU Graph", x + PADDING + 236, infoY + 26, TEXT_DIM, false);
-        renderSearchBox(ctx, x + listW - 160, infoY + 24, 152, 16, "Search mods", gpuSearch, focusedSearchTable == TableId.GPU);
-        renderResetButton(ctx, x + listW - 214, infoY + 24, 48, 16, hasGpuFilter());
-        renderSortSummary(ctx, x + PADDING, infoY + 28, "Sort", formatSort(gpuSort, gpuSortDescending), TEXT_DIM);
-        ctx.drawText(textRenderer, getGpuRows().size() + " mods", x + PADDING + 108, infoY + 28, TEXT_DIM, false);
+        int descriptionBottomY = renderWrappedText(ctx, x + PADDING, infoY, Math.max(260, listW - 16), gpuEffectiveView ? "Estimated GPU share by tagged render phases with shared render work folded into concrete mods." : "Raw GPU ownership by tagged render phases. Shared render buckets stay separate until you switch back to Effective view.", TEXT_DIM);
+        ctx.drawText(textRenderer, cpuStatusText(snapshot.gpuReady(), displayGpu.totalRenderSamples(), snapshot.cpuSampleAgeMillis()), x + PADDING, descriptionBottomY + 2, getGpuStatusColor(snapshot.gpuReady()), false);
+        ctx.drawText(textRenderer, "Tip: phase ownership assigns direct GPU time first, then Effective view redistributes leftover shared render work.", x + PADDING, descriptionBottomY + 12, TEXT_DIM, false);
+        addTooltip(x + PADDING, descriptionBottomY + 12, 460, 10, "GPU rows now use tagged render-phase ownership. Effective view redistributes leftover shared render work into concrete mods for readability.");
+        int controlsY = descriptionBottomY + 26;
+        drawTopChip(ctx, x + PADDING, controlsY, 78, 16, false);
+        ctx.drawText(textRenderer, "GPU Graph", x + PADDING + 18, controlsY + 4, TEXT_DIM, false);
+        drawTopChip(ctx, x + PADDING + 84, controlsY, 98, 16, gpuEffectiveView);
+        ctx.drawText(textRenderer, gpuEffectiveView ? "Effective" : "Raw", x + PADDING + 110, controlsY + 4, gpuEffectiveView ? TEXT_PRIMARY : TEXT_DIM, false);
+        addTooltip(x + PADDING + 84, controlsY, 98, 16, "Toggle between raw tagged ownership and effective ownership with redistributed shared render work.");
+        drawTopChip(ctx, x + PADDING + 188, controlsY, 112, 16, !gpuEffectiveView && gpuShowSharedRows);
+        ctx.drawText(textRenderer, gpuShowSharedRows ? "Shared Rows" : "Hide Shared", x + PADDING + 204, controlsY + 4, (!gpuEffectiveView && gpuShowSharedRows) ? TEXT_PRIMARY : TEXT_DIM, false);
+        addTooltip(x + PADDING + 188, controlsY, 112, 16, "In Raw view, show or hide shared/render rows. Effective view already folds them into mod rows.");
+        renderSearchBox(ctx, x + listW - 160, controlsY, 152, 16, "Search mods", gpuSearch, focusedSearchTable == TableId.GPU);
+        renderResetButton(ctx, x + listW - 214, controlsY, 48, 16, hasGpuFilter());
+        renderSortSummary(ctx, x + PADDING, controlsY + 22, "Sort", formatSort(gpuSort, gpuSortDescending), TEXT_DIM);
+        ctx.drawText(textRenderer, rows.size() + " rows", x + PADDING + 108, controlsY + 22, TEXT_DIM, false);
 
-        if (totalRenderSamples == 0 || totalGpuNs == 0) {
+        if (displayGpu.totalGpuNanos() <= 0L) {
             ctx.drawText(textRenderer, "No GPU attribution yet. Render some frames with timer queries enabled.", x + PADDING, infoY + 52, TEXT_DIM, false);
-            renderGpuDetailPanel(ctx, x + listW + gap, y + PADDING, detailW, h - (PADDING * 2), selectedGpuMod, null, null, totalRenderSamples, totalGpuNs);
+            renderGpuDetailPanel(ctx, x + listW + gap, y + PADDING, detailW, h - (PADDING * 2), selectedGpuMod, 0L, 0L, 0L, 0L, 0L, 0L, selectedGpuMod == null ? null : cpuDetails.get(selectedGpuMod), displayGpu.totalRenderSamples(), displayGpu.totalGpuNanos(), gpuEffectiveView);
             return;
         }
 
-        List<String> rows = getGpuRows();
         if (!rows.isEmpty() && (selectedGpuMod == null || !rows.contains(selectedGpuMod))) {
             selectedGpuMod = rows.getFirst();
         }
 
-        int headerY = infoY + 50;
+        int headerY = controlsY + 42;
         ctx.fill(x, headerY, x + listW, headerY + 14, HEADER_COLOR);
         ctx.drawText(textRenderer, headerLabel("MOD", gpuSort == GpuSort.NAME, gpuSortDescending), x + PADDING + ICON_SIZE + 6, headerY + 3, TEXT_DIM, false);
         addTooltip(x + PADDING + ICON_SIZE + 6, headerY + 1, 44, 14, "Sort by mod display name.");
@@ -517,10 +568,10 @@ public class TaskManagerScreen extends Screen {
         int threadsX = x + listW - 172;
         int gpuMsX = x + listW - 108;
         int renderSamplesX = x + listW - 42;
-        if (isColumnVisible(TableId.GPU, "pct")) { ctx.drawText(textRenderer, headerLabel("EST %GPU", gpuSort == GpuSort.EST_GPU, gpuSortDescending), pctX, headerY + 3, TEXT_DIM, false); addTooltip(pctX, headerY + 1, 58, 14, "Estimated GPU share derived from render-thread sampling and GPU time."); }
+        if (isColumnVisible(TableId.GPU, "pct")) { ctx.drawText(textRenderer, headerLabel("EST %GPU", gpuSort == GpuSort.EST_GPU, gpuSortDescending), pctX, headerY + 3, TEXT_DIM, false); addTooltip(pctX, headerY + 1, 58, 14, gpuEffectiveView ? "Tagged GPU share in the effective ownership view." : "Tagged GPU share in the raw ownership view."); }
         if (isColumnVisible(TableId.GPU, "threads")) { ctx.drawText(textRenderer, headerLabel("THREADS", gpuSort == GpuSort.THREADS, gpuSortDescending), threadsX, headerY + 3, TEXT_DIM, false); addTooltip(threadsX, headerY + 1, 58, 14, "Distinct sampled render threads contributing to this row."); }
-        if (isColumnVisible(TableId.GPU, "gpums")) { ctx.drawText(textRenderer, headerLabel("Est ms", gpuSort == GpuSort.GPU_MS, gpuSortDescending), gpuMsX, headerY + 3, TEXT_DIM, false); addTooltip(gpuMsX, headerY + 1, 48, 14, "Estimated GPU milliseconds in the rolling window."); }
-        if (isColumnVisible(TableId.GPU, "rsamples")) { ctx.drawText(textRenderer, headerLabel("R.S", gpuSort == GpuSort.RENDER_SAMPLES, gpuSortDescending), renderSamplesX, headerY + 3, TEXT_DIM, false); addTooltip(renderSamplesX, headerY + 1, 26, 14, "Render samples attributed to this mod."); }
+        if (isColumnVisible(TableId.GPU, "gpums")) { ctx.drawText(textRenderer, headerLabel("Est ms", gpuSort == GpuSort.GPU_MS, gpuSortDescending), gpuMsX, headerY + 3, TEXT_DIM, false); addTooltip(gpuMsX, headerY + 1, 48, 14, "Attributed GPU milliseconds in the rolling window."); }
+        if (isColumnVisible(TableId.GPU, "rsamples")) { ctx.drawText(textRenderer, headerLabel("R.S", gpuSort == GpuSort.RENDER_SAMPLES, gpuSortDescending), renderSamplesX, headerY + 3, TEXT_DIM, false); addTooltip(renderSamplesX, headerY + 1, 26, 14, "Render samples attributed to this row."); }
 
         int listY = headerY + 16;
         int listH = h - (listY - y);
@@ -536,11 +587,11 @@ public class TaskManagerScreen extends Screen {
                     if (modId.equals(selectedGpuMod)) {
                         ctx.fill(x, rowY, x + 3, rowY + ROW_HEIGHT, ACCENT_GREEN);
                     }
-                    CpuSamplingProfiler.Snapshot cpuSnapshot = cpu.get(modId);
+                    long gpuNanos = displayGpu.gpuNanosByMod().getOrDefault(modId, 0L);
+                    long renderSamples = displayGpu.renderSamplesByMod().getOrDefault(modId, 0L);
                     CpuSamplingProfiler.DetailSnapshot detailSnapshot = cpuDetails.get(modId);
-                    double share = cpuSnapshot.renderSamples() / (double) totalRenderSamples;
-                    double gpuMs = totalGpuNs * share / 1_000_000.0;
-                    double pct = share * 100.0;
+                    double pct = gpuNanos * 100.0 / Math.max(1L, displayGpu.totalGpuNanos());
+                    double gpuMs = gpuNanos / 1_000_000.0;
                     int threadCount = detailSnapshot == null ? 0 : detailSnapshot.sampledThreadCount();
 
                     Identifier icon = ModIconCache.getInstance().getIcon(modId);
@@ -549,7 +600,7 @@ public class TaskManagerScreen extends Screen {
                     if (isColumnVisible(TableId.GPU, "pct")) ctx.drawText(textRenderer, String.format(Locale.ROOT, "%.1f%%", pct), pctX, rowY + 6, getHeatColor(pct), false);
                     if (isColumnVisible(TableId.GPU, "threads")) ctx.drawText(textRenderer, Integer.toString(threadCount), threadsX, rowY + 6, TEXT_DIM, false);
                     if (isColumnVisible(TableId.GPU, "gpums")) ctx.drawText(textRenderer, String.format(Locale.ROOT, "%.2f", gpuMs), gpuMsX, rowY + 6, TEXT_DIM, false);
-                    if (isColumnVisible(TableId.GPU, "rsamples")) ctx.drawText(textRenderer, formatCount(cpuSnapshot.renderSamples()), renderSamplesX, rowY + 6, TEXT_DIM, false);
+                    if (isColumnVisible(TableId.GPU, "rsamples")) ctx.drawText(textRenderer, formatCount(renderSamples), renderSamplesX, rowY + 6, TEXT_DIM, false);
                 }
                 if (rowY > listY + listH) break;
                 rowY += ROW_HEIGHT;
@@ -558,7 +609,14 @@ public class TaskManagerScreen extends Screen {
             ctx.disableScissor();
         }
 
-        renderGpuDetailPanel(ctx, x + listW + gap, y + PADDING, detailW, h - (PADDING * 2), selectedGpuMod, cpu.get(selectedGpuMod), cpuDetails.get(selectedGpuMod), totalRenderSamples, totalGpuNs);
+        renderGpuDetailPanel(ctx, x + listW + gap, y + PADDING, detailW, h - (PADDING * 2), selectedGpuMod,
+                selectedGpuMod == null ? 0L : rawGpu.gpuNanosByMod().getOrDefault(selectedGpuMod, 0L),
+                selectedGpuMod == null ? 0L : displayGpu.gpuNanosByMod().getOrDefault(selectedGpuMod, 0L),
+                selectedGpuMod == null ? 0L : rawGpu.renderSamplesByMod().getOrDefault(selectedGpuMod, 0L),
+                selectedGpuMod == null ? 0L : displayGpu.renderSamplesByMod().getOrDefault(selectedGpuMod, 0L),
+                selectedGpuMod == null ? 0L : displayGpu.redistributedGpuNanosByMod().getOrDefault(selectedGpuMod, 0L),
+                selectedGpuMod == null ? 0L : displayGpu.redistributedRenderSamplesByMod().getOrDefault(selectedGpuMod, 0L),
+                selectedGpuMod == null ? null : cpuDetails.get(selectedGpuMod), displayGpu.totalRenderSamples(), displayGpu.totalGpuNanos(), gpuEffectiveView);
     }
 
     private void renderRender(DrawContext ctx, int x, int y, int w, int h, int mouseX, int mouseY) {
@@ -569,23 +627,27 @@ public class TaskManagerScreen extends Screen {
         }
 
         long totalCpuNanos = snapshot.renderPhases().values().stream().mapToLong(RenderPhaseProfiler.PhaseSnapshot::cpuNanos).sum();
+        ctx.drawText(textRenderer, "Owner shows the tagged mod bucket used by GPU attribution. Shared / Render means the phase still falls back to the shared render pool.", x + PADDING, y + PADDING, TEXT_DIM, false);
 
-        int headerY = y + PADDING;
+        int headerY = y + PADDING + 18;
         ctx.fill(x, headerY, x + w, headerY + 14, HEADER_COLOR);
         ctx.drawText(textRenderer, "PHASE", x + PADDING, headerY + 3, TEXT_DIM, false);
         addTooltip(x + PADDING, headerY + 1, 44, 14, "Render phase name.");
-        int shareX = w - 220;
-        int cpuMsX = w - 160;
-        int gpuMsX = w - 100;
-        int callsX = w - 45;
+        int ownerX = w - 300;
+        int shareX = w - 175;
+        int cpuMsX = w - 120;
+        int gpuMsX = w - 72;
+        int callsX = w - 34;
+        ctx.drawText(textRenderer, "OWNER", ownerX, headerY + 3, TEXT_DIM, false);
+        addTooltip(ownerX, headerY + 1, 42, 14, "Tagged owner mod for this phase. The GPU tab uses this first before redistributing any leftover shared render work.");
         ctx.drawText(textRenderer, "%CPU", shareX, headerY + 3, TEXT_DIM, false);
         addTooltip(shareX, headerY + 1, 38, 14, "CPU share of this render phase in the current window.");
-        ctx.drawText(textRenderer, "CPU ms", cpuMsX, headerY + 3, TEXT_DIM, false);
-        addTooltip(cpuMsX, headerY + 1, 42, 14, "Average CPU milliseconds per call for this phase.");
-        ctx.drawText(textRenderer, "GPU ms", gpuMsX, headerY + 3, TEXT_DIM, false);
-        addTooltip(gpuMsX, headerY + 1, 42, 14, "Average GPU milliseconds per call when timer queries are available.");
-        ctx.drawText(textRenderer, "CALLS", callsX, headerY + 3, TEXT_DIM, false);
-        addTooltip(callsX, headerY + 1, 42, 14, "Approximate call count for this phase in the rolling window.");
+        ctx.drawText(textRenderer, "CPU", cpuMsX, headerY + 3, TEXT_DIM, false);
+        addTooltip(cpuMsX, headerY + 1, 28, 14, "Average CPU milliseconds per call for this phase.");
+        ctx.drawText(textRenderer, "GPU", gpuMsX, headerY + 3, TEXT_DIM, false);
+        addTooltip(gpuMsX, headerY + 1, 28, 14, "Average GPU milliseconds per call when timer queries are available.");
+        ctx.drawText(textRenderer, "C", callsX, headerY + 3, TEXT_DIM, false);
+        addTooltip(callsX, headerY + 1, 12, 14, "Approximate call count for this phase in the rolling window.");
 
         int listY = headerY + 16;
         int listH = h - (listY - y);
@@ -601,8 +663,11 @@ public class TaskManagerScreen extends Screen {
                 double pct = totalCpuNanos > 0 ? phaseSnapshot.cpuNanos() * 100.0 / totalCpuNanos : 0;
                 double avgCpuMs = phaseCalls > 0 ? (phaseSnapshot.cpuNanos() / 1_000_000.0) / phaseCalls : 0;
                 double avgGpuMs = phaseCalls > 0 ? (phaseSnapshot.gpuNanos() / 1_000_000.0) / phaseCalls : 0;
+                String owner = phaseSnapshot.ownerMod() == null || phaseSnapshot.ownerMod().isBlank() ? "shared/render" : phaseSnapshot.ownerMod();
+                String phaseLabel = textRenderer.trimToWidth(phase, Math.max(120, ownerX - (x + PADDING) - 8));
 
-                ctx.drawText(textRenderer, phase, x + PADDING, rowY + 6, TEXT_PRIMARY, false);
+                ctx.drawText(textRenderer, phaseLabel, x + PADDING, rowY + 6, TEXT_PRIMARY, false);
+                ctx.drawText(textRenderer, textRenderer.trimToWidth(getDisplayName(owner), Math.max(70, shareX - ownerX - 6)), ownerX, rowY + 6, isSharedAttributionBucket(owner) ? TEXT_DIM : TEXT_PRIMARY, false);
                 ctx.drawText(textRenderer, String.format("%.1f%%", pct), shareX, rowY + 6, getHeatColor(pct), false);
                 ctx.drawText(textRenderer, String.format("%.2f", avgCpuMs), cpuMsX, rowY + 6, TEXT_DIM, false);
                 ctx.drawText(textRenderer, phaseSnapshot.gpuNanos() > 0 ? String.format("%.2f", avgGpuMs) : "-", gpuMsX, rowY + 6, TEXT_DIM, false);
@@ -700,21 +765,23 @@ public class TaskManagerScreen extends Screen {
 
         ctx.fill(x, y + h - 14, x + w, y + h, HEADER_COLOR);
         ctx.drawText(textRenderer, String.format(Locale.ROOT, "Startup span %.1f ms | %d mods | %s", totalSpan / 1_000_000.0, snapshot.startupRows().size(), measuredEntrypoints ? "measured entrypoints" : "fallback registration path"), left, y + h - 10, TEXT_DIM, false);
-        endFullPageScissor(ctx);
+        ctx.disableScissor();
     }
 
     private void renderMemory(DrawContext ctx, int x, int y, int w, int h, int mouseX, int mouseY) {
         MemoryProfiler.Snapshot memory = snapshot.memory();
-        Map<String, Long> memoryMods = snapshot.memoryMods();
+        Map<String, Long> rawMemoryMods = snapshot.memoryMods();
         Map<String, Long> sharedFamilies = snapshot.sharedMemoryFamilies();
         Map<String, Map<String, Long>> sharedFamilyClasses = snapshot.sharedFamilyClasses();
         Map<String, Map<String, Long>> memoryClassesByMod = snapshot.memoryClassesByMod();
+        EffectiveMemoryAttribution effectiveMemory = buildEffectiveMemoryAttribution(rawMemoryMods);
+        Map<String, Long> memoryMods = memoryEffectiveView ? effectiveMemory.displayBytes() : rawMemoryMods;
 
         if (selectedSharedFamily == null && !sharedFamilies.isEmpty()) {
             selectedSharedFamily = sharedFamilies.keySet().iterator().next();
         }
 
-        List<String> rows = getMemoryRows();
+        List<String> rows = getMemoryRows(memoryMods, memoryClassesByMod, !memoryEffectiveView && memoryShowSharedRows);
         if (selectedMemoryMod == null || !rows.contains(selectedMemoryMod)) {
             selectedMemoryMod = rows.isEmpty() ? null : rows.getFirst();
         }
@@ -725,21 +792,30 @@ public class TaskManagerScreen extends Screen {
         int tableW = w - sharedPanelW - panelGap;
         int left = x + PADDING;
         int top = y + PADDING;
-        ctx.drawText(textRenderer, "Estimated live heap by mod plus JVM runtime buckets. Updated asynchronously.", left, top, TEXT_DIM, false);
-        ctx.drawText(textRenderer, memoryStatusText(snapshot.memoryAgeMillis()), left, top + 10, snapshot.memoryAgeMillis() <= 15000 ? ACCENT_GREEN : ACCENT_YELLOW, false);
+        int descriptionBottomY = renderWrappedText(ctx, left, top, Math.max(260, tableW - 16), memoryEffectiveView ? "Effective live heap by mod with shared/runtime buckets folded into concrete mods for comparison. Updated asynchronously." : "Raw live heap by owner/class family. Shared/runtime buckets stay separate until you switch back to Effective view.", TEXT_DIM);
+        ctx.drawText(textRenderer, memoryStatusText(snapshot.memoryAgeMillis()), left, descriptionBottomY + 2, snapshot.memoryAgeMillis() <= 15000 ? ACCENT_GREEN : ACCENT_YELLOW, false);
 
         long heapMax = memory.heapMaxBytes() > 0 ? memory.heapMaxBytes() : memory.heapCommittedBytes();
         double usedPct = heapMax > 0 ? (memory.heapUsedBytes() * 100.0 / heapMax) : 0;
 
-        drawTopChip(ctx, x + tableW - 106, top + 2, 98, 16, false);
-        ctx.drawText(textRenderer, "Memory Graph", x + tableW - 92, top + 6, TEXT_DIM, false);
+        ctx.drawText(textRenderer, "Tip: Effective view proportionally folds shared/runtime memory into mod rows for readability.", left, descriptionBottomY + 12, TEXT_DIM, false);
+        addTooltip(left, descriptionBottomY + 12, 430, 10, "Effective view proportionally folds shared/runtime memory into concrete mods. Raw view keeps true-owned and shared buckets separate.");
+        int controlsTopY = descriptionBottomY + 26;
+        drawTopChip(ctx, x + tableW - 222, controlsTopY, 112, 16, !memoryEffectiveView && memoryShowSharedRows);
+        ctx.drawText(textRenderer, memoryShowSharedRows ? "Shared Rows" : "Hide Shared", x + tableW - 206, controlsTopY + 4, (!memoryEffectiveView && memoryShowSharedRows) ? TEXT_PRIMARY : TEXT_DIM, false);
+        addTooltip(x + tableW - 222, controlsTopY, 112, 16, "In Raw view, show or hide shared/jvm, shared/framework, and runtime rows. Effective view already folds them into mod rows.");
+        drawTopChip(ctx, x + tableW - 112, controlsTopY, 98, 16, memoryEffectiveView);
+        ctx.drawText(textRenderer, memoryEffectiveView ? "Effective" : "Raw", x + tableW - 86, controlsTopY + 4, memoryEffectiveView ? TEXT_PRIMARY : TEXT_DIM, false);
+        addTooltip(x + tableW - 112, controlsTopY, 98, 16, "Toggle between raw memory ownership and effective ownership with redistributed shared/runtime memory.");
+        drawTopChip(ctx, x + tableW - 106, controlsTopY + 18, 98, 16, false);
+        ctx.drawText(textRenderer, "Memory Graph", x + tableW - 92, controlsTopY + 22, TEXT_DIM, false);
 
-        int controlsY = top + 28;
+        int controlsY = controlsTopY + 42;
 
         renderSearchBox(ctx, x + tableW - 160, controlsY, 152, 16, "Search mods", memorySearch, focusedSearchTable == TableId.MEMORY);
         renderResetButton(ctx, x + tableW - 214, controlsY, 48, 16, hasMemoryFilter());
         renderSortSummary(ctx, left, controlsY + 4, "Sort", formatSort(memorySort, memorySortDescending), TEXT_DIM);
-        ctx.drawText(textRenderer, rows.size() + " mods", left + 108, controlsY + 4, TEXT_DIM, false);
+        ctx.drawText(textRenderer, rows.size() + " rows", left + 108, controlsY + 4, TEXT_DIM, false);
 
         int barY = controlsY + 24;
         int barW = Math.min(320, tableW - (PADDING * 2));
@@ -766,7 +842,7 @@ public class TaskManagerScreen extends Screen {
         }
 
         if (rows.isEmpty()) {
-            ctx.drawText(textRenderer, memorySearch.isBlank() ? "Per-mod memory snapshot not available yet." : "No memory rows match the current search/filter.", left, barY + 48, TEXT_DIM, false);
+            ctx.drawText(textRenderer, memorySearch.isBlank() ? "Per-mod memory attribution is still warming up. Open Memory Graph for live JVM totals in the meantime." : "No memory rows match the current search/filter.", left, barY + 48, TEXT_DIM, false);
             return;
         }
 
@@ -779,7 +855,7 @@ public class TaskManagerScreen extends Screen {
         int pctX = x + tableW - 42;
         if (isColumnVisible(TableId.MEMORY, "classes")) { ctx.drawText(textRenderer, headerLabel("CLS", memorySort == MemorySort.CLASS_COUNT, memorySortDescending), classesX, headerY + 3, TEXT_DIM, false); addTooltip(classesX, headerY + 1, 28, 14, "Distinct live class families attributed to this mod."); }
         if (isColumnVisible(TableId.MEMORY, "mb")) { ctx.drawText(textRenderer, headerLabel("MB", memorySort == MemorySort.MEMORY_MB, memorySortDescending), mbX, headerY + 3, TEXT_DIM, false); addTooltip(mbX, headerY + 1, 22, 14, "Attributed live heap in megabytes."); }
-        if (isColumnVisible(TableId.MEMORY, "pct")) { ctx.drawText(textRenderer, headerLabel("%", memorySort == MemorySort.PERCENT, memorySortDescending), pctX, headerY + 3, TEXT_DIM, false); addTooltip(pctX, headerY + 1, 16, 14, "Share of currently attributed live heap."); }
+        if (isColumnVisible(TableId.MEMORY, "pct")) { ctx.drawText(textRenderer, headerLabel("%", memorySort == MemorySort.PERCENT, memorySortDescending), pctX, headerY + 3, TEXT_DIM, false); addTooltip(pctX, headerY + 1, 16, 14, memoryEffectiveView ? "Share of effective attributed live heap." : "Share of raw attributed live heap."); }
 
         long totalAttributedBytes = Math.max(1, memoryMods.values().stream().mapToLong(Long::longValue).sum());
         int listY = headerY + 16;
@@ -814,65 +890,88 @@ public class TaskManagerScreen extends Screen {
 
         if (detailH > 0) {
             if (selectedMemoryMod != null) {
-                renderMemoryDetailPanel(ctx, x, y + h - detailH, tableW, detailH, selectedMemoryMod, memoryClassesByMod.getOrDefault(selectedMemoryMod, Map.of()));
+                renderMemoryDetailPanel(ctx, x, y + h - detailH, tableW, detailH, selectedMemoryMod, rawMemoryMods.getOrDefault(selectedMemoryMod, 0L), effectiveMemory.displayBytes().getOrDefault(selectedMemoryMod, rawMemoryMods.getOrDefault(selectedMemoryMod, 0L)), memoryMods.getOrDefault(selectedMemoryMod, 0L), memoryClassesByMod.getOrDefault(selectedMemoryMod, Map.of()), effectiveMemory.redistributedBytesByMod().getOrDefault(selectedMemoryMod, 0L), totalAttributedBytes, memoryEffectiveView);
             } else {
                 renderSharedFamilyDetail(ctx, x, y + h - detailH, tableW, detailH, sharedFamilyClasses.getOrDefault(selectedSharedFamily, Map.of()));
             }
         }
     }
 
-    private void renderCpuDetailPanel(DrawContext ctx, int x, int y, int width, int height, String modId, CpuSamplingProfiler.Snapshot cpuSnapshot, CpuSamplingProfiler.DetailSnapshot detail, ModTimingSnapshot invokeSnapshot) {
+    private void renderCpuDetailPanel(DrawContext ctx, int x, int y, int width, int height, String modId, CpuSamplingProfiler.Snapshot rawCpuSnapshot, CpuSamplingProfiler.Snapshot effectiveCpuSnapshot, CpuSamplingProfiler.Snapshot displayCpuSnapshot, long redistributedSamples, CpuSamplingProfiler.DetailSnapshot detail, ModTimingSnapshot invokeSnapshot, long totalCpuSamples, boolean effectiveView) {
         drawInsetPanel(ctx, x, y, width, height);
-        if (modId == null || cpuSnapshot == null) {
+        if (modId == null || displayCpuSnapshot == null) {
             ctx.drawText(textRenderer, "Select a row to inspect sampled CPU causes.", x + 8, y + 8, TEXT_DIM, false);
             return;
         }
         ctx.enableScissor(x, y, x + width, y + height);
-        ctx.drawText(textRenderer, textRenderer.trimToWidth(getDisplayName(modId), width - 16), x + 8, y + 8, TEXT_PRIMARY, false);
-        double pct = snapshot.totalCpuSamples() > 0 ? cpuSnapshot.totalSamples() * 100.0 / snapshot.totalCpuSamples() : 0.0;
-        int rowY = renderWrappedText(ctx, x + 8, y + 20, width - 16, String.format(Locale.ROOT, "%.1f%% CPU | %s threads | %s samples | %s invokes", pct, detail == null ? 0 : detail.sampledThreadCount(), formatCount(cpuSnapshot.totalSamples()), formatCount(invokeSnapshot == null ? 0 : invokeSnapshot.calls())), TEXT_DIM);
-        rowY = renderWrappedText(ctx, x + 8, rowY, width - 16, "Attribution: sampled stack ownership [measured/inferred]", TEXT_DIM) + 6;
-        if ("shared/jvm".equals(modId) || "shared/framework".equals(modId)) {
-            rowY = renderThreadSnapshotSection(ctx, x + 8, rowY, width - 16, "Top JVM threads [measured]", snapshot.systemMetrics().threadDetailsByName());
-            rowY = renderStringListSection(ctx, x + 8, rowY + 6, width - 16, "Top waits / locks [measured]", ProfilerManager.getInstance().getLatestLockSummaries());
-        } else {
-            rowY = renderReasonSection(ctx, x + 8, rowY, width - 16, "Top threads [sampled]", effectiveThreadBreakdown(modId, detail));
+        drawTopChip(ctx, x + width - 96, y + 6, 88, 16, activeDrilldownTable == TableId.TASKS);
+        ctx.drawText(textRenderer, "Why this row", x + width - 88, y + 10, activeDrilldownTable == TableId.TASKS ? TEXT_PRIMARY : TEXT_DIM, false);
+        ctx.drawText(textRenderer, textRenderer.trimToWidth(getDisplayName(modId), width - 112), x + 8, y + 8, TEXT_PRIMARY, false);
+        long rawSamples = rawCpuSnapshot == null ? 0L : rawCpuSnapshot.totalSamples();
+        long effectiveSamples = effectiveCpuSnapshot == null ? rawSamples : effectiveCpuSnapshot.totalSamples();
+        double pct = displayCpuSnapshot.totalSamples() * 100.0 / Math.max(1L, totalCpuSamples);
+        int rowY = renderWrappedText(ctx, x + 8, y + 20, width - 16, String.format(Locale.ROOT, "%s view | %.1f%% CPU | %s threads | %s shown samples | %s invokes", effectiveView ? "Effective" : "Raw", pct, detail == null ? 0 : detail.sampledThreadCount(), formatCount(displayCpuSnapshot.totalSamples()), formatCount(invokeSnapshot == null ? 0 : invokeSnapshot.calls())), TEXT_DIM);
+        rowY = renderWrappedText(ctx, x + 8, rowY, width - 16, "Raw owned samples: " + formatCount(rawSamples) + " | Effective samples: " + formatCount(effectiveSamples), TEXT_DIM);
+        if (redistributedSamples > 0) {
+            rowY = renderWrappedText(ctx, x + 8, rowY, width - 16, "Redistributed shared/framework samples: " + formatCount(redistributedSamples), TEXT_DIM);
         }
-        renderReasonSection(ctx, x + 8, rowY + 6, width - 16, "Top sampled frames [sampled]", detail == null ? Map.of() : detail.topFrames());
+        rowY = renderWrappedText(ctx, x + 8, rowY, width - 16, effectiveView ? "Attribution: sampled stack ownership with shared/framework time proportionally folded into concrete mods [measured/inferred]" : "Attribution: sampled stack ownership without redistribution. Shared/framework rows remain separate [measured/inferred]", TEXT_DIM) + 6;
+        rowY = renderReasonSection(ctx, x + 8, rowY, width - 16, "Top threads [sampled]", effectiveThreadBreakdown(modId, detail));
+        if ("shared/render".equals(modId)) {
+            rowY = renderStringListSection(ctx, x + 8, rowY + 6, width - 16, "Shared bucket sources", buildGpuPhaseBreakdownLines(modId));
+            renderReasonSection(ctx, x + 8, rowY + 6, width - 16, "Top sampled frames [sampled]", detail == null ? Map.of() : detail.topFrames());
+        } else {
+            rowY = renderReasonSection(ctx, x + 8, rowY + 6, width - 16, isSharedAttributionBucket(modId) ? "Shared bucket sources" : "Top sampled frames [sampled]", isSharedAttributionBucket(modId) ? buildCpuBucketBreakdown(modId, detail) : (detail == null ? Map.of() : detail.topFrames()));
+            if (isSharedAttributionBucket(modId)) {
+                renderReasonSection(ctx, x + 8, rowY + 6, width - 16, "Top sampled frames [sampled]", detail == null ? Map.of() : detail.topFrames());
+            }
+        }
         ctx.disableScissor();
     }
 
-    private void renderGpuDetailPanel(DrawContext ctx, int x, int y, int width, int height, String modId, CpuSamplingProfiler.Snapshot cpuSnapshot, CpuSamplingProfiler.DetailSnapshot detail, long totalRenderSamples, long totalGpuNs) {
+    private void renderGpuDetailPanel(DrawContext ctx, int x, int y, int width, int height, String modId, long rawGpuNanos, long displayGpuNanos, long rawRenderSamples, long displayRenderSamples, long redistributedGpuNanos, long redistributedRenderSamples, CpuSamplingProfiler.DetailSnapshot detail, long totalRenderSamples, long totalGpuNanos, boolean effectiveView) {
         drawInsetPanel(ctx, x, y, width, height);
-        if (modId == null || cpuSnapshot == null) {
+        if (modId == null || (displayGpuNanos <= 0L && displayRenderSamples <= 0L)) {
             ctx.drawText(textRenderer, "Select a row to inspect estimated GPU work.", x + 8, y + 8, TEXT_DIM, false);
             return;
         }
-        double share = totalRenderSamples > 0 ? cpuSnapshot.renderSamples() / (double) totalRenderSamples : 0.0;
-        double gpuMs = totalGpuNs * share / 1_000_000.0;
+        double pct = displayGpuNanos * 100.0 / Math.max(1L, totalGpuNanos);
+        double gpuMs = displayGpuNanos / 1_000_000.0;
         ctx.enableScissor(x, y, x + width, y + height);
-        ctx.drawText(textRenderer, textRenderer.trimToWidth(getDisplayName(modId), width - 16), x + 8, y + 8, TEXT_PRIMARY, false);
-        int rowY = renderWrappedText(ctx, x + 8, y + 20, width - 16, String.format(Locale.ROOT, "%.1f%% est GPU | %s threads | %.2f ms est GPU time | %s render samples", share * 100.0, detail == null ? 0 : detail.sampledThreadCount(), gpuMs, formatCount(cpuSnapshot.renderSamples())), TEXT_DIM);
-        rowY = renderWrappedText(ctx, x + 8, rowY, width - 16, "Attribution: render-thread sampling weighted by GPU timers [estimated]", TEXT_DIM) + 6;
-        if ("shared/jvm".equals(modId) || "shared/framework".equals(modId)) {
-            rowY = renderThreadSnapshotSection(ctx, x + 8, rowY, width - 16, "Top JVM threads [measured]", snapshot.systemMetrics().threadDetailsByName());
-            rowY = renderStringListSection(ctx, x + 8, rowY + 6, width - 16, "Top waits / locks [measured]", ProfilerManager.getInstance().getLatestLockSummaries());
-        } else {
-            rowY = renderReasonSection(ctx, x + 8, rowY, width - 16, "Render threads [sampled]", effectiveThreadBreakdown(modId, detail));
+        drawTopChip(ctx, x + width - 96, y + 6, 88, 16, activeDrilldownTable == TableId.GPU);
+        ctx.drawText(textRenderer, "Why this row", x + width - 88, y + 10, activeDrilldownTable == TableId.GPU ? TEXT_PRIMARY : TEXT_DIM, false);
+        ctx.drawText(textRenderer, textRenderer.trimToWidth(getDisplayName(modId), width - 112), x + 8, y + 8, TEXT_PRIMARY, false);
+        int rowY = renderWrappedText(ctx, x + 8, y + 20, width - 16, String.format(Locale.ROOT, "%s view | %.1f%% GPU | %s threads | %.2f ms shown GPU | %s shown render samples", effectiveView ? "Effective" : "Raw", pct, detail == null ? 0 : detail.sampledThreadCount(), gpuMs, formatCount(displayRenderSamples)), TEXT_DIM);
+        rowY = renderWrappedText(ctx, x + 8, rowY, width - 16, String.format(Locale.ROOT, "Raw tagged GPU: %.2f ms | Raw render samples: %s", rawGpuNanos / 1_000_000.0, formatCount(rawRenderSamples)), TEXT_DIM);
+        rowY = renderWrappedText(ctx, x + 8, rowY, width - 16, "Owner source: " + describeGpuOwnerSource(modId), TEXT_DIM);
+        if (redistributedGpuNanos > 0 || redistributedRenderSamples > 0) {
+            rowY = renderWrappedText(ctx, x + 8, rowY, width - 16, String.format(Locale.ROOT, "Redistributed shared GPU: %.2f ms | Redistributed render samples: %s", redistributedGpuNanos / 1_000_000.0, formatCount(redistributedRenderSamples)), TEXT_DIM);
         }
+        rowY = renderWrappedText(ctx, x + 8, rowY, width - 16, effectiveView ? "Attribution: tagged render-phase ownership plus proportional redistribution of shared render work [estimated]" : "Attribution: tagged render-phase ownership without redistribution. Shared render rows remain separate [estimated]", TEXT_DIM) + 6;
+        rowY = renderReasonSection(ctx, x + 8, rowY, width - 16, "Render threads [sampled]", effectiveThreadBreakdown(modId, detail));
+        rowY = renderStringListSection(ctx, x + 8, rowY + 6, width - 16, isSharedAttributionBucket(modId) ? "Top shared owner phases [tagged]" : "Top owner phases [tagged]", buildGpuPhaseBreakdownLines(modId));
         renderReasonSection(ctx, x + 8, rowY + 6, width - 16, "Top sampled render frames [sampled]", detail == null ? Map.of() : detail.topFrames());
         ctx.disableScissor();
     }
 
-    private void renderMemoryDetailPanel(DrawContext ctx, int x, int y, int width, int height, String modId, Map<String, Long> topClasses) {
+    private void renderMemoryDetailPanel(DrawContext ctx, int x, int y, int width, int height, String modId, long rawBytes, long effectiveBytes, long displayBytes, Map<String, Long> topClasses, long redistributedBytes, long totalAttributedBytes, boolean effectiveView) {
         drawInsetPanel(ctx, x, y, width, height);
         if (modId == null) {
             ctx.drawText(textRenderer, "Select a row to inspect top live classes.", x + 8, y + 8, TEXT_DIM, false);
             return;
         }
-        ctx.drawText(textRenderer, textRenderer.trimToWidth(getDisplayName(modId), width - 16), x + 8, y + 8, TEXT_PRIMARY, false);
-        ctx.drawText(textRenderer, "Top live class families in the latest histogram sample [measured by owning class].", x + 8, y + 20, TEXT_DIM, false);
-        renderReasonSection(ctx, x + 8, y + 38, width - 16, "Top classes", topClasses);
+        drawTopChip(ctx, x + width - 96, y + 6, 88, 16, activeDrilldownTable == TableId.MEMORY);
+        ctx.drawText(textRenderer, "Why this row", x + width - 88, y + 10, activeDrilldownTable == TableId.MEMORY ? TEXT_PRIMARY : TEXT_DIM, false);
+        ctx.drawText(textRenderer, textRenderer.trimToWidth(getDisplayName(modId), width - 112), x + 8, y + 8, TEXT_PRIMARY, false);
+        int rowY = y + 20;
+        double pct = displayBytes * 100.0 / Math.max(1L, totalAttributedBytes);
+        rowY = renderWrappedText(ctx, x + 8, rowY, width - 16, String.format(Locale.ROOT, "%s view | %.1f%% heap | %.1f MB shown", effectiveView ? "Effective" : "Raw", pct, displayBytes / (1024.0 * 1024.0)), TEXT_DIM);
+        rowY = renderWrappedText(ctx, x + 8, rowY, width - 16, String.format(Locale.ROOT, "Raw owned memory: %.1f MB | Effective memory: %.1f MB", rawBytes / (1024.0 * 1024.0), effectiveBytes / (1024.0 * 1024.0)), TEXT_DIM);
+        if (redistributedBytes > 0) {
+            rowY = renderWrappedText(ctx, x + 8, rowY, width - 16, "Redistributed shared/runtime memory: " + String.format(Locale.ROOT, "%.1f MB", redistributedBytes / (1024.0 * 1024.0)), TEXT_DIM);
+        }
+        ctx.drawText(textRenderer, effectiveView ? "Attribution: live class ownership with shared/runtime buckets proportionally folded into concrete mods [measured/inferred]" : "Attribution: live class ownership without redistribution. Shared/runtime rows remain separate [measured/inferred]", x + 8, rowY, TEXT_DIM, false);
+        renderReasonSection(ctx, x + 8, rowY + 18, width - 16, "Top classes", topClasses);
     }
 
     private int renderThreadSnapshotSection(DrawContext ctx, int x, int y, int width, String title, Map<String, ThreadLoadProfiler.ThreadSnapshot> data) {
@@ -989,6 +1088,49 @@ public class TaskManagerScreen extends Screen {
         return detail == null ? Map.of() : new LinkedHashMap<>(detail.topThreads());
     }
 
+    private Map<String, Number> buildCpuBucketBreakdown(String modId, CpuSamplingProfiler.DetailSnapshot detail) {
+        if (detail != null && detail.topFrames() != null && !detail.topFrames().isEmpty()) {
+            return new LinkedHashMap<>(detail.topFrames());
+        }
+        if ("shared/jvm".equals(modId) || "shared/framework".equals(modId)) {
+            Map<String, Number> result = new LinkedHashMap<>();
+            snapshot.systemMetrics().threadLoadPercentByName().entrySet().stream().limit(5).forEach(entry -> result.put(entry.getKey(), entry.getValue()));
+            return result;
+        }
+        if ("shared/render".equals(modId)) {
+            return Map.of();
+        }
+        return Map.of();
+    }
+
+    private java.util.List<String> buildGpuPhaseBreakdownLines(String modId) {
+        return snapshot.renderPhases().entrySet().stream()
+                .filter(entry -> {
+                    String owner = entry.getValue().ownerMod() == null || entry.getValue().ownerMod().isBlank() ? "shared/render" : entry.getValue().ownerMod();
+                    return modId.equals(owner) || ("shared/render".equals(modId) && isSharedAttributionBucket(owner));
+                })
+                .sorted((a, b) -> Long.compare(b.getValue().gpuNanos(), a.getValue().gpuNanos()))
+                .limit(5)
+                .map(entry -> String.format(Locale.ROOT, "%s | %.2f ms", entry.getKey(), entry.getValue().gpuNanos() / 1_000_000.0))
+                .toList();
+    }
+
+    private String describeGpuOwnerSource(String modId) {
+        if (modId == null || modId.isBlank()) {
+            return "unknown";
+        }
+        if ("shared/render".equals(modId)) {
+            return "shared/render fallback bucket from phases without a concrete owner";
+        }
+        if (isSharedAttributionBucket(modId)) {
+            return "shared bucket carried through raw ownership view";
+        }
+        long taggedPhases = snapshot.renderPhases().values().stream()
+                .filter(phase -> modId.equals(phase.ownerMod()))
+                .count();
+        return taggedPhases > 0 ? "directly tagged by " + taggedPhases + " render phase" + (taggedPhases == 1 ? "" : "s") : "redistributed from shared render work";
+    }
+
     private String formatDetailValue(Number value) {
         if (value == null) {
             return "0";
@@ -1027,6 +1169,10 @@ public class TaskManagerScreen extends Screen {
         beginFullPageScissor(ctx, x, y, w, h);
         ctx.drawText(textRenderer, "Network throughput and packet/channel attribution during capture.", left, top, TEXT_DIM, false);
         top += 14;
+        if (snapshot.systemMetrics().bytesReceivedPerSecond() < 0 && snapshot.systemMetrics().bytesSentPerSecond() < 0) {
+            ctx.drawText(textRenderer, "Network counters are unavailable right now. Packet attribution can still populate while throughput stays unavailable.", left, top, ACCENT_YELLOW, false);
+            top += 14;
+        }
         drawMetricRow(ctx, left, top, w - 16, "Inbound", formatBytesPerSecond(snapshot.systemMetrics().bytesReceivedPerSecond()));
         top += 16;
         drawMetricRow(ctx, left, top, w - 16, "Outbound", formatBytesPerSecond(snapshot.systemMetrics().bytesSentPerSecond()));
@@ -1059,7 +1205,7 @@ public class TaskManagerScreen extends Screen {
         ctx.drawText(textRenderer, "Packet spike bookmarks", left, top, TEXT_PRIMARY, false);
         top += 14;
         top += renderPacketSpikeBookmarks(ctx, left, top, w - 16, NetworkPacketProfiler.getInstance().getSpikeHistory());
-        endFullPageScissor(ctx);
+        ctx.disableScissor();
     }
 
 
@@ -1072,6 +1218,10 @@ public class TaskManagerScreen extends Screen {
         beginFullPageScissor(ctx, x, y, w, h);
         ctx.drawText(textRenderer, "Disk throughput from OS counters during capture. Unsupported platforms may show unavailable.", left, top, TEXT_DIM, false);
         top += 14;
+        if (snapshot.systemMetrics().diskReadBytesPerSecond() < 0 && snapshot.systemMetrics().diskWriteBytesPerSecond() < 0) {
+            ctx.drawText(textRenderer, "Disk throughput counters are unavailable on this provider right now.", left, top, ACCENT_YELLOW, false);
+            top += 14;
+        }
         drawMetricRow(ctx, left, top, w - 16, "Read", formatBytesPerSecond(snapshot.systemMetrics().diskReadBytesPerSecond()));
         top += 16;
         drawMetricRow(ctx, left, top, w - 16, "Write", formatBytesPerSecond(snapshot.systemMetrics().diskWriteBytesPerSecond()));
@@ -1080,7 +1230,7 @@ public class TaskManagerScreen extends Screen {
         renderMetricGraph(ctx, graphX - PADDING, top, graphWidth + (PADDING * 2), graphHeight, metrics.getOrderedDiskReadHistory(), metrics.getOrderedDiskWriteHistory(), "Disk Read/Write", "B/s", metrics.getHistorySpanSeconds());
         top += graphHeight + 2;
         renderGraphLegend(ctx, graphX, top, new String[]{"Read", "Write"}, new int[]{INTEL_COLOR, ACCENT_YELLOW});
-        endFullPageScissor(ctx);
+        ctx.disableScissor();
     }
     private void renderSystem(DrawContext ctx, int x, int y, int w, int h) {
         int left = x + PADDING;
@@ -1107,16 +1257,19 @@ public class TaskManagerScreen extends Screen {
             top += 24;
             if (cpuGraphMetricTab == GraphMetricTab.LOAD) {
                 renderFixedScaleSeriesGraph(ctx, graphLeft, top, graphWidth, 146, metrics.getOrderedCpuLoadHistory(), "CPU Load", "%", getCpuGraphColor(), 100.0, metrics.getHistorySpanSeconds());
+                top += 164;
+                top += renderGraphLegend(ctx, graphLeft, top, new String[]{"CPU Load"}, new int[]{getCpuGraphColor()}) + 8;
             } else {
                 renderSensorSeriesGraph(ctx, graphLeft, top, graphWidth, 146, metrics.getOrderedCpuTemperatureHistory(), "CPU Temperature", "C", getCpuGraphColor(), 110.0, metrics.getHistorySpanSeconds(), system.cpuTemperatureC() >= 0.0, textRenderer.trimToWidth(system.cpuTemperatureUnavailableReason(), Math.max(80, graphWidth - 12)));
+                top += 164;
+                top += renderGraphLegend(ctx, graphLeft, top, new String[]{"CPU Temperature"}, new int[]{getCpuGraphColor()}) + 8;
             }
-            top += 164;
             drawMetricRow(ctx, graphLeft, top, graphWidth, "Current CPU Load", formatPercentWithTrend(system.cpuCoreLoadPercent(), system.cpuLoadChangePerSecond()));
             top += 16;
             drawMetricRow(ctx, graphLeft, top, graphWidth, "CPU Temperature", formatTemperatureWithTrend(system.cpuTemperatureC(), system.cpuTemperatureChangePerSecond()));
             top += 16;
             drawMetricRow(ctx, graphLeft, top, graphWidth, "CPU Info", formatCpuInfo());
-            endFullPageScissor(ctx);
+            ctx.disableScissor();
             return;
         }
 
@@ -1127,13 +1280,17 @@ public class TaskManagerScreen extends Screen {
             top += 24;
             if (gpuGraphMetricTab == GraphMetricTab.LOAD) {
                 renderFixedScaleSeriesGraph(ctx, graphLeft, top, graphWidth, 146, metrics.getOrderedGpuLoadHistory(), "GPU Load", "%", getGpuGraphColor(), 100.0, metrics.getHistorySpanSeconds());
+                top += 164;
+                top += renderGraphLegend(ctx, graphLeft, top, new String[]{"GPU Load"}, new int[]{getGpuGraphColor()}) + 8;
             } else {
-                renderSensorSeriesGraph(ctx, graphLeft, top, graphWidth, 146, metrics.getOrderedGpuTemperatureHistory(), "GPU Temperature", "C", getGpuGraphColor(), 110.0, metrics.getHistorySpanSeconds(), system.gpuTemperatureC() >= 0.0, "Sensor not available from telemetry bridge");
+                renderSensorSeriesGraph(ctx, graphLeft, top, graphWidth, 146, metrics.getOrderedGpuTemperatureHistory(), "GPU Temperature", "C", getGpuGraphColor(), 110.0, metrics.getHistorySpanSeconds(), system.gpuTemperatureC() >= 0.0, "Sensor is not available");
+                top += 164;
+                top += renderGraphLegend(ctx, graphLeft, top, new String[]{"GPU Temperature"}, new int[]{getGpuGraphColor()}) + 8;
             }
-            top += 164;
             double vramMaxMb = Math.max(1.0, system.vramTotalBytes() > 0L ? system.vramTotalBytes() / (1024.0 * 1024.0) : 1.0);
             renderFixedScaleSeriesGraph(ctx, graphLeft, top, graphWidth, 118, metrics.getOrderedVramUsedHistory(), "VRAM Usage", "MB", getGpuGraphColor(), vramMaxMb, metrics.getHistorySpanSeconds());
             top += 132;
+            top += renderGraphLegend(ctx, graphLeft, top, new String[]{"VRAM Used"}, new int[]{getGpuGraphColor()}) + 8;
             drawMetricRow(ctx, graphLeft, top, graphWidth, "Current GPU Load", formatPercentWithTrend(system.gpuCoreLoadPercent(), system.gpuLoadChangePerSecond()));
             top += 16;
             drawMetricRow(ctx, graphLeft, top, graphWidth, "GPU Temperature", formatTemperatureWithTrend(system.gpuTemperatureC(), system.gpuTemperatureChangePerSecond()));
@@ -1141,7 +1298,7 @@ public class TaskManagerScreen extends Screen {
             drawMetricRow(ctx, graphLeft, top, graphWidth, "GPU Info", blankToUnknown(system.gpuVendor()) + " | " + blankToUnknown(system.gpuRenderer()));
             top += 16;
             drawMetricRow(ctx, graphLeft, top, graphWidth, "VRAM Usage", formatBytesMb(system.vramUsedBytes()) + " / " + formatBytesMb(system.vramTotalBytes()));
-            endFullPageScissor(ctx);
+            ctx.disableScissor();
             return;
         }
 
@@ -1164,7 +1321,7 @@ public class TaskManagerScreen extends Screen {
             drawMetricRow(ctx, graphLeft, top, graphWidth, "Heap Max", formatBytesMb(heapMaxBytes));
             top += 16;
             drawMetricRow(ctx, graphLeft, top, graphWidth, "Non-Heap", formatBytesMb(snapshot.memory().nonHeapUsedBytes()));
-            endFullPageScissor(ctx);
+            ctx.disableScissor();
             return;
         }
 
@@ -1226,7 +1383,7 @@ public class TaskManagerScreen extends Screen {
         renderSensorsPanel(ctx, left, top, w - 24, system);
         top += 124;
         ctx.drawText(textRenderer, textRenderer.trimToWidth("Export sessions keep the current runtime summary, findings, hotspots, and HTML report for offline inspection.", w - 24), left, top, TEXT_DIM, false);
-        endFullPageScissor(ctx);
+        ctx.disableScissor();
     }
 
     private void renderBlockEntities(DrawContext ctx, int x, int y, int w, int h) {
@@ -1271,7 +1428,7 @@ public class TaskManagerScreen extends Screen {
             }
             top = renderCountMap(ctx, left, top, w - 24, "Top block entities in selected chunk [measured counts]", blockEntityCounts) + 6;
         }
-        endFullPageScissor(ctx);
+        ctx.disableScissor();
     }
 
     private void renderWorldTab(DrawContext ctx, int x, int y, int w, int h) {
@@ -1316,7 +1473,7 @@ public class TaskManagerScreen extends Screen {
             top += 16;
             if (snapshot.systemMetrics().threadLoadPercentByName().isEmpty()) {
                 ctx.drawText(textRenderer, "Waiting for JVM thread CPU samples...", left, top, TEXT_DIM, false);
-                endFullPageScissor(ctx);
+                ctx.disableScissor();
                 return;
             }
             int shown = 0;
@@ -1382,7 +1539,7 @@ public class TaskManagerScreen extends Screen {
             }
             top += renderRuleFindingsSection(ctx, left, top, w - 24, ProfilerManager.getInstance().getLatestRuleFindings()) + 8;
         }
-        endFullPageScissor(ctx);
+        ctx.disableScissor();
     }
 
     private void renderLagMap(DrawContext ctx, int x, int y, int width, int height) {
@@ -1805,6 +1962,15 @@ public class TaskManagerScreen extends Screen {
         startupSearchFocused = false;
         focusedColorSetting = null;
 
+        if (attributionHelpOpen || activeDrilldownTable != null) {
+            ModalLayout modal = getCenteredModalLayout(getScreenWidth(), getScreenHeight(), Math.min(920, getScreenWidth() - 32), Math.min(620, getScreenHeight() - 48));
+            if (!isInside(mouseX, mouseY, modal.x(), modal.y(), modal.width(), modal.height()) || isInside(mouseX, mouseY, modal.x() + modal.width() - 62, modal.y() + 10, 52, 16)) {
+                attributionHelpOpen = false;
+                activeDrilldownTable = null;
+            }
+            return true;
+        }
+
         if (isInside(mouseX, mouseY, PADDING + 106, 3, 128, 14)) {
             ProfilerManager.getInstance().cycleMode();
             return true;
@@ -1831,7 +1997,7 @@ public class TaskManagerScreen extends Screen {
         int tabW = Math.max(66, Math.min(84, (getScreenWidth() - (PADDING * 2) - ((TAB_NAMES.length - 1) * 2)) / TAB_NAMES.length));
         for (int i = 0; i < TAB_NAMES.length; i++) {
             int tx = PADDING + i * (tabW + 2);
-            if (isInside(mouseX, mouseY, tx, tabY, tabW, TAB_HEIGHT)) {
+            if (isInside(mouseX, mouseY, tx - 4, tabY - 2, tabW + 8, TAB_HEIGHT + 4)) {
                 activeTab = i;
                 lastOpenedTab = activeTab;
                 scrollOffset = 0;
@@ -1842,17 +2008,31 @@ public class TaskManagerScreen extends Screen {
         if (activeTab == 0) {
             int detailW = Math.min(420, Math.max(320, getScreenWidth() / 3));
             int listW = getScreenWidth() - detailW - PADDING;
-            if (isInside(mouseX, mouseY, PADDING + 208, getContentY() + PADDING + 22, 78, 16)) {
+            if (isInside(mouseX, mouseY, PADDING, getContentY() + PADDING + 34, 78, 16)) {
                 activeTab = 10;
                 systemMiniTab = SystemMiniTab.CPU_GRAPH;
                 scrollOffset = 0;
                 return true;
             }
-            if (isInside(mouseX, mouseY, listW - 160, getContentY() + PADDING + 24, 152, 16)) {
+            if (isInside(mouseX, mouseY, PADDING + 84, getContentY() + PADDING + 34, 98, 16)) {
+                taskEffectiveView = !taskEffectiveView;
+                scrollOffset = 0;
+                return true;
+            }
+            if (isInside(mouseX, mouseY, PADDING + 188, getContentY() + PADDING + 34, 112, 16)) {
+                taskShowSharedRows = !taskShowSharedRows;
+                scrollOffset = 0;
+                return true;
+            }
+            if (selectedTaskMod != null && isInside(mouseX, mouseY, listW + PADDING + detailW - 96, getContentY() + PADDING + 6, 88, 16)) {
+                activeDrilldownTable = TableId.TASKS;
+                return true;
+            }
+            if (isInside(mouseX, mouseY, listW - 160, getContentY() + PADDING + 34, 152, 16)) {
                 focusedSearchTable = TableId.TASKS;
                 return true;
             }
-            if (isInside(mouseX, mouseY, listW - 214, getContentY() + PADDING + 24, 48, 16)) {
+            if (isInside(mouseX, mouseY, listW - 214, getContentY() + PADDING + 34, 48, 16)) {
                 resetTasksTable();
                 return true;
             }
@@ -1869,17 +2049,31 @@ public class TaskManagerScreen extends Screen {
         if (activeTab == 1) {
             int detailW = Math.min(420, Math.max(320, getScreenWidth() / 3));
             int listW = getScreenWidth() - detailW - PADDING;
-            if (isInside(mouseX, mouseY, PADDING + 218, getContentY() + PADDING + 22, 78, 16)) {
+            if (isInside(mouseX, mouseY, PADDING, getContentY() + PADDING + 34, 78, 16)) {
                 activeTab = 10;
                 systemMiniTab = SystemMiniTab.GPU_GRAPH;
                 scrollOffset = 0;
                 return true;
             }
-            if (isInside(mouseX, mouseY, listW - 160, getContentY() + PADDING + 24, 152, 16)) {
+            if (isInside(mouseX, mouseY, PADDING + 84, getContentY() + PADDING + 34, 98, 16)) {
+                gpuEffectiveView = !gpuEffectiveView;
+                scrollOffset = 0;
+                return true;
+            }
+            if (isInside(mouseX, mouseY, PADDING + 188, getContentY() + PADDING + 34, 112, 16)) {
+                gpuShowSharedRows = !gpuShowSharedRows;
+                scrollOffset = 0;
+                return true;
+            }
+            if (selectedGpuMod != null && isInside(mouseX, mouseY, listW + PADDING + detailW - 96, getContentY() + PADDING + 6, 88, 16)) {
+                activeDrilldownTable = TableId.GPU;
+                return true;
+            }
+            if (isInside(mouseX, mouseY, listW - 160, getContentY() + PADDING + 34, 152, 16)) {
                 focusedSearchTable = TableId.GPU;
                 return true;
             }
-            if (isInside(mouseX, mouseY, listW - 214, getContentY() + PADDING + 24, 48, 16)) {
+            if (isInside(mouseX, mouseY, listW - 214, getContentY() + PADDING + 34, 48, 16)) {
                 resetGpuTable();
                 return true;
             }
@@ -1896,17 +2090,35 @@ public class TaskManagerScreen extends Screen {
         if (activeTab == 4) {
             int sharedPanelW = snapshot.sharedMemoryFamilies().isEmpty() ? 0 : Math.min(280, Math.max(220, getScreenWidth() / 4));
             int tableW = getScreenWidth() - sharedPanelW - (sharedPanelW > 0 ? PADDING : 0);
-            if (isInside(mouseX, mouseY, tableW - 106, getContentY() + PADDING + 2, 98, 16)) {
+            int memoryDescriptionBottomY = getContentY() + PADDING + measureWrappedHeight(Math.max(260, tableW - 16), memoryEffectiveView ? "Effective live heap by mod with shared/runtime buckets folded into concrete mods for comparison. Updated asynchronously." : "Raw live heap by owner/class family. Shared/runtime buckets stay separate until you switch back to Effective view.");
+            int memoryControlsTopY = memoryDescriptionBottomY + 26;
+            if (isInside(mouseX, mouseY, tableW - 106, memoryControlsTopY + 18, 98, 16)) {
                 activeTab = 10;
                 systemMiniTab = SystemMiniTab.MEMORY_GRAPH;
                 scrollOffset = 0;
                 return true;
             }
-            if (isInside(mouseX, mouseY, tableW - 160, getContentY() + PADDING + 28, 152, 16)) {
+            int memoryContentHeight = getScreenHeight() - getContentY() - PADDING;
+            if (selectedMemoryMod != null && isInside(mouseX, mouseY, tableW - 96, getContentY() + memoryContentHeight - 116 + 6, 88, 16)) {
+                activeDrilldownTable = TableId.MEMORY;
+                return true;
+            }
+            if (isInside(mouseX, mouseY, tableW - 112, memoryControlsTopY, 98, 16)) {
+                memoryEffectiveView = !memoryEffectiveView;
+                scrollOffset = 0;
+                return true;
+            }
+            if (isInside(mouseX, mouseY, tableW - 222, memoryControlsTopY, 112, 16)) {
+                memoryShowSharedRows = !memoryShowSharedRows;
+                scrollOffset = 0;
+                return true;
+            }
+            MemoryListLayout memoryLayout = getMemoryListLayout();
+            if (isInside(mouseX, mouseY, tableW - 160, memoryLayout.searchY(), 152, 16)) {
                 focusedSearchTable = TableId.MEMORY;
                 return true;
             }
-            if (isInside(mouseX, mouseY, tableW - 214, getContentY() + PADDING + 28, 48, 16)) {
+            if (isInside(mouseX, mouseY, tableW - 214, memoryLayout.searchY(), 48, 16)) {
                 resetMemoryTable();
                 return true;
             }
@@ -1945,19 +2157,19 @@ public class TaskManagerScreen extends Screen {
                     : getLagMapLayout(getContentY(), getScreenWidth(), getScreenHeight() - getContentY() - PADDING);
             int left = lagMapLayout.left();
             int top = lagMapLayout.miniTabY();
-            if (isInside(mouseX, mouseY, left, top, 76, 16)) {
+            if (isInside(mouseX, mouseY, left - 3, top - 2, 82, 20)) {
                 worldMiniTab = WorldMiniTab.LAG_MAP;
                 return true;
             }
-            if (isInside(mouseX, mouseY, left + 82, top, 70, 16)) {
+            if (isInside(mouseX, mouseY, left + 79, top - 2, 76, 20)) {
                 worldMiniTab = WorldMiniTab.ENTITIES;
                 return true;
             }
-            if (isInside(mouseX, mouseY, left + 158, top, 72, 16)) {
+            if (isInside(mouseX, mouseY, left + 155, top - 2, 78, 20)) {
                 worldMiniTab = WorldMiniTab.CHUNKS;
                 return true;
             }
-            if (isInside(mouseX, mouseY, left + 236, top, 108, 16)) {
+            if (isInside(mouseX, mouseY, left + 233, top - 2, 114, 20)) {
                 worldMiniTab = WorldMiniTab.BLOCK_ENTITIES;
                 return true;
             }
@@ -1973,40 +2185,40 @@ public class TaskManagerScreen extends Screen {
         if (activeTab == 10) {
             int left = PADDING;
             int top = getFullPageScrollTop(getContentY()) + 28;
-            if (isInside(mouseX, mouseY, left, top, 78, 16)) {
+            if (isInside(mouseX, mouseY, left - 3, top - 2, 84, 20)) {
                 systemMiniTab = SystemMiniTab.OVERVIEW;
                 return true;
             }
-            if (isInside(mouseX, mouseY, left + 84, top, 88, 16)) {
+            if (isInside(mouseX, mouseY, left + 81, top - 2, 94, 20)) {
                 systemMiniTab = SystemMiniTab.CPU_GRAPH;
                 return true;
             }
-            if (isInside(mouseX, mouseY, left + 178, top, 88, 16)) {
+            if (isInside(mouseX, mouseY, left + 175, top - 2, 94, 20)) {
                 systemMiniTab = SystemMiniTab.GPU_GRAPH;
                 return true;
             }
-            if (isInside(mouseX, mouseY, left + 272, top, 108, 16)) {
+            if (isInside(mouseX, mouseY, left + 269, top - 2, 114, 20)) {
                 systemMiniTab = SystemMiniTab.MEMORY_GRAPH;
                 return true;
             }
             int graphTabsY = top + 24;
             int graphTabsX = Math.max(PADDING, (getScreenWidth() - getPreferredGraphWidth(getScreenWidth())) / 2);
             if (systemMiniTab == SystemMiniTab.CPU_GRAPH) {
-                if (isInside(mouseX, mouseY, graphTabsX, graphTabsY, 84, 16)) {
+                if (isInside(mouseX, mouseY, graphTabsX - 3, graphTabsY - 2, 90, 20)) {
                     cpuGraphMetricTab = GraphMetricTab.LOAD;
                     return true;
                 }
-                if (isInside(mouseX, mouseY, graphTabsX + 90, graphTabsY, 120, 16)) {
+                if (isInside(mouseX, mouseY, graphTabsX + 87, graphTabsY - 2, 126, 20)) {
                     cpuGraphMetricTab = GraphMetricTab.TEMPERATURE;
                     return true;
                 }
             }
             if (systemMiniTab == SystemMiniTab.GPU_GRAPH) {
-                if (isInside(mouseX, mouseY, graphTabsX, graphTabsY, 84, 16)) {
+                if (isInside(mouseX, mouseY, graphTabsX - 3, graphTabsY - 2, 90, 20)) {
                     gpuGraphMetricTab = GraphMetricTab.LOAD;
                     return true;
                 }
-                if (isInside(mouseX, mouseY, graphTabsX + 90, graphTabsY, 120, 16)) {
+                if (isInside(mouseX, mouseY, graphTabsX + 87, graphTabsY - 2, 126, 20)) {
                     gpuGraphMetricTab = GraphMetricTab.TEMPERATURE;
                     return true;
                 }
@@ -2016,12 +2228,12 @@ public class TaskManagerScreen extends Screen {
         if (activeTab == 11) {
             int left = PADDING;
             int actionY = getContentY() + PADDING + 18 - scrollOffset;
-            Runnable[] sessionActions = {
-                () -> ProfilerManager.getInstance().toggleSessionLogging(),
-                ConfigManager::cycleSessionDurationSeconds,
-                ConfigManager::cycleMetricsUpdateIntervalMs,
-                ConfigManager::cycleProfilerUpdateDelayMs
-            };
+            if (isInside(mouseX, mouseY, left + 104, actionY - 2, 108, 16)) {
+                attributionHelpOpen = true;
+                return true;
+            }
+            actionY += measureWrappedHeight(getScreenWidth() - 24, "Raw keeps direct ownership separate. Effective folds shared/runtime buckets back into mods for easier ranking. Use Open Guide for the full measured / inferred / estimated explanation.") + 28;
+            Runnable[] sessionActions = sessionActions();
             for (Runnable action : sessionActions) {
                 if (isInside(mouseX, mouseY, left, actionY, getScreenWidth() - 16, 16)) {
                     action.run();
@@ -2031,12 +2243,7 @@ public class TaskManagerScreen extends Screen {
             }
 
             actionY += 32;
-            Runnable[] hudBaseActions = {
-                () -> ConfigManager.setHudEnabled(!ConfigManager.isHudEnabled()),
-                ConfigManager::cycleHudPosition,
-                ConfigManager::cycleHudLayoutMode,
-                ConfigManager::cycleHudTriggerMode
-            };
+            Runnable[] hudBaseActions = hudBaseActions();
             for (Runnable action : hudBaseActions) {
                 if (isInside(mouseX, mouseY, left, actionY, getScreenWidth() - 16, 16)) {
                     action.run();
@@ -2055,35 +2262,7 @@ public class TaskManagerScreen extends Screen {
             actionY += 22;
 
             boolean presetMode = ConfigManager.getHudConfigMode() == ConfigManager.HudConfigMode.PRESET;
-            Runnable[] hudModeActions = presetMode
-                    ? new Runnable[] {
-                        ConfigManager::cycleHudPreset,
-                        () -> ConfigManager.setHudExpandedOnWarning(!ConfigManager.isHudExpandedOnWarning()),
-                        ConfigManager::toggleHudBudgetColorMode,
-                        ConfigManager::toggleHudAutoFocusAlertRow
-                    }
-                    : new Runnable[] {
-                        ConfigManager::toggleHudShowFps,
-                        ConfigManager::toggleHudShowFrame,
-                        ConfigManager::toggleHudShowTicks,
-                        ConfigManager::toggleHudShowUtilization,
-                        ConfigManager::toggleHudShowTemperatures,
-                        ConfigManager::toggleHudShowParallelism,
-                        ConfigManager::toggleHudShowLogic,
-                        ConfigManager::toggleHudShowBackground,
-                        ConfigManager::toggleHudShowFrameBudget,
-                        ConfigManager::toggleHudShowMemory,
-                        ConfigManager::toggleHudShowVram,
-                        ConfigManager::toggleHudShowNetwork,
-                        ConfigManager::toggleHudShowChunkActivity,
-                        ConfigManager::toggleHudShowWorld,
-                        ConfigManager::toggleHudShowDiskIo,
-                        ConfigManager::toggleHudShowInputLatency,
-                        ConfigManager::toggleHudShowSession,
-                        () -> ConfigManager.setHudExpandedOnWarning(!ConfigManager.isHudExpandedOnWarning()),
-                        ConfigManager::toggleHudBudgetColorMode,
-                        ConfigManager::toggleHudAutoFocusAlertRow
-                    };
+            Runnable[] hudModeActions = hudModeActions(presetMode);
             for (Runnable action : hudModeActions) {
                 if (isInside(mouseX, mouseY, left, actionY, getScreenWidth() - 16, 16)) {
                     action.run();
@@ -2093,20 +2272,7 @@ public class TaskManagerScreen extends Screen {
             }
 
             actionY += presetMode ? 20 : 20;
-            Runnable[] hudRateActions = {
-                ConfigManager::toggleHudShowZeroRateOfChange,
-                ConfigManager::toggleHudShowFpsRateOfChange,
-                ConfigManager::toggleHudShowFrameRateOfChange,
-                ConfigManager::toggleHudShowTickRateOfChange,
-                ConfigManager::toggleHudShowUtilizationRateOfChange,
-                ConfigManager::toggleHudShowMemoryAllocationRate,
-                ConfigManager::toggleHudShowVramRateOfChange,
-                ConfigManager::toggleHudShowNetworkRateOfChange,
-                ConfigManager::toggleHudShowChunkActivityRateOfChange,
-                ConfigManager::toggleHudShowWorldRateOfChange,
-                ConfigManager::toggleHudShowDiskIoRateOfChange,
-                ConfigManager::toggleHudShowInputLatencyRateOfChange
-            };
+            Runnable[] hudRateActions = hudRateActions();
             for (Runnable action : hudRateActions) {
                 if (isInside(mouseX, mouseY, left, actionY, getScreenWidth() - 16, 16)) {
                     action.run();
@@ -2116,19 +2282,7 @@ public class TaskManagerScreen extends Screen {
             }
 
             actionY += 32;
-            Runnable[] tableActions = {
-                () -> ConfigManager.toggleTasksColumn("cpu"),
-                () -> ConfigManager.toggleTasksColumn("threads"),
-                () -> ConfigManager.toggleTasksColumn("samples"),
-                () -> ConfigManager.toggleTasksColumn("invokes"),
-                () -> ConfigManager.toggleGpuColumn("pct"),
-                () -> ConfigManager.toggleGpuColumn("threads"),
-                () -> ConfigManager.toggleGpuColumn("gpums"),
-                () -> ConfigManager.toggleGpuColumn("rsamples"),
-                () -> ConfigManager.toggleMemoryColumn("classes"),
-                () -> ConfigManager.toggleMemoryColumn("mb"),
-                () -> ConfigManager.toggleMemoryColumn("pct")
-            };
+            Runnable[] tableActions = tableActions();
             for (Runnable action : tableActions) {
                 if (isInside(mouseX, mouseY, left, actionY, getScreenWidth() - 16, 16)) {
                     action.run();
@@ -2138,7 +2292,7 @@ public class TaskManagerScreen extends Screen {
             }
 
             actionY += 32;
-            ColorSetting[] colorSettings = {ColorSetting.CPU, ColorSetting.GPU, ColorSetting.WORLD_ENTITIES, ColorSetting.WORLD_CHUNKS_LOADED, ColorSetting.WORLD_CHUNKS_RENDERED};
+            ColorSetting[] colorSettings = colorSettings();
             for (ColorSetting colorSetting : colorSettings) {
                 if (isInside(mouseX, mouseY, left, actionY, getScreenWidth() - 16, 16)) {
                     focusedColorSetting = colorSetting;
@@ -2165,7 +2319,7 @@ public class TaskManagerScreen extends Screen {
         if (draggingHudTransparency && activeTab == 11) {
             int left = PADDING;
             int actionY = getContentY() + PADDING + 18 - scrollOffset;
-            actionY += (22 * hudBaseActionCount()) + 32 + (22 * hudBaseActionCount());
+            actionY += (22 * sessionActionCount()) + 32 + (22 * hudBaseActionCount());
             SliderLayout slider = getHudTransparencySliderLayout(left, actionY, getScreenWidth() - 24);
             updateHudTransparencyFromMouse(toLogicalX(click.x()), slider);
             return true;
@@ -2214,10 +2368,10 @@ public class TaskManagerScreen extends Screen {
 
     private int getSettingsContentHeight() {
         int contentHeight = 18;
-        contentHeight += 4 * 22;
+        contentHeight += sessionActionCount() * 22;
         contentHeight += 32;
         contentHeight += 18;
-        contentHeight += 4 * 22;
+        contentHeight += hudBaseActionCount() * 22;
         contentHeight += 24;
         contentHeight += 22;
         if (ConfigManager.getHudConfigMode() == ConfigManager.HudConfigMode.PRESET) {
@@ -2232,25 +2386,125 @@ public class TaskManagerScreen extends Screen {
         contentHeight += hudRateActionCount() * 22;
         contentHeight += 32;
         contentHeight += 18;
-        contentHeight += 11 * 22;
+        contentHeight += tableActionCount() * 22;
         contentHeight += 32;
         contentHeight += 18;
-        contentHeight += 6 * 22;
+        contentHeight += colorSettingCount() * 22;
         contentHeight += 34;
         return contentHeight;
     }
 
 
+    static int sessionActionCount() {
+        return sessionActions().length;
+    }
+
     static int hudBaseActionCount() {
-        return 4;
+        return hudBaseActions().length;
     }
 
     static int hudModeActionCount(boolean presetMode) {
-        return presetMode ? 4 : 20;
+        return hudModeActions(presetMode).length;
     }
 
     static int hudRateActionCount() {
-        return 12;
+        return hudRateActions().length;
+    }
+
+    static int tableActionCount() {
+        return tableActions().length;
+    }
+
+    static int colorSettingCount() {
+        return colorSettings().length + 1;
+    }
+
+    private static Runnable[] sessionActions() {
+        return new Runnable[] {
+                () -> ProfilerManager.getInstance().toggleSessionLogging(),
+                ConfigManager::cycleSessionDurationSeconds,
+                ConfigManager::cycleMetricsUpdateIntervalMs,
+                ConfigManager::cycleProfilerUpdateDelayMs
+        };
+    }
+
+    private static Runnable[] hudBaseActions() {
+        return new Runnable[] {
+                () -> ConfigManager.setHudEnabled(!ConfigManager.isHudEnabled()),
+                ConfigManager::cycleHudPosition,
+                ConfigManager::cycleHudLayoutMode,
+                ConfigManager::cycleHudTriggerMode,
+                ConfigManager::cycleFrameBudgetTargetFps
+        };
+    }
+
+    private static Runnable[] hudModeActions(boolean presetMode) {
+        return presetMode
+                ? new Runnable[] {
+                    ConfigManager::cycleHudPreset,
+                    () -> ConfigManager.setHudExpandedOnWarning(!ConfigManager.isHudExpandedOnWarning()),
+                    ConfigManager::toggleHudBudgetColorMode,
+                    ConfigManager::toggleHudAutoFocusAlertRow
+                }
+                : new Runnable[] {
+                    ConfigManager::toggleHudShowFps,
+                    ConfigManager::toggleHudShowFrame,
+                    ConfigManager::toggleHudShowTicks,
+                    ConfigManager::toggleHudShowUtilization,
+                    ConfigManager::toggleHudShowTemperatures,
+                    ConfigManager::toggleHudShowParallelism,
+                    ConfigManager::toggleHudShowLogic,
+                    ConfigManager::toggleHudShowBackground,
+                    ConfigManager::toggleHudShowFrameBudget,
+                    ConfigManager::toggleHudShowMemory,
+                    ConfigManager::toggleHudShowVram,
+                    ConfigManager::toggleHudShowNetwork,
+                    ConfigManager::toggleHudShowChunkActivity,
+                    ConfigManager::toggleHudShowWorld,
+                    ConfigManager::toggleHudShowDiskIo,
+                    ConfigManager::toggleHudShowInputLatency,
+                    ConfigManager::toggleHudShowSession,
+                    () -> ConfigManager.setHudExpandedOnWarning(!ConfigManager.isHudExpandedOnWarning()),
+                    ConfigManager::toggleHudBudgetColorMode,
+                    ConfigManager::toggleHudAutoFocusAlertRow
+                };
+    }
+
+    private static Runnable[] hudRateActions() {
+        return new Runnable[] {
+                ConfigManager::toggleHudShowZeroRateOfChange,
+                ConfigManager::toggleHudShowFpsRateOfChange,
+                ConfigManager::toggleHudShowFrameRateOfChange,
+                ConfigManager::toggleHudShowTickRateOfChange,
+                ConfigManager::toggleHudShowUtilizationRateOfChange,
+                ConfigManager::toggleHudShowMemoryAllocationRate,
+                ConfigManager::toggleHudShowVramRateOfChange,
+                ConfigManager::toggleHudShowNetworkRateOfChange,
+                ConfigManager::toggleHudShowChunkActivityRateOfChange,
+                ConfigManager::toggleHudShowWorldRateOfChange,
+                ConfigManager::toggleHudShowDiskIoRateOfChange,
+                ConfigManager::toggleHudShowInputLatencyRateOfChange
+        };
+    }
+
+    private static Runnable[] tableActions() {
+        return new Runnable[] {
+                () -> ConfigManager.toggleTasksColumn("cpu"),
+                () -> ConfigManager.toggleTasksColumn("threads"),
+                () -> ConfigManager.toggleTasksColumn("samples"),
+                () -> ConfigManager.toggleTasksColumn("invokes"),
+                () -> ConfigManager.toggleGpuColumn("pct"),
+                () -> ConfigManager.toggleGpuColumn("threads"),
+                () -> ConfigManager.toggleGpuColumn("gpums"),
+                () -> ConfigManager.toggleGpuColumn("rsamples"),
+                () -> ConfigManager.toggleMemoryColumn("classes"),
+                () -> ConfigManager.toggleMemoryColumn("mb"),
+                () -> ConfigManager.toggleMemoryColumn("pct")
+        };
+    }
+
+    private static ColorSetting[] colorSettings() {
+        return new ColorSetting[] {ColorSetting.CPU, ColorSetting.GPU, ColorSetting.WORLD_ENTITIES, ColorSetting.WORLD_CHUNKS_LOADED, ColorSetting.WORLD_CHUNKS_RENDERED};
     }
 
     private boolean isInside(double mouseX, double mouseY, int x, int y, int width, int height) {
@@ -2279,6 +2533,11 @@ public class TaskManagerScreen extends Screen {
 
     @Override
     public boolean keyPressed(KeyInput input) {
+        if ((attributionHelpOpen || activeDrilldownTable != null) && input.key() == 256) {
+            attributionHelpOpen = false;
+            activeDrilldownTable = null;
+            return true;
+        }
         if (wueffi.taskmanager.client.util.KeyBindHandler.matchesOpenKey(input)) {
             close();
             return true;
@@ -2348,16 +2607,16 @@ public class TaskManagerScreen extends Screen {
         }
     }
 
-    private List<String> getTaskRows() {
-        Map<String, CpuSamplingProfiler.Snapshot> cpu = snapshot.cpuMods();
-        Map<String, CpuSamplingProfiler.DetailSnapshot> cpuDetails = snapshot.cpuDetails();
-        Map<String, ModTimingSnapshot> invokes = snapshot.modInvokes();
+    private List<String> getTaskRows(Map<String, CpuSamplingProfiler.Snapshot> cpu, Map<String, CpuSamplingProfiler.DetailSnapshot> cpuDetails, Map<String, ModTimingSnapshot> invokes, boolean includeShared) {
         LinkedHashSet<String> mods = new LinkedHashSet<>();
         mods.addAll(cpu.keySet());
         mods.addAll(invokes.keySet());
         String query = tasksSearch.toLowerCase(Locale.ROOT);
         List<String> rows = new ArrayList<>();
         for (String modId : mods) {
+            if (!includeShared && isSharedAttributionBucket(modId)) {
+                continue;
+            }
             String haystack = (modId + " " + getDisplayName(modId)).toLowerCase(Locale.ROOT);
             if (query.isBlank() || haystack.contains(query)) {
                 rows.add(modId);
@@ -2371,56 +2630,57 @@ public class TaskManagerScreen extends Screen {
     }
 
     private Comparator<String> taskComparator(Map<String, CpuSamplingProfiler.Snapshot> cpu, Map<String, CpuSamplingProfiler.DetailSnapshot> cpuDetails, Map<String, ModTimingSnapshot> invokes) {
+        long totalCpuSamples = Math.max(1L, cpu.values().stream().mapToLong(CpuSamplingProfiler.Snapshot::totalSamples).sum());
         return switch (taskSort) {
             case NAME -> Comparator.comparing((String modId) -> getDisplayName(modId).toLowerCase(Locale.ROOT));
             case THREADS -> Comparator.comparingInt((String modId) -> cpuDetails.get(modId) == null ? 0 : cpuDetails.get(modId).sampledThreadCount());
             case SAMPLES -> Comparator.comparingLong((String modId) -> cpu.getOrDefault(modId, new CpuSamplingProfiler.Snapshot(0, 0, 0)).totalSamples());
             case INVOKES -> Comparator.comparingLong((String modId) -> invokes.getOrDefault(modId, new ModTimingSnapshot(0, 0)).calls());
-            case CPU -> Comparator.comparingDouble((String modId) -> snapshot.totalCpuSamples() > 0 ? (cpu.getOrDefault(modId, new CpuSamplingProfiler.Snapshot(0, 0, 0)).totalSamples() * 100.0 / snapshot.totalCpuSamples()) : 0.0);
+            case CPU -> Comparator.comparingDouble((String modId) -> cpu.getOrDefault(modId, new CpuSamplingProfiler.Snapshot(0, 0, 0)).totalSamples() * 100.0 / totalCpuSamples);
         };
     }
 
-    private List<String> getGpuRows() {
-        Map<String, CpuSamplingProfiler.Snapshot> cpu = snapshot.cpuMods();
-        Map<String, CpuSamplingProfiler.DetailSnapshot> cpuDetails = snapshot.cpuDetails();
-        long totalRenderSamples = snapshot.totalRenderSamples();
-        long totalGpuNs = snapshot.renderPhases().values().stream().mapToLong(RenderPhaseProfiler.PhaseSnapshot::gpuNanos).sum();
+    private List<String> getGpuRows(EffectiveGpuAttribution gpuAttribution, Map<String, CpuSamplingProfiler.DetailSnapshot> cpuDetails, boolean includeShared) {
         String query = gpuSearch.toLowerCase(Locale.ROOT);
         List<String> rows = new ArrayList<>();
-        for (Map.Entry<String, CpuSamplingProfiler.Snapshot> entry : cpu.entrySet()) {
-            if (entry.getValue().renderSamples() <= 0) {
+        for (String modId : gpuAttribution.gpuNanosByMod().keySet()) {
+            if (gpuAttribution.gpuNanosByMod().getOrDefault(modId, 0L) <= 0L && gpuAttribution.renderSamplesByMod().getOrDefault(modId, 0L) <= 0L) {
                 continue;
             }
-            String modId = entry.getKey();
+            if (!includeShared && isSharedAttributionBucket(modId)) {
+                continue;
+            }
             String haystack = (modId + " " + getDisplayName(modId)).toLowerCase(Locale.ROOT);
             if (query.isBlank() || haystack.contains(query)) {
                 rows.add(modId);
             }
         }
-        rows.sort(gpuComparator(cpu, cpuDetails, totalRenderSamples, totalGpuNs));
+        rows.sort(gpuComparator(gpuAttribution, cpuDetails));
         if (gpuSortDescending) {
             Collections.reverse(rows);
         }
         return rows;
     }
 
-    private Comparator<String> gpuComparator(Map<String, CpuSamplingProfiler.Snapshot> cpu, Map<String, CpuSamplingProfiler.DetailSnapshot> cpuDetails, long totalRenderSamples, long totalGpuNs) {
+    private Comparator<String> gpuComparator(EffectiveGpuAttribution gpuAttribution, Map<String, CpuSamplingProfiler.DetailSnapshot> cpuDetails) {
+        long safeTotalGpuNanos = Math.max(1L, gpuAttribution.totalGpuNanos());
         return switch (gpuSort) {
             case NAME -> Comparator.comparing((String modId) -> getDisplayName(modId).toLowerCase(Locale.ROOT));
             case THREADS -> Comparator.comparingInt((String modId) -> cpuDetails.get(modId) == null ? 0 : cpuDetails.get(modId).sampledThreadCount());
-            case GPU_MS -> Comparator.comparingDouble((String modId) -> totalRenderSamples > 0 ? ((cpu.getOrDefault(modId, new CpuSamplingProfiler.Snapshot(0, 0, 0)).renderSamples() / (double) totalRenderSamples) * totalGpuNs / 1_000_000.0) : 0.0);
-            case RENDER_SAMPLES -> Comparator.comparingLong((String modId) -> cpu.getOrDefault(modId, new CpuSamplingProfiler.Snapshot(0, 0, 0)).renderSamples());
-            case EST_GPU -> Comparator.comparingDouble((String modId) -> totalRenderSamples > 0 ? (cpu.getOrDefault(modId, new CpuSamplingProfiler.Snapshot(0, 0, 0)).renderSamples() * 100.0 / totalRenderSamples) : 0.0);
+            case GPU_MS -> Comparator.comparingDouble((String modId) -> gpuAttribution.gpuNanosByMod().getOrDefault(modId, 0L) / 1_000_000.0);
+            case RENDER_SAMPLES -> Comparator.comparingLong((String modId) -> gpuAttribution.renderSamplesByMod().getOrDefault(modId, 0L));
+            case EST_GPU -> Comparator.comparingDouble((String modId) -> gpuAttribution.gpuNanosByMod().getOrDefault(modId, 0L) * 100.0 / safeTotalGpuNanos);
         };
     }
 
-    private List<String> getMemoryRows() {
-        Map<String, Long> memoryMods = snapshot.memoryMods();
-        Map<String, Map<String, Long>> memoryClassesByMod = snapshot.memoryClassesByMod();
-        long totalAttributedBytes = Math.max(1, memoryMods.values().stream().mapToLong(Long::longValue).sum());
+    private List<String> getMemoryRows(Map<String, Long> memoryMods, Map<String, Map<String, Long>> memoryClassesByMod, boolean includeShared) {
+        long totalAttributedBytes = Math.max(1L, memoryMods.values().stream().mapToLong(Long::longValue).sum());
         String query = memorySearch.toLowerCase(Locale.ROOT);
         List<String> rows = new ArrayList<>();
         for (String modId : memoryMods.keySet()) {
+            if (!includeShared && isSharedAttributionBucket(modId)) {
+                continue;
+            }
             String haystack = (modId + " " + getDisplayName(modId)).toLowerCase(Locale.ROOT);
             if (query.isBlank() || haystack.contains(query)) {
                 rows.add(modId);
@@ -2442,6 +2702,251 @@ public class TaskManagerScreen extends Screen {
         };
     }
 
+    private boolean isSharedAttributionBucket(String modId) {
+        return modId != null && (modId.startsWith("shared/") || modId.startsWith("runtime/"));
+    }
+
+    private EffectiveCpuAttribution buildEffectiveCpuAttribution(Map<String, CpuSamplingProfiler.Snapshot> rawCpu, Map<String, ModTimingSnapshot> invokes) {
+        LinkedHashMap<String, CpuSamplingProfiler.Snapshot> concrete = new LinkedHashMap<>();
+        long sharedTotalSamples = 0L;
+        long sharedClientSamples = 0L;
+        long sharedRenderSamples = 0L;
+        for (Map.Entry<String, CpuSamplingProfiler.Snapshot> entry : rawCpu.entrySet()) {
+            String modId = entry.getKey();
+            CpuSamplingProfiler.Snapshot sample = entry.getValue();
+            if (isSharedAttributionBucket(modId)) {
+                sharedTotalSamples += sample.totalSamples();
+                sharedClientSamples += sample.clientSamples();
+                sharedRenderSamples += sample.renderSamples();
+            } else {
+                concrete.put(modId, sample);
+            }
+        }
+        if (concrete.isEmpty()) {
+            long totalSamples = rawCpu.values().stream().mapToLong(CpuSamplingProfiler.Snapshot::totalSamples).sum();
+            long totalRenderSamples = rawCpu.values().stream().mapToLong(CpuSamplingProfiler.Snapshot::renderSamples).sum();
+            return new EffectiveCpuAttribution(new LinkedHashMap<>(rawCpu), Map.of(), Map.of(), totalSamples, totalRenderSamples);
+        }
+
+        Map<String, Double> totalWeights = buildCpuWeightMap(concrete, invokes, CpuSamplingProfiler.Snapshot::totalSamples);
+        Map<String, Double> clientWeights = buildCpuWeightMap(concrete, invokes, CpuSamplingProfiler.Snapshot::clientSamples);
+        Map<String, Double> renderWeights = buildCpuWeightMap(concrete, invokes, CpuSamplingProfiler.Snapshot::renderSamples);
+        Map<String, Long> redistributedTotals = distributeLongProportionally(sharedTotalSamples, totalWeights);
+        Map<String, Long> redistributedClients = distributeLongProportionally(sharedClientSamples, clientWeights);
+        Map<String, Long> redistributedRenders = distributeLongProportionally(sharedRenderSamples, renderWeights);
+
+        LinkedHashMap<String, CpuSamplingProfiler.Snapshot> display = new LinkedHashMap<>();
+        for (Map.Entry<String, CpuSamplingProfiler.Snapshot> entry : concrete.entrySet()) {
+            String modId = entry.getKey();
+            CpuSamplingProfiler.Snapshot sample = entry.getValue();
+            display.put(modId, new CpuSamplingProfiler.Snapshot(
+                    sample.totalSamples() + redistributedTotals.getOrDefault(modId, 0L),
+                    sample.clientSamples() + redistributedClients.getOrDefault(modId, 0L),
+                    sample.renderSamples() + redistributedRenders.getOrDefault(modId, 0L)
+            ));
+        }
+
+        long totalSamples = display.values().stream().mapToLong(CpuSamplingProfiler.Snapshot::totalSamples).sum();
+        long totalRenderSamples = display.values().stream().mapToLong(CpuSamplingProfiler.Snapshot::renderSamples).sum();
+        return new EffectiveCpuAttribution(display, redistributedTotals, redistributedRenders, totalSamples, totalRenderSamples);
+    }
+
+    private EffectiveGpuAttribution buildEffectiveGpuAttribution(boolean effectiveView) {
+        Map<String, CpuSamplingProfiler.Snapshot> cpu = snapshot.cpuMods();
+        EffectiveCpuAttribution effectiveCpu = buildEffectiveCpuAttribution(cpu, snapshot.modInvokes());
+        Map<String, CpuSamplingProfiler.Snapshot> renderSource = effectiveView ? effectiveCpu.displaySnapshots() : cpu;
+        LinkedHashMap<String, Long> renderSamplesByMod = new LinkedHashMap<>();
+        renderSource.forEach((modId, sample) -> {
+            if (sample.renderSamples() > 0L) {
+                renderSamplesByMod.put(modId, sample.renderSamples());
+            }
+        });
+
+        LinkedHashMap<String, Long> directGpuByMod = new LinkedHashMap<>();
+        long sharedGpuNanos = 0L;
+        for (RenderPhaseProfiler.PhaseSnapshot phase : snapshot.renderPhases().values()) {
+            if (phase.gpuNanos() <= 0L) {
+                continue;
+            }
+            String ownerMod = phase.ownerMod() == null || phase.ownerMod().isBlank() ? "shared/render" : phase.ownerMod();
+            if (isSharedAttributionBucket(ownerMod)) {
+                sharedGpuNanos += phase.gpuNanos();
+            } else {
+                directGpuByMod.merge(ownerMod, phase.gpuNanos(), Long::sum);
+            }
+        }
+
+        if (!effectiveView) {
+            if (sharedGpuNanos > 0L) {
+                directGpuByMod.merge("shared/render", sharedGpuNanos, Long::sum);
+                renderSamplesByMod.putIfAbsent("shared/render", 0L);
+            }
+            long totalGpuNanos = Math.max(1L, directGpuByMod.values().stream().mapToLong(Long::longValue).sum());
+            long totalRenderSamples = Math.max(1L, renderSamplesByMod.values().stream().mapToLong(Long::longValue).sum());
+            return new EffectiveGpuAttribution(directGpuByMod, renderSamplesByMod, Map.of(), Map.of(), totalGpuNanos, totalRenderSamples);
+        }
+
+        LinkedHashMap<String, Long> effectiveGpuByMod = new LinkedHashMap<>();
+        renderSamplesByMod.keySet().forEach(modId -> effectiveGpuByMod.put(modId, directGpuByMod.getOrDefault(modId, 0L)));
+        directGpuByMod.forEach((modId, gpuNanos) -> effectiveGpuByMod.putIfAbsent(modId, gpuNanos));
+        Map<String, Double> weights = buildGpuWeightMap(renderSamplesByMod, effectiveGpuByMod);
+        Map<String, Long> redistributedGpu = distributeLongProportionally(sharedGpuNanos, weights);
+        redistributedGpu.forEach((modId, gpuNanos) -> effectiveGpuByMod.merge(modId, gpuNanos, Long::sum));
+        effectiveGpuByMod.entrySet().removeIf(entry -> entry.getValue() <= 0L && renderSamplesByMod.getOrDefault(entry.getKey(), 0L) <= 0L);
+        long totalGpuNanos = Math.max(1L, effectiveGpuByMod.values().stream().mapToLong(Long::longValue).sum());
+        long totalRenderSamples = Math.max(1L, renderSamplesByMod.values().stream().mapToLong(Long::longValue).sum());
+        return new EffectiveGpuAttribution(effectiveGpuByMod, renderSamplesByMod, redistributedGpu, effectiveCpu.redistributedRenderSamplesByMod(), totalGpuNanos, totalRenderSamples);
+    }
+
+    private EffectiveMemoryAttribution buildEffectiveMemoryAttribution(Map<String, Long> rawMemoryMods) {
+        LinkedHashMap<String, Long> concrete = new LinkedHashMap<>();
+        long sharedBytes = 0L;
+        for (Map.Entry<String, Long> entry : rawMemoryMods.entrySet()) {
+            if (isSharedAttributionBucket(entry.getKey())) {
+                sharedBytes += entry.getValue();
+            } else {
+                concrete.put(entry.getKey(), entry.getValue());
+            }
+        }
+        if (concrete.isEmpty()) {
+            long totalBytes = rawMemoryMods.values().stream().mapToLong(Long::longValue).sum();
+            return new EffectiveMemoryAttribution(new LinkedHashMap<>(rawMemoryMods), Map.of(), totalBytes);
+        }
+        Map<String, Double> weights = buildMemoryWeightMap(concrete);
+        Map<String, Long> redistributed = distributeLongProportionally(sharedBytes, weights);
+        LinkedHashMap<String, Long> display = new LinkedHashMap<>();
+        for (Map.Entry<String, Long> entry : concrete.entrySet()) {
+            display.put(entry.getKey(), entry.getValue() + redistributed.getOrDefault(entry.getKey(), 0L));
+        }
+        long totalBytes = display.values().stream().mapToLong(Long::longValue).sum();
+        return new EffectiveMemoryAttribution(display, redistributed, totalBytes);
+    }
+
+    private Map<String, Double> buildCpuWeightMap(Map<String, CpuSamplingProfiler.Snapshot> concrete, Map<String, ModTimingSnapshot> invokes, java.util.function.ToLongFunction<CpuSamplingProfiler.Snapshot> extractor) {
+        LinkedHashMap<String, Double> weights = new LinkedHashMap<>();
+        double total = 0.0;
+        for (Map.Entry<String, CpuSamplingProfiler.Snapshot> entry : concrete.entrySet()) {
+            double weight = Math.max(0L, extractor.applyAsLong(entry.getValue()));
+            weights.put(entry.getKey(), weight);
+            total += weight;
+        }
+        if (total > 0.0) {
+            return weights;
+        }
+        double invokeTotal = 0.0;
+        for (String modId : concrete.keySet()) {
+            double weight = Math.max(0L, invokes.getOrDefault(modId, new ModTimingSnapshot(0, 0)).calls());
+            weights.put(modId, weight);
+            invokeTotal += weight;
+        }
+        if (invokeTotal > 0.0) {
+            return weights;
+        }
+        for (String modId : concrete.keySet()) {
+            weights.put(modId, 1.0);
+        }
+        return weights;
+    }
+
+    private Map<String, Double> buildMemoryWeightMap(Map<String, Long> concrete) {
+        LinkedHashMap<String, Double> weights = new LinkedHashMap<>();
+        double total = 0.0;
+        for (Map.Entry<String, Long> entry : concrete.entrySet()) {
+            double weight = Math.max(0L, entry.getValue());
+            weights.put(entry.getKey(), weight);
+            total += weight;
+        }
+        if (total > 0.0) {
+            return weights;
+        }
+        for (String modId : concrete.keySet()) {
+            weights.put(modId, 1.0);
+        }
+        return weights;
+    }
+
+    private Map<String, Double> buildGpuWeightMap(Map<String, Long> renderSamplesByMod, Map<String, Long> directGpuByMod) {
+        LinkedHashMap<String, Double> weights = new LinkedHashMap<>();
+        double total = 0.0;
+        for (Map.Entry<String, Long> entry : renderSamplesByMod.entrySet()) {
+            if (isSharedAttributionBucket(entry.getKey())) {
+                continue;
+            }
+            double weight = Math.max(0L, entry.getValue());
+            weights.put(entry.getKey(), weight);
+            total += weight;
+        }
+        if (total > 0.0) {
+            return weights;
+        }
+        for (Map.Entry<String, Long> entry : directGpuByMod.entrySet()) {
+            if (isSharedAttributionBucket(entry.getKey())) {
+                continue;
+            }
+            double weight = Math.max(0L, entry.getValue());
+            weights.put(entry.getKey(), weight);
+            total += weight;
+        }
+        if (total > 0.0) {
+            return weights;
+        }
+        for (String modId : renderSamplesByMod.keySet()) {
+            if (!isSharedAttributionBucket(modId)) {
+                weights.put(modId, 1.0);
+            }
+        }
+        if (weights.isEmpty()) {
+            directGpuByMod.keySet().stream().filter(modId -> !isSharedAttributionBucket(modId)).forEach(modId -> weights.put(modId, 1.0));
+        }
+        return weights;
+    }
+
+    private Map<String, Long> distributeLongProportionally(long total, Map<String, Double> weights) {
+        if (total <= 0L || weights.isEmpty()) {
+            return Map.of();
+        }
+        LinkedHashMap<String, Long> result = new LinkedHashMap<>();
+        ArrayList<Map.Entry<String, Double>> entries = new ArrayList<>(weights.entrySet());
+        double weightSum = entries.stream().mapToDouble(entry -> Math.max(0.0, entry.getValue())).sum();
+        if (weightSum <= 0.0) {
+            for (Map.Entry<String, Double> entry : entries) {
+                result.put(entry.getKey(), 0L);
+            }
+            return result;
+        }
+        LinkedHashMap<String, Double> remainders = new LinkedHashMap<>();
+        long assigned = 0L;
+        for (Map.Entry<String, Double> entry : entries) {
+            double exact = total * Math.max(0.0, entry.getValue()) / weightSum;
+            long whole = (long) Math.floor(exact);
+            result.put(entry.getKey(), whole);
+            remainders.put(entry.getKey(), exact - whole);
+            assigned += whole;
+        }
+        long remainder = total - assigned;
+        if (remainder > 0L) {
+            entries.sort((a, b) -> Double.compare(remainders.getOrDefault(b.getKey(), 0.0), remainders.getOrDefault(a.getKey(), 0.0)));
+            for (int i = 0; i < remainder; i++) {
+                String modId = entries.get(i % entries.size()).getKey();
+                result.put(modId, result.getOrDefault(modId, 0L) + 1L);
+            }
+        }
+        return result;
+    }
+    private List<String> getTaskRows() {
+        Map<String, CpuSamplingProfiler.Snapshot> displayCpu = taskEffectiveView ? buildEffectiveCpuAttribution(snapshot.cpuMods(), snapshot.modInvokes()).displaySnapshots() : snapshot.cpuMods();
+        return getTaskRows(displayCpu, snapshot.cpuDetails(), snapshot.modInvokes(), !taskEffectiveView && taskShowSharedRows);
+    }
+
+    private List<String> getGpuRows() {
+        return getGpuRows(buildEffectiveGpuAttribution(gpuEffectiveView), snapshot.cpuDetails(), !gpuEffectiveView && gpuShowSharedRows);
+    }
+
+    private List<String> getMemoryRows() {
+
+        Map<String, Long> displayMemory = memoryEffectiveView ? buildEffectiveMemoryAttribution(snapshot.memoryMods()).displayBytes() : snapshot.memoryMods();
+        return getMemoryRows(displayMemory, snapshot.memoryClassesByMod(), !memoryEffectiveView && memoryShowSharedRows);
+    }
     private java.util.List<StartupTimingProfiler.StartupRow> getStartupRows() {
         String query = startupSearch.toLowerCase(Locale.ROOT);
         java.util.List<StartupTimingProfiler.StartupRow> rows = new ArrayList<>();
@@ -2486,7 +2991,7 @@ public class TaskManagerScreen extends Screen {
     }
 
     private boolean handleTaskHeaderClick(double mouseX, double mouseY, int listW) {
-        int headerY = getContentY() + PADDING + 50;
+        int headerY = getContentY() + PADDING + 76;
         int modX = PADDING + ICON_SIZE + 6;
         int pctX = listW - 206;
         int threadsX = listW - 146;
@@ -2501,7 +3006,7 @@ public class TaskManagerScreen extends Screen {
     }
 
     private boolean handleGpuHeaderClick(double mouseX, double mouseY, int listW) {
-        int headerY = getContentY() + PADDING + 50;
+        int headerY = getContentY() + PADDING + 76;
         int modX = PADDING + ICON_SIZE + 6;
         int pctX = listW - 232;
         int threadsX = listW - 172;
@@ -2516,7 +3021,8 @@ public class TaskManagerScreen extends Screen {
     }
 
     private boolean handleMemoryHeaderClick(double mouseX, double mouseY, int tableW) {
-        int headerY = getContentY() + PADDING + 96;
+        MemoryListLayout layout = getMemoryListLayout();
+        int headerY = layout.headerY();
         int modX = PADDING + ICON_SIZE + 6;
         int classesX = tableW - 140;
         int mbX = tableW - 94;
@@ -2589,7 +3095,7 @@ public class TaskManagerScreen extends Screen {
         }
         int detailW = Math.min(420, Math.max(320, getScreenWidth() / 3));
         int listW = width - detailW - PADDING;
-        return findRowAt(mouseX, mouseY, getContentY() + PADDING + 66, listW, getTaskRows());
+        return findRowAt(mouseX, mouseY, getContentY() + PADDING + 92, listW, getTaskRows());
     }
 
     private String findGpuRowAt(double mouseX, double mouseY) {
@@ -2598,7 +3104,7 @@ public class TaskManagerScreen extends Screen {
         }
         int detailW = Math.min(420, Math.max(320, getScreenWidth() / 3));
         int listW = width - detailW - PADDING;
-        return findRowAt(mouseX, mouseY, getContentY() + PADDING + 66, listW, getGpuRows());
+        return findRowAt(mouseX, mouseY, getContentY() + PADDING + 92, listW, getGpuRows());
     }
 
     private String findMemoryRowAt(double mouseX, double mouseY) {
@@ -2669,12 +3175,17 @@ public class TaskManagerScreen extends Screen {
         int panelGap = sharedPanelW > 0 ? PADDING : 0;
         int tableW = getScreenWidth() - sharedPanelW - panelGap;
         int top = getContentY() + PADDING;
-        int controlsY = top + 28;
+        String description = memoryEffectiveView
+                ? "Effective live heap by mod with shared/runtime buckets folded into concrete mods for comparison. Updated asynchronously."
+                : "Raw live heap by owner/class family. Shared/runtime buckets stay separate until you switch back to Effective view.";
+        int descriptionBottomY = top + measureWrappedHeight(Math.max(260, tableW - 16), description);
+        int controlsTopY = descriptionBottomY + 26;
+        int controlsY = controlsTopY + 42;
         int barY = controlsY + 24;
         int headerY = barY + 58;
         int listY = headerY + 16;
         int listH = getScreenHeight() - getContentY() - PADDING - (listY - getContentY()) - detailH;
-        return new MemoryListLayout(tableW, listY, listH);
+        return new MemoryListLayout(tableW, controlsY, headerY, listY, listH);
     }
 
 
@@ -2800,15 +3311,15 @@ public class TaskManagerScreen extends Screen {
         }
     }
     private boolean hasTaskFilter() {
-        return !tasksSearch.isBlank() || taskSort != TaskSort.CPU || !taskSortDescending;
+        return !tasksSearch.isBlank() || taskSort != TaskSort.CPU || !taskSortDescending || !taskEffectiveView || taskShowSharedRows;
     }
 
     private boolean hasGpuFilter() {
-        return !gpuSearch.isBlank() || gpuSort != GpuSort.EST_GPU || !gpuSortDescending;
+        return !gpuSearch.isBlank() || gpuSort != GpuSort.EST_GPU || !gpuSortDescending || !gpuEffectiveView || gpuShowSharedRows;
     }
 
     private boolean hasMemoryFilter() {
-        return !memorySearch.isBlank() || memorySort != MemorySort.MEMORY_MB || !memorySortDescending;
+        return !memorySearch.isBlank() || memorySort != MemorySort.MEMORY_MB || !memorySortDescending || !memoryEffectiveView || memoryShowSharedRows;
     }
 
     private boolean hasStartupFilter() {
@@ -2819,6 +3330,8 @@ public class TaskManagerScreen extends Screen {
         tasksSearch = "";
         taskSort = TaskSort.CPU;
         taskSortDescending = true;
+        taskEffectiveView = true;
+        taskShowSharedRows = false;
         focusedSearchTable = null;
     }
 
@@ -2826,6 +3339,8 @@ public class TaskManagerScreen extends Screen {
         gpuSearch = "";
         gpuSort = GpuSort.EST_GPU;
         gpuSortDescending = true;
+        gpuEffectiveView = true;
+        gpuShowSharedRows = false;
         focusedSearchTable = null;
     }
 
@@ -2840,6 +3355,8 @@ public class TaskManagerScreen extends Screen {
         memorySearch = "";
         memorySort = MemorySort.MEMORY_MB;
         memorySortDescending = true;
+        memoryEffectiveView = true;
+        memoryShowSharedRows = false;
         focusedSearchTable = null;
     }
 
@@ -2918,6 +3435,20 @@ public class TaskManagerScreen extends Screen {
     }
 
     private String getDisplayName(String modId) {
+        if (modId == null || modId.isBlank()) {
+            return "Unknown";
+        }
+        if (modId.startsWith("shared/")) {
+            return switch (modId) {
+                case "shared/jvm" -> "Shared / JVM";
+                case "shared/framework" -> "Shared / Framework";
+                case "shared/render" -> "Shared / Render";
+                default -> "Shared / " + cleanProfilerLabel(modId.substring("shared/".length()));
+            };
+        }
+        if (modId.startsWith("runtime/")) {
+            return "Runtime / " + cleanProfilerLabel(modId.substring("runtime/".length()));
+        }
         return FabricLoader.getInstance().getModContainer(modId)
                 .map(mod -> mod.getMetadata().getName())
                 .orElseGet(() -> cleanProfilerLabel(modId));
@@ -3293,20 +3824,31 @@ public class TaskManagerScreen extends Screen {
     }
 
     private void renderSensorSeriesGraph(DrawContext ctx, int x, int y, int width, int height, double[] values, String title, String units, int color, double fixedMax, double spanSeconds, boolean sensorAvailable, String unavailableLabel) {
-        renderFixedScaleLineGraph(ctx, x, y, width, height, sanitizeSeries(values), title, units, color, fixedMax, spanSeconds);
-        if (sensorAvailable || hasValidSeriesValue(values)) {
+        if (sensorAvailable) {
+            renderFixedScaleLineGraph(ctx, x, y, width, height, sanitizeSeries(values), title, units, color, fixedMax, spanSeconds);
             return;
         }
+
+        ctx.drawText(textRenderer, title + " (" + units + ")", x, y, TEXT_PRIMARY, false);
+        int graphX = x;
         int graphY = y + 14;
         int graphWidth = Math.max(120, width);
         int graphHeight = Math.max(64, height - 30);
         int plotRightPadding = 74;
         int plotWidth = Math.max(72, graphWidth - plotRightPadding);
-        String overlay = "Sensor not available";
-        int overlayX = x + Math.max(0, (plotWidth - textRenderer.getWidth(overlay)) / 2);
+        int axisX = graphX + plotWidth + 8;
+        int cardColor = 0x28101010;
+        int borderColor = 0x44383838;
+        ctx.fill(graphX - 3, graphY - 3, graphX + graphWidth + 3, graphY + graphHeight + 3, borderColor);
+        ctx.fill(graphX - 2, graphY - 2, graphX + graphWidth + 2, graphY + graphHeight + 2, cardColor);
+        drawAxisLabel(ctx, axisX, graphY - 4, formatGraphValue(fixedMax, units));
+        drawAxisLabel(ctx, axisX, graphY + (graphHeight / 2) - 4, formatGraphValue(fixedMax / 2.0, units));
+        drawAxisLabel(ctx, axisX, graphY + graphHeight - 8, formatGraphValue(0.0, units));
+        String overlay = "Sensor is not available";
+        int overlayX = graphX + Math.max(0, (plotWidth - textRenderer.getWidth(overlay)) / 2);
         int overlayY = graphY + Math.max(8, (graphHeight / 2) - 4);
         ctx.drawText(textRenderer, overlay, overlayX, overlayY, TEXT_DIM, false);
-        ctx.drawText(textRenderer, unavailableLabel, x, graphY + graphHeight + 4, TEXT_DIM, false);
+        ctx.drawText(textRenderer, textRenderer.trimToWidth(unavailableLabel, Math.max(80, graphWidth - 12)), x, graphY + graphHeight + 4, TEXT_DIM, false);
     }
 
     private boolean hasValidSeriesValue(double[] values) {
@@ -3551,7 +4093,7 @@ public class TaskManagerScreen extends Screen {
                 if (++shown >= 20) break;
             }
         }
-        endFullPageScissor(ctx);
+        ctx.disableScissor();
     }
 
     private void renderTimeline(DrawContext ctx, int x, int y, int w, int h) {
@@ -3582,7 +4124,179 @@ public class TaskManagerScreen extends Screen {
         drawMetricRow(ctx, left, top, graphWidth, "Frame Histogram", formatFrameHistogram(frames.getFrameTimeHistogram()));
         top += 22;
         renderSpikeInspector(ctx, left, top, graphWidth);
-        endFullPageScissor(ctx);
+        ctx.disableScissor();
+    }
+
+    private ModalLayout getCenteredModalLayout(int screenWidth, int screenHeight, int preferredWidth, int preferredHeight) {
+        int width = Math.max(280, Math.min(preferredWidth, screenWidth - 24));
+        int height = Math.max(220, Math.min(preferredHeight, screenHeight - 24));
+        int x = Math.max(12, (screenWidth - width) / 2);
+        int y = Math.max(20, (screenHeight - height) / 2);
+        return new ModalLayout(x, y, width, height);
+    }
+
+    private void renderAttributionHelpOverlay(DrawContext ctx, int screenWidth, int screenHeight, int mouseX, int mouseY) {
+        ctx.fill(0, 0, screenWidth, screenHeight, 0xAA000000);
+        ModalLayout modal = getCenteredModalLayout(screenWidth, screenHeight, Math.min(900, screenWidth - 32), Math.min(560, screenHeight - 48));
+        drawInsetPanel(ctx, modal.x(), modal.y(), modal.width(), modal.height());
+        drawTopChip(ctx, modal.x() + modal.width() - 62, modal.y() + 10, 52, 16, false);
+        ctx.drawText(textRenderer, "Close", modal.x() + modal.width() - 47, modal.y() + 14, TEXT_DIM, false);
+        ctx.drawText(textRenderer, "Attribution Guide", modal.x() + 12, modal.y() + 12, TEXT_PRIMARY, false);
+        ctx.drawText(textRenderer, textRenderer.trimToWidth("A quick guide to what is measured directly, what is inferred, and what is redistributed for readability.", modal.width() - 90), modal.x() + 12, modal.y() + 24, TEXT_DIM, false);
+        int contentX = modal.x() + 12;
+        int contentY = modal.y() + 48;
+        int contentW = modal.width() - 24;
+        ctx.enableScissor(modal.x() + 6, modal.y() + 40, modal.x() + modal.width() - 6, modal.y() + modal.height() - 6);
+        contentY = renderWrappedText(ctx, contentX, contentY, contentW, "Measured: data we directly observed, like sampled CPU stacks, JVM class histograms, GPU timer-query phase timings, or hardware counters.", TEXT_PRIMARY) + 8;
+        contentY = renderWrappedText(ctx, contentX, contentY, contentW, "Inferred: data we can explain from nearby evidence but do not directly own with perfect certainty, like shared/framework work or render-thread influence.", TEXT_PRIMARY) + 8;
+        contentY = renderWrappedText(ctx, contentX, contentY, contentW, "Estimated: GPU per-mod ownership is still an estimate because the driver exposes total timings more readily than exact per-mod boundaries. Tagged phase owners reduce the guesswork, but some render work still lands in shared/render.", TEXT_PRIMARY) + 12;
+        contentY = renderWrappedText(ctx, contentX, contentY, contentW, "Raw view keeps true-owned and shared/runtime buckets separate. Effective view redistributes shared/runtime buckets back into concrete mods so the main ranking answers the practical question: which mod is effectively carrying the most load right now?", TEXT_PRIMARY) + 12;
+        contentY = renderWrappedText(ctx, contentX, contentY, contentW, "Shared buckets are not errors. Shared / JVM, Shared / Framework, Shared / Render, and Runtime rows are where work genuinely crosses mod boundaries or belongs to the platform more than a single mod.", TEXT_PRIMARY) + 12;
+        contentY = renderWrappedText(ctx, contentX, contentY, contentW, "Use Raw when you want honesty about direct ownership. Use Effective when you want faster triage. The export now preserves both so reports match what you saw on screen.", ACCENT_YELLOW);
+        ctx.disableScissor();
+    }
+
+    private void renderRowDrilldownOverlay(DrawContext ctx, int screenWidth, int screenHeight, int mouseX, int mouseY) {
+        String modId = getActiveDrilldownModId();
+        if (modId == null) {
+            activeDrilldownTable = null;
+            return;
+        }
+        ctx.fill(0, 0, screenWidth, screenHeight, 0xAA000000);
+        ModalLayout modal = getCenteredModalLayout(screenWidth, screenHeight, Math.min(920, screenWidth - 32), Math.min(620, screenHeight - 48));
+        drawInsetPanel(ctx, modal.x(), modal.y(), modal.width(), modal.height());
+        drawTopChip(ctx, modal.x() + modal.width() - 62, modal.y() + 10, 52, 16, false);
+        ctx.drawText(textRenderer, "Close", modal.x() + modal.width() - 47, modal.y() + 14, TEXT_DIM, false);
+        String title = switch (activeDrilldownTable) {
+            case TASKS -> "CPU Row Drilldown";
+            case GPU -> "GPU Row Drilldown";
+            case MEMORY -> "Memory Row Drilldown";
+        };
+        ctx.drawText(textRenderer, title, modal.x() + 12, modal.y() + 12, TEXT_PRIMARY, false);
+        ctx.drawText(textRenderer, textRenderer.trimToWidth(getDisplayName(modId), modal.width() - 90), modal.x() + 12, modal.y() + 24, ACCENT_YELLOW, false);
+        if (activeDrilldownTable == TableId.TASKS) {
+            renderCpuDrilldownContent(ctx, modal, modId);
+        } else if (activeDrilldownTable == TableId.GPU) {
+            renderGpuDrilldownContent(ctx, modal, modId);
+        } else if (activeDrilldownTable == TableId.MEMORY) {
+            renderMemoryDrilldownContent(ctx, modal, modId);
+        }
+    }
+
+    private String getActiveDrilldownModId() {
+        if (activeDrilldownTable == null) {
+            return null;
+        }
+        return switch (activeDrilldownTable) {
+            case TASKS -> selectedTaskMod;
+            case GPU -> selectedGpuMod;
+            case MEMORY -> selectedMemoryMod;
+        };
+    }
+
+    private void renderCpuDrilldownContent(DrawContext ctx, ModalLayout modal, String modId) {
+        Map<String, CpuSamplingProfiler.Snapshot> rawCpu = snapshot.cpuMods();
+        EffectiveCpuAttribution effectiveCpu = buildEffectiveCpuAttribution(rawCpu, snapshot.modInvokes());
+        CpuSamplingProfiler.Snapshot rawSnapshot = rawCpu.getOrDefault(modId, new CpuSamplingProfiler.Snapshot(0, 0, 0));
+        CpuSamplingProfiler.Snapshot effectiveSnapshot = effectiveCpu.displaySnapshots().getOrDefault(modId, rawSnapshot);
+        CpuSamplingProfiler.Snapshot displaySnapshot = taskEffectiveView ? effectiveSnapshot : rawSnapshot;
+        CpuSamplingProfiler.DetailSnapshot detail = snapshot.cpuDetails().get(modId);
+        double[] trend = buildTrendSeries(TableId.TASKS, modId, taskEffectiveView);
+        List<ProfilerManager.SessionPoint> recentPoints = getRecentSessionPoints();
+        int contentX = modal.x() + 12;
+        int contentY = modal.y() + 46;
+        int contentW = modal.width() - 24;
+        ctx.enableScissor(modal.x() + 6, modal.y() + 40, modal.x() + modal.width() - 6, modal.y() + modal.height() - 6);
+        contentY = renderWrappedText(ctx, contentX, contentY, contentW, String.format(Locale.ROOT, "%s view | current %.1f%% CPU | raw %s samples | effective %s samples", taskEffectiveView ? "Effective" : "Raw", displaySnapshot.totalSamples() * 100.0 / Math.max(1L, (taskEffectiveView ? effectiveCpu.totalSamples() : rawCpu.values().stream().mapToLong(CpuSamplingProfiler.Snapshot::totalSamples).sum())), formatCount(rawSnapshot.totalSamples()), formatCount(effectiveSnapshot.totalSamples())), TEXT_DIM) + 6;
+        contentY = renderWrappedText(ctx, contentX, contentY, contentW, "Why this row: sampled stack ownership points here directly, while shared/framework buckets are proportionally redistributed only in Effective view.", TEXT_DIM) + 8;
+        renderSeriesGraph(ctx, contentX, contentY, contentW, 124, trend, null, "CPU Trend (last ~30s)", "% CPU", ACCENT_GREEN, 0, getTrendSpanSeconds(recentPoints));
+        contentY += 142;
+        contentY = renderReasonSection(ctx, contentX, contentY, contentW, "Top threads [sampled]", effectiveThreadBreakdown(modId, detail)) + 6;
+        contentY = renderReasonSection(ctx, contentX, contentY, contentW, isSharedAttributionBucket(modId) ? "Shared bucket sources" : "Top sampled frames [sampled]", isSharedAttributionBucket(modId) ? buildCpuBucketBreakdown(modId, detail) : (detail == null ? Map.of() : detail.topFrames())) + 6;
+        if (isSharedAttributionBucket(modId)) {
+            renderReasonSection(ctx, contentX, contentY, contentW, "Top sampled frames [sampled]", detail == null ? Map.of() : detail.topFrames());
+        }
+        ctx.disableScissor();
+    }
+
+    private void renderGpuDrilldownContent(DrawContext ctx, ModalLayout modal, String modId) {
+        EffectiveGpuAttribution rawGpu = buildEffectiveGpuAttribution(false);
+        EffectiveGpuAttribution displayGpu = buildEffectiveGpuAttribution(gpuEffectiveView);
+        CpuSamplingProfiler.DetailSnapshot detail = snapshot.cpuDetails().get(modId);
+        long displayGpuNanos = displayGpu.gpuNanosByMod().getOrDefault(modId, 0L);
+        double[] trend = buildTrendSeries(TableId.GPU, modId, gpuEffectiveView);
+        List<ProfilerManager.SessionPoint> recentPoints = getRecentSessionPoints();
+        int contentX = modal.x() + 12;
+        int contentY = modal.y() + 46;
+        int contentW = modal.width() - 24;
+        ctx.enableScissor(modal.x() + 6, modal.y() + 40, modal.x() + modal.width() - 6, modal.y() + modal.height() - 6);
+        contentY = renderWrappedText(ctx, contentX, contentY, contentW, String.format(Locale.ROOT, "%s view | current %.1f%% GPU | raw %.2f ms | effective %.2f ms", gpuEffectiveView ? "Effective" : "Raw", displayGpuNanos * 100.0 / Math.max(1L, displayGpu.totalGpuNanos()), rawGpu.gpuNanosByMod().getOrDefault(modId, 0L) / 1_000_000.0, displayGpuNanos / 1_000_000.0), TEXT_DIM) + 6;
+        contentY = renderWrappedText(ctx, contentX, contentY, contentW, "Why this row: tagged render-phase owners get first claim on GPU time, then leftover shared/render work is redistributed only in Effective view.", TEXT_DIM) + 8;
+        renderSeriesGraph(ctx, contentX, contentY, contentW, 124, trend, null, "GPU Trend (last ~30s)", "% GPU", getGpuGraphColor(), 0, getTrendSpanSeconds(recentPoints));
+        contentY += 142;
+        contentY = renderWrappedText(ctx, contentX, contentY, contentW, "Owner source: " + describeGpuOwnerSource(modId), TEXT_DIM) + 6;
+        contentY = renderReasonSection(ctx, contentX, contentY, contentW, "Render threads [sampled]", effectiveThreadBreakdown(modId, detail)) + 6;
+        contentY = renderStringListSection(ctx, contentX, contentY, contentW, isSharedAttributionBucket(modId) ? "Top shared owner phases [tagged]" : "Top owner phases [tagged]", buildGpuPhaseBreakdownLines(modId)) + 6;
+        renderReasonSection(ctx, contentX, contentY, contentW, "Top sampled render frames [sampled]", detail == null ? Map.of() : detail.topFrames());
+        ctx.disableScissor();
+    }
+
+    private void renderMemoryDrilldownContent(DrawContext ctx, ModalLayout modal, String modId) {
+        Map<String, Long> rawMemory = snapshot.memoryMods();
+        EffectiveMemoryAttribution effectiveMemory = buildEffectiveMemoryAttribution(rawMemory);
+        Map<String, Long> displayMemory = memoryEffectiveView ? effectiveMemory.displayBytes() : rawMemory;
+        double[] trend = buildTrendSeries(TableId.MEMORY, modId, memoryEffectiveView);
+        List<ProfilerManager.SessionPoint> recentPoints = getRecentSessionPoints();
+        int contentX = modal.x() + 12;
+        int contentY = modal.y() + 46;
+        int contentW = modal.width() - 24;
+        ctx.enableScissor(modal.x() + 6, modal.y() + 40, modal.x() + modal.width() - 6, modal.y() + modal.height() - 6);
+        contentY = renderWrappedText(ctx, contentX, contentY, contentW, String.format(Locale.ROOT, "%s view | current %.1f MB shown | raw %.1f MB | effective %.1f MB", memoryEffectiveView ? "Effective" : "Raw", displayMemory.getOrDefault(modId, 0L) / (1024.0 * 1024.0), rawMemory.getOrDefault(modId, 0L) / (1024.0 * 1024.0), effectiveMemory.displayBytes().getOrDefault(modId, rawMemory.getOrDefault(modId, 0L)) / (1024.0 * 1024.0)), TEXT_DIM) + 6;
+        contentY = renderWrappedText(ctx, contentX, contentY, contentW, "Why this row: live class ownership points here directly, while shared/runtime buckets are redistributed only in Effective view.", TEXT_DIM) + 8;
+        renderSeriesGraph(ctx, contentX, contentY, contentW, 124, trend, null, "Memory Trend (last ~30s)", "MB", getMemoryGraphColor(), 0, getTrendSpanSeconds(recentPoints));
+        contentY += 142;
+        contentY = renderReasonSection(ctx, contentX, contentY, contentW, "Top classes", snapshot.memoryClassesByMod().getOrDefault(modId, Map.of())) + 6;
+        if (isSharedAttributionBucket(modId)) {
+            renderReasonSection(ctx, contentX, contentY, contentW, "Shared family classes", snapshot.sharedFamilyClasses().getOrDefault(modId, Map.of()));
+        }
+        ctx.disableScissor();
+    }
+
+    private List<ProfilerManager.SessionPoint> getRecentSessionPoints() {
+        List<ProfilerManager.SessionPoint> history = new ArrayList<>(ProfilerManager.getInstance().getSessionHistory());
+        if (history.isEmpty()) {
+            return history;
+        }
+        long cutoff = System.currentTimeMillis() - (ATTRIBUTION_TREND_WINDOW_SECONDS * 1000L);
+        List<ProfilerManager.SessionPoint> recent = history.stream()
+                .filter(point -> point.capturedAtEpochMillis() >= cutoff)
+                .toList();
+        return recent.isEmpty() ? history : recent;
+    }
+
+    private int getTrendSpanSeconds(List<ProfilerManager.SessionPoint> points) {
+        if (points == null || points.size() < 2) {
+            return ATTRIBUTION_TREND_WINDOW_SECONDS;
+        }
+        long spanMs = Math.max(1000L, points.get(points.size() - 1).capturedAtEpochMillis() - points.get(0).capturedAtEpochMillis());
+        return (int) Math.max(1L, Math.round(spanMs / 1000.0));
+    }
+
+    private double[] buildTrendSeries(TableId tableId, String modId, boolean effectiveView) {
+        List<ProfilerManager.SessionPoint> points = getRecentSessionPoints();
+        if (points.isEmpty()) {
+            return new double[] {0.0};
+        }
+        double[] values = new double[points.size()];
+        for (int i = 0; i < points.size(); i++) {
+            ProfilerManager.SessionPoint point = points.get(i);
+            values[i] = switch (tableId) {
+                case TASKS -> (effectiveView ? point.cpuEffectivePercentByMod() : point.cpuRawPercentByMod()).getOrDefault(modId, 0.0);
+                case GPU -> (effectiveView ? point.gpuEffectivePercentByMod() : point.gpuRawPercentByMod()).getOrDefault(modId, 0.0);
+                case MEMORY -> (effectiveView ? point.memoryEffectiveMbByMod() : point.memoryRawMbByMod()).getOrDefault(modId, 0.0);
+            };
+        }
+        return values;
     }
 
     private void renderSettings(DrawContext ctx, int x, int y, int w, int h, int mouseX, int mouseY) {
@@ -3591,6 +4305,11 @@ public class TaskManagerScreen extends Screen {
         int top = getFullPageScrollTop(y);
         ctx.drawText(textRenderer, "Settings", left, top, TEXT_PRIMARY, false);
         top += 18;
+        ctx.drawText(textRenderer, "Attribution", left, top, TEXT_PRIMARY, false);
+        drawTopChip(ctx, left + 104, top - 2, 108, 16, attributionHelpOpen);
+        ctx.drawText(textRenderer, "Open Guide", left + 132, top + 2, attributionHelpOpen ? TEXT_PRIMARY : TEXT_DIM, false);
+        top += 18;
+        top = renderWrappedText(ctx, left, top, w - 24, "Raw keeps direct ownership separate. Effective folds shared/runtime buckets back into mods for easier ranking. Use Open Guide for the full measured / inferred / estimated explanation.", TEXT_DIM) + 10;
         drawSettingRow(ctx, left, top, w - 24, "Session Logging", ProfilerManager.getInstance().isSessionLogging() ? "On" : "Off", mouseX, mouseY);
         top += 22;
         drawSettingRow(ctx, left, top, w - 24, "Session Duration", ConfigManager.getSessionDurationSeconds() + "s", mouseX, mouseY);
@@ -3608,6 +4327,8 @@ public class TaskManagerScreen extends Screen {
         drawSettingRow(ctx, left, top, w - 24, "Layout", String.valueOf(ConfigManager.getHudLayoutMode()), mouseX, mouseY);
         top += 22;
         drawSettingRow(ctx, left, top, w - 24, "Trigger Mode", String.valueOf(ConfigManager.getHudTriggerMode()), mouseX, mouseY);
+        top += 22;
+        drawSettingRowWithTooltip(ctx, left, top, w - 24, "Target FPS", ConfigManager.getFrameBudgetTargetFps() + " FPS", mouseX, mouseY, "Sets the frame-budget target used by the HUD, alerts, and exports when judging whether a frame is over budget.");
         top += 22;
         drawSliderSetting(ctx, left, top, w - 24, "HUD Transparency", ConfigManager.getHudTransparencyPercent(), mouseX, mouseY);
         top += 24;
@@ -3641,7 +4362,7 @@ public class TaskManagerScreen extends Screen {
             top += 22;
             drawSettingRow(ctx, left, top, w - 24, "Background", ConfigManager.isHudShowBackground() ? "On" : "Off", mouseX, mouseY);
             top += 22;
-            drawSettingRowWithTooltip(ctx, left, top, w - 24, "Frame Budget", ConfigManager.isHudShowFrameBudget() ? "On" : "Off", mouseX, mouseY, "Shows the latest frame time against the 16.7ms 60 FPS target and how far over or under budget it is.");
+            drawSettingRowWithTooltip(ctx, left, top, w - 24, "Frame Budget", ConfigManager.isHudShowFrameBudget() ? "On" : "Off", mouseX, mouseY, "Shows the latest frame time against your configured target FPS budget and how far over or under budget it is.");
             top += 22;
             drawSettingRow(ctx, left, top, w - 24, "Memory", ConfigManager.isHudShowMemory() ? "On" : "Off", mouseX, mouseY);
             top += 22;
@@ -3731,7 +4452,7 @@ public class TaskManagerScreen extends Screen {
         drawSettingRow(ctx, left, top, w - 24, "Reset Graph Colours", "Defaults", mouseX, mouseY);
         top += 20;
         ctx.drawText(textRenderer, textRenderer.trimToWidth("Click a colour row, type a hex value like #5EA9FF, then press Enter to save.", w - 24), left, top, TEXT_DIM, false);
-        endFullPageScissor(ctx);
+        ctx.disableScissor();
     }
 
 
@@ -3839,6 +4560,26 @@ public class TaskManagerScreen extends Screen {
         return value == null || value.isBlank() ? "unknown" : value;
     }
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 

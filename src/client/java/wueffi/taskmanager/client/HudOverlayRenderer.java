@@ -11,6 +11,7 @@ import java.util.Deque;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Supplier;
 
 public final class HudOverlayRenderer {
 
@@ -20,6 +21,8 @@ public final class HudOverlayRenderer {
     private static final int TEXT = 0xFFD7DDE4;
     private static final int DIM = 0xFF97A3AF;
     private static final int ACCENT = 0xFF70C7A7;
+    private static final int FLOW_IN = 0xFF5EA9FF;
+    private static final int FLOW_OUT = 0xFFFFC857;
     private static final int WARN = 0xFFFFC857;
     private static final int ERROR = 0xFFFF9F43;
     private static final int CRITICAL = 0xFFFF6B6B;
@@ -34,11 +37,7 @@ public final class HudOverlayRenderer {
     private static final int LABEL_VALUE_GAP = 8;
     private static final int VALUE_RIGHT_PADDING = 4;
     private static final int MAX_MEMORY_RATE_SAMPLES = 24;
-    private static long lastDisplayedFpsUpdateAtMillis;
-    private static long lastDisplayedMemoryUpdateAtMillis;
-    private static String displayedFpsText = "0 now | 0 avg";
-    private static String displayedLowFpsText = "1% 0 | 0.1% 0";
-    private static String displayedMemoryText = "0/0 MB";
+    private static final Map<String, DisplayCacheEntry> displayCache = new HashMap<>();
     private static final Deque<MemoryRateSample> memoryRateSamples = new ArrayDeque<>();
     private static final Map<String, RateSample> rateSamples = new HashMap<>();
     private static final Map<String, SensorRateSample> sensorRateSamples = new HashMap<>();
@@ -60,8 +59,7 @@ public final class HudOverlayRenderer {
         FrameTimelineProfiler frame = FrameTimelineProfiler.getInstance();
         MemoryProfiler.Snapshot memory = snapshot.memory();
         SystemMetricsProfiler.Snapshot system = snapshot.systemMetrics();
-        refreshDisplayedFps(frame);
-        refreshDisplayedMemory(memory);
+        refreshDisplayedMetrics(frame, memory, snapshot, system);
         ProfilerManager.RuleFinding highestFinding = highestFinding(profilerManager);
         double latestFrameMs = frame.getLatestFrameNs() / 1_000_000.0;
         long recentSpikeAge = snapshot.spikes().isEmpty() ? Long.MAX_VALUE : Math.max(0L, System.currentTimeMillis() - snapshot.spikes().get(0).capturedAtEpochMillis());
@@ -149,35 +147,35 @@ public final class HudOverlayRenderer {
 
     private static void buildCompactEntries(List<Entry> entries, ProfilerManager.ProfilerSnapshot snapshot, FrameTimelineProfiler frame, MemoryProfiler.Snapshot memory, SystemMetricsProfiler.Snapshot system) {
         entries.add(new Entry("FPS", displayedFpsText(frame), HEADER, false));
-        entries.add(new Entry("Frame Budget", frameBudgetText(frame), frameBudgetColor(frame), true));
+        entries.add(new Entry("Frame Budget", displayedMetric("frame.budget", () -> frameBudgetText(frame)), frameBudgetColor(frame), true));
         entries.add(new Entry("CPU", formatUtilAndTemp(system, true), utilizationColor(system, true), false));
         entries.add(new Entry("GPU", formatUtilAndTemp(system, false), utilizationColor(system, false), false));
         entries.add(new Entry("Memory", displayedMemoryText(memory), memoryColor(memory), false));
-        entries.add(new Entry("VRAM", vramText(system), vramColor(system), false));
+        entries.add(new Entry("VRAM", displayedMetric("vram", () -> vramText(system)), vramColor(system), false));
         if (snapshot.sessionLogging()) {
-            entries.add(new Entry("Session", formatDuration(snapshot.sessionLoggingElapsedMillis()) + " / " + formatDuration(ConfigManager.getSessionDurationSeconds() * 1000L), WARN, false));
+            entries.add(new Entry("Session", displayedMetric("session", () -> formatDuration(snapshot.sessionLoggingElapsedMillis()) + " / " + formatDuration(ConfigManager.getSessionDurationSeconds() * 1000L)), WARN, false));
         }
     }
 
     private static void buildPresetFullEntries(List<Entry> entries, ProfilerManager.ProfilerSnapshot snapshot, FrameTimelineProfiler frame, MemoryProfiler.Snapshot memory, SystemMetricsProfiler.Snapshot system) {
         entries.add(new Entry("FPS", displayedFpsText(frame), HEADER, false));
         entries.add(new Entry("FPS Lows", displayedLowFpsText(frame), HEADER, false));
-        entries.add(new Entry("Frame Budget", frameBudgetText(frame), frameBudgetColor(frame), false));
-        entries.add(new Entry("Frame", compactFrameText(frame), frameBudgetColor(frame), false));
-        entries.add(new Entry("Client Tick", tickText("tick.client", TickProfiler.getInstance().getAverageClientTickNs() / 1_000_000.0), tickColor(TickProfiler.getInstance().getAverageClientTickNs() / 1_000_000.0, false), false));
-        entries.add(new Entry("Server Tick", tickText("tick.server", TickProfiler.getInstance().getAverageServerTickNs() / 1_000_000.0), tickColor(TickProfiler.getInstance().getAverageServerTickNs() / 1_000_000.0, true), false));
+        entries.add(new Entry("Frame Budget", displayedMetric("frame.budget", () -> frameBudgetText(frame)), frameBudgetColor(frame), false));
+        entries.add(new Entry("Frame", displayedMetric("frame.stats", () -> compactFrameText(frame)), frameBudgetColor(frame), false));
+        entries.add(new Entry("Client Tick", displayedMetric("tick.client", () -> tickText("tick.client", TickProfiler.getInstance().getAverageClientTickNs() / 1_000_000.0)), tickColor(TickProfiler.getInstance().getAverageClientTickNs() / 1_000_000.0, false), false));
+        entries.add(new Entry("Server Tick", displayedMetric("tick.server", () -> tickText("tick.server", TickProfiler.getInstance().getAverageServerTickNs() / 1_000_000.0)), tickColor(TickProfiler.getInstance().getAverageServerTickNs() / 1_000_000.0, true), false));
         entries.add(new Entry("CPU", formatUtilAndTemp(system, true), utilizationColor(system, true), false));
         entries.add(new Entry("GPU", formatUtilAndTemp(system, false), utilizationColor(system, false), false));
-        entries.add(new Entry("Input Latency", inputLatencyText(system), inputLatencyColor(system), false));
+        entries.add(new Entry("Input Latency", displayedMetric("input.latency", () -> inputLatencyText(system)), inputLatencyColor(system), false));
         entries.add(new Entry("Memory", displayedMemoryText(memory), memoryColor(memory), false));
-        entries.add(new Entry("VRAM", vramText(system), vramColor(system), false));
-        entries.add(new Entry("Network", networkText(system), networkColor(system), true));
-        entries.add(new Entry("Chunk Activity", chunkActivityText(system), chunkActivityColor(system), true));
-        entries.add(new Entry("Entities", worldEntitiesText(snapshot), DIM, false));
-        entries.add(new Entry("Chunks", worldChunksText(snapshot), DIM, false));
-        entries.add(new Entry("Disk I/O", diskIoText(system), DIM, true));
+        entries.add(new Entry("VRAM", displayedMetric("vram", () -> vramText(system)), vramColor(system), false));
+        entries.add(networkEntry(system));
+        entries.add(new Entry("Chunk Activity", displayedMetric("chunk.activity", () -> chunkActivityText(system)), chunkActivityColor(system), true));
+        entries.add(new Entry("Entities", displayedMetric("world.entities", () -> worldEntitiesText(snapshot)), DIM, false));
+        entries.add(new Entry("Chunks", displayedMetric("world.chunks", () -> worldChunksText(snapshot)), DIM, false));
+        entries.add(diskEntry(system));
         if (snapshot.sessionLogging()) {
-            entries.add(new Entry("Session", formatDuration(snapshot.sessionLoggingElapsedMillis()) + " / " + formatDuration(ConfigManager.getSessionDurationSeconds() * 1000L), WARN, false));
+            entries.add(new Entry("Session", displayedMetric("session", () -> formatDuration(snapshot.sessionLoggingElapsedMillis()) + " / " + formatDuration(ConfigManager.getSessionDurationSeconds() * 1000L)), WARN, false));
         }
     }
 
@@ -187,20 +185,20 @@ public final class HudOverlayRenderer {
             entries.add(new Entry("FPS Lows", displayedLowFpsText(frame), HEADER, false));
         }
         if (ConfigManager.isHudShowFrame()) {
-            entries.add(new Entry("Frame", compactFrameText(frame), TEXT, false));
+            entries.add(new Entry("Frame", displayedMetric("frame.stats", () -> compactFrameText(frame)), TEXT, false));
         }
         if (ConfigManager.isHudShowTicks()) {
-            entries.add(new Entry("Client Tick", tickText("tick.client", TickProfiler.getInstance().getAverageClientTickNs() / 1_000_000.0), TEXT, false));
-            entries.add(new Entry("Server Tick", tickText("tick.server", TickProfiler.getInstance().getAverageServerTickNs() / 1_000_000.0), TEXT, false));
+            entries.add(new Entry("Client Tick", displayedMetric("tick.client", () -> tickText("tick.client", TickProfiler.getInstance().getAverageClientTickNs() / 1_000_000.0)), TEXT, false));
+            entries.add(new Entry("Server Tick", displayedMetric("tick.server", () -> tickText("tick.server", TickProfiler.getInstance().getAverageServerTickNs() / 1_000_000.0)), TEXT, false));
         }
         if (ConfigManager.isHudShowUtilization()) {
             entries.add(new Entry("CPU", formatUtilAndTemp(system, true), utilizationColor(system, true), false));
             entries.add(new Entry("GPU", formatUtilAndTemp(system, false), utilizationColor(system, false), false));
             if (ConfigManager.isHudShowLogic()) {
-                entries.add(new Entry("Main Logic", shorten(system.mainLogicSummary().replace("Main Logic: ", ""), 36), DIM, true));
+                entries.add(new Entry("Main Logic", displayedMetric("logic.main", () -> shorten(system.mainLogicSummary().replace("Main Logic: ", ""), 36)), DIM, true));
             }
             if (ConfigManager.isHudShowBackground()) {
-                entries.add(new Entry("Background", shorten(system.backgroundSummary().replace("Background: ", ""), 36), DIM, true));
+                entries.add(new Entry("Background", displayedMetric("logic.background", () -> shorten(system.backgroundSummary().replace("Background: ", ""), 36)), DIM, true));
             }
         }
         if (ConfigManager.isHudShowParallelism()) {
@@ -208,66 +206,67 @@ public final class HudOverlayRenderer {
             if (system.activeHighLoadThreads() > Math.max(1, system.estimatedPhysicalCores() / 2) && snapshot.stutterScore() > 10.0) {
                 parallelText = "Thread overscheduling";
             }
-            entries.add(new Entry("Parallel", parallelText, WARN, true));
+            String displayedParallelText = parallelText;
+            entries.add(new Entry("Parallel", displayedMetric("parallel", () -> displayedParallelText), WARN, true));
         }
         if (ConfigManager.isHudShowFrameBudget()) {
-            entries.add(new Entry("Frame Budget", frameBudgetText(frame), frameBudgetColor(frame), true));
+            entries.add(new Entry("Frame Budget", displayedMetric("frame.budget", () -> frameBudgetText(frame)), frameBudgetColor(frame), true));
         }
         if (ConfigManager.isHudShowMemory()) {
             entries.add(new Entry("Memory", displayedMemoryText(memory), memoryColor(memory), false));
         }
         if (ConfigManager.isHudShowVram()) {
-            entries.add(new Entry("VRAM", vramText(system), vramColor(system), false));
+            entries.add(new Entry("VRAM", displayedMetric("vram", () -> vramText(system)), vramColor(system), false));
         }
         if (ConfigManager.isHudShowNetwork()) {
-            entries.add(new Entry("Network", networkText(system), networkColor(system), true));
+            entries.add(networkEntry(system));
         }
         if (ConfigManager.isHudShowChunkActivity()) {
-            entries.add(new Entry("Chunk Activity", chunkActivityText(system), chunkActivityColor(system), true));
+            entries.add(new Entry("Chunk Activity", displayedMetric("chunk.activity", () -> chunkActivityText(system)), chunkActivityColor(system), true));
         }
         if (ConfigManager.isHudShowWorld()) {
-            entries.add(new Entry("Entities", worldEntitiesText(snapshot), DIM, false));
-            entries.add(new Entry("Chunks", worldChunksText(snapshot), DIM, false));
+            entries.add(new Entry("Entities", displayedMetric("world.entities", () -> worldEntitiesText(snapshot)), DIM, false));
+            entries.add(new Entry("Chunks", displayedMetric("world.chunks", () -> worldChunksText(snapshot)), DIM, false));
         }
         if (ConfigManager.isHudShowDiskIo()) {
-            entries.add(new Entry("Disk I/O", diskIoText(system), DIM, true));
+            entries.add(diskEntry(system));
         }
         if (ConfigManager.isHudShowInputLatency()) {
-            entries.add(new Entry("Input Latency", inputLatencyText(system), inputLatencyColor(system), false));
+            entries.add(new Entry("Input Latency", displayedMetric("input.latency", () -> inputLatencyText(system)), inputLatencyColor(system), false));
         }
         if (ConfigManager.isHudShowSession() && snapshot.sessionLogging()) {
-            entries.add(new Entry("Session", formatDuration(snapshot.sessionLoggingElapsedMillis()) + " / " + formatDuration(ConfigManager.getSessionDurationSeconds() * 1000L), WARN, false));
+            entries.add(new Entry("Session", displayedMetric("session", () -> formatDuration(snapshot.sessionLoggingElapsedMillis()) + " / " + formatDuration(ConfigManager.getSessionDurationSeconds() * 1000L)), WARN, false));
         }
     }
 
     private static void appendExpandedDetails(List<Entry> entries, ProfilerManager profilerManager, ProfilerManager.ProfilerSnapshot snapshot, ProfilerManager.RuleFinding highestFinding, int alertColor, boolean hasAutoFocusRow) {
         long warningCount = profilerManager.getLatestRuleFindings().stream().filter(finding -> severityRank(finding.severity()) >= 1).count();
         if (warningCount > 0 && !hasAutoFocusRow) {
-            entries.add(new Entry("Alert", warningCount + " active | stutter " + format1(snapshot.stutterScore()), alertColor, true));
+            entries.add(new Entry("Alert", displayedMetric("alert", () -> warningCount + " active | stutter " + format1(snapshot.stutterScore())), alertColor, true));
             if (highestFinding != null) {
-                entries.add(new Entry("Why", shorten(highestFinding.category() + ": " + highestFinding.message(), 64), alertColor, true));
+                entries.add(new Entry("Why", displayedMetric("alert.why", () -> shorten(highestFinding.category() + ": " + highestFinding.message(), 64)), alertColor, true));
             }
         }
         if (!snapshot.spikes().isEmpty()) {
             ProfilerManager.SpikeCapture latestSpike = snapshot.spikes().get(0);
-            entries.add(new Entry("Spike", format1(latestSpike.frameDurationMs()) + " ms | " + shorten(latestSpike.likelyBottleneck(), 32), WARN, true));
+            entries.add(new Entry("Spike", displayedMetric("spike", () -> format1(latestSpike.frameDurationMs()) + " ms | " + shorten(latestSpike.likelyBottleneck(), 32)), WARN, true));
         }
         String bottleneck = profilerManager.getCurrentBottleneckLabel();
         if (bottleneck != null && !bottleneck.isBlank()) {
-            entries.add(new Entry("Focus", shorten(bottleneck, 48), highestFinding != null ? alertColor : DIM, true));
+            entries.add(new Entry("Focus", displayedMetric("focus", () -> shorten(bottleneck, 48)), highestFinding != null ? alertColor : DIM, true));
         }
     }
 
     private static boolean shouldRenderHud(ProfilerManager.ProfilerSnapshot snapshot, ProfilerManager.RuleFinding highestFinding, double latestFrameMs, long recentSpikeAge) {
         return switch (ConfigManager.getHudTriggerMode()) {
             case ALWAYS -> true;
-            case SPIKES_ONLY -> latestFrameMs >= 40.0 || recentSpikeAge <= 5000L || snapshot.stutterScore() >= 10.0 || (highestFinding != null && severityRank(highestFinding.severity()) >= 2);
+            case SPIKES_ONLY -> latestFrameMs >= Math.max(40.0, targetFrameBudgetMs() * 2.0) || recentSpikeAge <= 5000L || snapshot.stutterScore() >= 10.0 || (highestFinding != null && severityRank(highestFinding.severity()) >= 2);
             case WARNINGS_ONLY -> highestFinding != null && severityRank(highestFinding.severity()) >= 1;
         };
     }
 
     private static boolean hasActionableWarning(ProfilerManager.ProfilerSnapshot snapshot, ProfilerManager.RuleFinding highestFinding, double latestFrameMs, long recentSpikeAge) {
-        return latestFrameMs >= 40.0
+        return latestFrameMs >= Math.max(40.0, targetFrameBudgetMs() * 2.0)
                 || recentSpikeAge <= 5000L
                 || snapshot.stutterScore() >= 10.0
                 || (highestFinding != null && severityRank(highestFinding.severity()) >= 1);
@@ -355,8 +354,40 @@ public final class HudOverlayRenderer {
         int labelWidth = Math.min(preferredLabelWidth, maxLabelWidth);
         int valueX = x + labelWidth;
         int valueWidth = Math.max(24, width - (valueX - x) - VALUE_RIGHT_PADDING);
+        if (entry.segments() != null && !entry.segments().isEmpty()) {
+            drawSegmentedValue(ctx, textRenderer, valueX, y, valueWidth, entry.segments(), entry.color());
+            return;
+        }
         String value = trimWithEllipsis(textRenderer, entry.value(), valueWidth);
         ctx.drawText(textRenderer, value, valueX, y, entry.color(), false);
+    }
+
+    private static void drawSegmentedValue(DrawContext ctx, TextRenderer textRenderer, int x, int y, int width, List<ValueSegment> segments, int fallbackColor) {
+        int usedWidth = 0;
+        for (int i = 0; i < segments.size(); i++) {
+            int remainingWidth = width - usedWidth;
+            if (remainingWidth <= 0) {
+                return;
+            }
+            ValueSegment segment = segments.get(i);
+            String text = segment.text();
+            if (text == null || text.isEmpty()) {
+                continue;
+            }
+            boolean last = i == segments.size() - 1;
+            String shown = last ? trimWithEllipsis(textRenderer, text, remainingWidth) : textRenderer.trimToWidth(text, remainingWidth);
+            if (shown.isEmpty()) {
+                return;
+            }
+            ctx.drawText(textRenderer, shown, x + usedWidth, y, segment.color(), false);
+            usedWidth += textRenderer.getWidth(shown);
+            if (!shown.equals(text)) {
+                return;
+            }
+        }
+        if (usedWidth == 0) {
+            ctx.drawText(textRenderer, trimWithEllipsis(textRenderer, "n/a", width), x, y, fallbackColor, false);
+        }
     }
 
     private static String trimWithEllipsis(TextRenderer textRenderer, String value, int width) {
@@ -375,34 +406,53 @@ public final class HudOverlayRenderer {
     }
 
     private static String displayedFpsText(FrameTimelineProfiler frame) {
-        return displayedFpsText;
+        return displayedMetric("fps.primary", () -> {
+            long now = System.currentTimeMillis();
+            return format0(frame.getCurrentFps()) + " now | " + format0(frame.getAverageFps()) + " avg" + rateSuffix("fps", frame.getCurrentFps(), now, "fps/s", ConfigManager.isHudShowFpsRateOfChange());
+        });
     }
 
     private static String displayedLowFpsText(FrameTimelineProfiler frame) {
-        return displayedLowFpsText;
+        return displayedMetric("fps.lows", () -> "1% " + format0(frame.getOnePercentLowFps()) + " | 0.1% " + format0(frame.getPointOnePercentLowFps()));
     }
 
     private static String displayedMemoryText(MemoryProfiler.Snapshot memory) {
-        return displayedMemoryText;
+        return displayedMetric("memory.primary", () -> formatMemoryDisplay(memory, System.currentTimeMillis()));
     }
 
-    private static void refreshDisplayedFps(FrameTimelineProfiler frame) {
-        long now = System.currentTimeMillis();
-        if (lastDisplayedFpsUpdateAtMillis != 0L && now - lastDisplayedFpsUpdateAtMillis < ConfigManager.getMetricsUpdateIntervalMs()) {
-            return;
-        }
-        lastDisplayedFpsUpdateAtMillis = now;
-        displayedFpsText = format0(frame.getCurrentFps()) + " now | " + format0(frame.getAverageFps()) + " avg" + rateSuffix("fps", frame.getCurrentFps(), now, "fps/s", ConfigManager.isHudShowFpsRateOfChange());
-        displayedLowFpsText = "1% " + format0(frame.getOnePercentLowFps()) + " | 0.1% " + format0(frame.getPointOnePercentLowFps());
+    private static void refreshDisplayedMetrics(FrameTimelineProfiler frame, MemoryProfiler.Snapshot memory, ProfilerManager.ProfilerSnapshot snapshot, SystemMetricsProfiler.Snapshot system) {
+        displayedFpsText(frame);
+        displayedLowFpsText(frame);
+        displayedMemoryText(memory);
+        displayedMetric("frame.stats", () -> compactFrameText(frame));
+        displayedMetric("frame.budget", () -> frameBudgetText(frame));
+        displayedMetric("tick.client", () -> tickText("tick.client", TickProfiler.getInstance().getAverageClientTickNs() / 1_000_000.0));
+        displayedMetric("tick.server", () -> tickText("tick.server", TickProfiler.getInstance().getAverageServerTickNs() / 1_000_000.0));
+        displayedMetric("vram", () -> vramText(system));
+        displayedMetric("network", () -> networkText(system));
+        displayedMetric("chunk.activity", () -> chunkActivityText(system));
+        displayedMetric("world.entities", () -> worldEntitiesText(snapshot));
+        displayedMetric("world.chunks", () -> worldChunksText(snapshot));
+        displayedMetric("disk.io", () -> diskIoText(system));
+        displayedMetric("input.latency", () -> inputLatencyText(system));
+        displayedMetric("logic.main", () -> shorten(system.mainLogicSummary().replace("Main Logic: ", ""), 36));
+        displayedMetric("logic.background", () -> shorten(system.backgroundSummary().replace("Background: ", ""), 36));
+        displayedMetric("session", () -> formatDuration(snapshot.sessionLoggingElapsedMillis()) + " / " + formatDuration(ConfigManager.getSessionDurationSeconds() * 1000L));
     }
 
-    private static void refreshDisplayedMemory(MemoryProfiler.Snapshot memory) {
+    private static String displayedMetric(String key, Supplier<String> supplier) {
         long now = System.currentTimeMillis();
-        if (lastDisplayedMemoryUpdateAtMillis != 0L && now - lastDisplayedMemoryUpdateAtMillis < ConfigManager.getMetricsUpdateIntervalMs()) {
-            return;
+        DisplayCacheEntry cached = displayCache.get(key);
+        if (cached != null && !shouldRefreshDisplayedMetric(now, cached.updatedAtMillis(), ConfigManager.getMetricsUpdateIntervalMs())) {
+            return cached.value();
         }
-        lastDisplayedMemoryUpdateAtMillis = now;
-        displayedMemoryText = formatMemoryDisplay(memory, now);
+        String value = supplier.get();
+        displayCache.put(key, new DisplayCacheEntry(now, value));
+        return value;
+    }
+
+    static boolean shouldRefreshDisplayedMetric(long nowMillis, long lastUpdatedMillis, int intervalMillis) {
+        return lastUpdatedMillis == 0L || nowMillis - lastUpdatedMillis >= intervalMillis;
     }
 
     private static String compactFrameText(FrameTimelineProfiler frame) {
@@ -427,10 +477,10 @@ public final class HudOverlayRenderer {
             return base;
         }
         double rateMbPerSecond = computeAverageAllocationRateMbPerSecond();
-        if ((Double.isNaN(rateMbPerSecond) || Math.abs(rateMbPerSecond) < 0.05) && !ConfigManager.isHudShowZeroRateOfChange()) {
+        if ((Double.isNaN(rateMbPerSecond) || rateMbPerSecond < 0.05) && !ConfigManager.isHudShowZeroRateOfChange()) {
             return base;
         }
-        return base + " (" + signedRateText(rateMbPerSecond) + ")";
+        return base + " (alloc " + allocationRateText(rateMbPerSecond) + ")";
     }
 
     private static String formatUtilAndTemp(SystemMetricsProfiler.Snapshot system, boolean cpu) {
@@ -456,18 +506,19 @@ public final class HudOverlayRenderer {
 
     private static Entry buildAutoFocusEntry(ProfilerManager profilerManager, ProfilerManager.ProfilerSnapshot snapshot, ProfilerManager.RuleFinding highestFinding, double latestFrameMs, int alertColor) {
         if (highestFinding != null) {
-            return new Entry("Focus", shorten(highestFinding.category() + ": " + highestFinding.message(), 72), alertColor, true);
+            return new Entry("Focus", displayedMetric("focus.auto.finding", () -> shorten(highestFinding.category() + ": " + highestFinding.message(), 72)), alertColor, true);
         }
         if (!snapshot.spikes().isEmpty()) {
             ProfilerManager.SpikeCapture latestSpike = snapshot.spikes().get(0);
-            return new Entry("Focus", "Spike " + format1(latestSpike.frameDurationMs()) + " ms | " + shorten(latestSpike.likelyBottleneck(), 40), alertColor, true);
+            return new Entry("Focus", displayedMetric("focus.auto.spike", () -> "Spike " + format1(latestSpike.frameDurationMs()) + " ms | " + shorten(latestSpike.likelyBottleneck(), 40)), alertColor, true);
         }
         String bottleneck = profilerManager.getCurrentBottleneckLabel();
         if (bottleneck != null && !bottleneck.isBlank()) {
-            return new Entry("Focus", shorten(bottleneck, 72), alertColor, true);
+            return new Entry("Focus", displayedMetric("focus.auto.bottleneck", () -> shorten(bottleneck, 72)), alertColor, true);
         }
-        if (latestFrameMs > 16.7) {
-            return new Entry("Focus", "Frame budget exceeded by " + format1(Math.max(0.0, latestFrameMs - 16.7)) + " ms", alertColor, true);
+        double targetFrameMs = targetFrameBudgetMs();
+        if (latestFrameMs > targetFrameMs) {
+            return new Entry("Focus", displayedMetric("focus.auto.budget", () -> "Frame budget exceeded by " + format1(Math.max(0.0, latestFrameMs - targetFrameMs)) + " ms"), alertColor, true);
         }
         return null;
     }
@@ -475,9 +526,10 @@ public final class HudOverlayRenderer {
     private static String frameBudgetText(FrameTimelineProfiler frame) {
         long now = System.currentTimeMillis();
         double currentFrameMs = frame.getLatestFrameNs() / 1_000_000.0;
-        double overBudgetMs = currentFrameMs - 16.7;
+        double targetFrameMs = targetFrameBudgetMs();
+        double overBudgetMs = currentFrameMs - targetFrameMs;
         String budgetState = overBudgetMs > 0.0 ? "+" + format1(overBudgetMs) + " over" : format1(Math.abs(overBudgetMs)) + " headroom";
-        return format1(currentFrameMs) + "/16.7 ms | " + budgetState + rateSuffix("frame.budget", currentFrameMs, now, "ms/s", ConfigManager.isHudShowFrameRateOfChange());
+        return format1(currentFrameMs) + "/" + format1(targetFrameMs) + " ms | " + budgetState + rateSuffix("frame.budget", currentFrameMs, now, "ms/s", ConfigManager.isHudShowFrameRateOfChange());
     }
 
     private static String vramText(SystemMetricsProfiler.Snapshot system) {
@@ -537,7 +589,7 @@ public final class HudOverlayRenderer {
         if (!ConfigManager.isHudBudgetColorMode()) {
             return TEXT;
         }
-        double warnThreshold = server ? 30.0 : 16.7;
+        double warnThreshold = server ? 30.0 : targetFrameBudgetMs();
         double errorThreshold = server ? 50.0 : 25.0;
         double criticalThreshold = server ? 75.0 : 40.0;
         return severityColorForValue(millis, warnThreshold, errorThreshold, criticalThreshold, TEXT);
@@ -601,7 +653,12 @@ public final class HudOverlayRenderer {
         if (!ConfigManager.isHudBudgetColorMode()) {
             return TEXT;
         }
-        return severityColorForValue(frameMs, 16.7, 25.0, 40.0, TEXT);
+        double targetFrameMs = targetFrameBudgetMs();
+        return severityColorForValue(frameMs, targetFrameMs, targetFrameMs * 1.5, Math.max(40.0, targetFrameMs * 2.5), TEXT);
+    }
+
+    private static double targetFrameBudgetMs() {
+        return ConfigManager.getFrameBudgetTargetFrameMs();
     }
 
     private static int severityColorForValue(double value, double warnThreshold, double errorThreshold, double criticalThreshold, int normalColor) {
@@ -704,19 +761,29 @@ public final class HudOverlayRenderer {
         if (memoryRateSamples.size() < 2) {
             return Double.NaN;
         }
-        MemoryRateSample first = memoryRateSamples.peekFirst();
-        MemoryRateSample last = memoryRateSamples.peekLast();
-        if (first == null || last == null) {
+        long totalAllocatedBytes = 0L;
+        long totalElapsedMillis = 0L;
+        MemoryRateSample previous = null;
+        for (MemoryRateSample sample : memoryRateSamples) {
+            if (previous != null) {
+                long elapsedMillis = Math.max(1L, sample.capturedAtMillis() - previous.capturedAtMillis());
+                long allocatedBytes = Math.max(0L, sample.usedBytes() - previous.usedBytes());
+                totalAllocatedBytes += allocatedBytes;
+                totalElapsedMillis += elapsedMillis;
+            }
+            previous = sample;
+        }
+        if (totalElapsedMillis <= 0L) {
             return Double.NaN;
         }
-        long elapsedMillis = Math.max(1L, last.capturedAtMillis() - first.capturedAtMillis());
-        double deltaMb = (last.usedBytes() - first.usedBytes()) / (1024.0 * 1024.0);
-        return deltaMb * 1000.0 / elapsedMillis;
+        return (totalAllocatedBytes / (1024.0 * 1024.0)) * 1000.0 / totalElapsedMillis;
     }
 
-    private static String signedRateText(double rateMbPerSecond) {
-        String prefix = rateMbPerSecond > 0.0 ? "+" : "-";
-        return prefix + format1(Math.abs(rateMbPerSecond)) + " MB/s";
+    private static String allocationRateText(double rateMbPerSecond) {
+        if (!Double.isFinite(rateMbPerSecond) || rateMbPerSecond < 0.05) {
+            return "0.0 MB/s";
+        }
+        return format1(Math.max(0.0, rateMbPerSecond)) + " MB/s";
     }
 
     private static String signedSensorRate(double value, String units) {
@@ -755,6 +822,56 @@ public final class HudOverlayRenderer {
         String writeRate = optionalRateSuffix("disk.write", system.diskWriteBytesPerSecond(), now, "B/s/s");
         String combined = joinRateParts(readRate, writeRate);
         return "R " + read + " | W " + write + appendSuffix(combined);
+    }
+
+    private static Entry networkEntry(SystemMetricsProfiler.Snapshot system) {
+        return new Entry("Network", displayedMetric("network", () -> networkText(system)), networkColor(system), true, networkSegments(system));
+    }
+
+    private static Entry diskEntry(SystemMetricsProfiler.Snapshot system) {
+        return new Entry("Disk I/O", displayedMetric("disk.io", () -> diskIoText(system)), DIM, true, diskSegments(system));
+    }
+
+    private static List<ValueSegment> networkSegments(SystemMetricsProfiler.Snapshot system) {
+        return List.of(
+                new ValueSegment("IN ", FLOW_IN),
+                new ValueSegment(compactIo(system.bytesReceivedPerSecond()), FLOW_IN),
+                new ValueSegment(" | ", TEXT),
+                new ValueSegment("OUT ", FLOW_OUT),
+                new ValueSegment(compactIo(system.bytesSentPerSecond()), FLOW_OUT),
+                new ValueSegment(networkRateSuffixText(system), DIM)
+        );
+    }
+
+    private static List<ValueSegment> diskSegments(SystemMetricsProfiler.Snapshot system) {
+        return List.of(
+                new ValueSegment("R ", FLOW_IN),
+                new ValueSegment(compactIo(system.diskReadBytesPerSecond()), FLOW_IN),
+                new ValueSegment(" | ", TEXT),
+                new ValueSegment("W ", FLOW_OUT),
+                new ValueSegment(compactIo(system.diskWriteBytesPerSecond()), FLOW_OUT),
+                new ValueSegment(diskRateSuffixText(system), DIM)
+        );
+    }
+
+    private static String networkRateSuffixText(SystemMetricsProfiler.Snapshot system) {
+        if (!ConfigManager.isHudShowNetworkRateOfChange()) {
+            return "";
+        }
+        long now = System.currentTimeMillis();
+        String downRate = optionalByteRateSuffix("network.down", system.bytesReceivedPerSecond(), now, "/s/s");
+        String upRate = optionalByteRateSuffix("network.up", system.bytesSentPerSecond(), now, "/s/s");
+        return appendSuffix(joinRateParts(downRate, upRate));
+    }
+
+    private static String diskRateSuffixText(SystemMetricsProfiler.Snapshot system) {
+        if (!ConfigManager.isHudShowDiskIoRateOfChange()) {
+            return "";
+        }
+        long now = System.currentTimeMillis();
+        String readRate = optionalRateSuffix("disk.read", system.diskReadBytesPerSecond(), now, "B/s/s");
+        String writeRate = optionalRateSuffix("disk.write", system.diskWriteBytesPerSecond(), now, "B/s/s");
+        return appendSuffix(joinRateParts(readRate, writeRate));
     }
 
     private static String tickText(String key, double millis) {
@@ -889,13 +1006,22 @@ public final class HudOverlayRenderer {
         return (color & 0x00FFFFFF) | (scaledAlpha << 24);
     }
 
-    private record Entry(String label, String value, int color, boolean fullWidth) {
+    private record Entry(String label, String value, int color, boolean fullWidth, List<ValueSegment> segments) {
+        private Entry(String label, String value, int color, boolean fullWidth) {
+            this(label, value, color, fullWidth, null);
+        }
     }
 
     private record Row(List<Entry> entries, boolean fullWidth) {
     }
 
     private record MemoryRateSample(long capturedAtMillis, long usedBytes) {
+    }
+
+    private record DisplayCacheEntry(long updatedAtMillis, String value) {
+    }
+
+    private record ValueSegment(String text, int color) {
     }
 
     private record RateSample(long capturedAtMillis, double value, String displaySuffix) {
@@ -907,3 +1033,5 @@ public final class HudOverlayRenderer {
         }
     }
 }
+
+

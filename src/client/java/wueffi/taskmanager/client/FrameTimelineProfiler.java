@@ -9,6 +9,7 @@ public class FrameTimelineProfiler {
 
     private static final int SIZE = 300;
     private static final long FPS_WINDOW_NS = 250_000_000L;
+    private static final long AVERAGE_FPS_WINDOW_NS = 1_500_000_000L;
 
     private final long[] frameTimes = new long[SIZE];
     private final long[] frameTimestamps = new long[SIZE];
@@ -89,6 +90,15 @@ public class FrameTimelineProfiler {
     }
 
     public double getAverageFps() {
+        if (count == 0) {
+            return 0.0;
+        }
+        int latestIndex = (index - 1 + SIZE) % SIZE;
+        long latestTimestamp = frameTimestamps[latestIndex];
+        double rollingAverage = computeAverageFpsOverWindow(latestTimestamp, latestIndex, count, AVERAGE_FPS_WINDOW_NS);
+        if (rollingAverage > 0.0) {
+            return rollingAverage;
+        }
         long averageFrameNs = getAverageFrameNs();
         if (averageFrameNs <= 0L) {
             return 0.0;
@@ -208,6 +218,32 @@ public class FrameTimelineProfiler {
             return 0.0;
         }
         return (last - first) / 1_000_000_000.0;
+    }
+
+    private double computeAverageFpsOverWindow(long endTimestampNs, int newestIndex, int availableSamples, long windowNs) {
+        if (availableSamples <= 0 || endTimestampNs <= 0L) {
+            return 0.0;
+        }
+        long windowStartNs = endTimestampNs - Math.max(windowNs, FPS_WINDOW_NS);
+        long totalFrameNs = 0L;
+        int framesInWindow = 0;
+        for (int i = 0; i < availableSamples; i++) {
+            int candidateIndex = (newestIndex - i + SIZE) % SIZE;
+            long candidateTimestamp = frameTimestamps[candidateIndex];
+            long candidateFrameNs = frameTimes[candidateIndex];
+            if (candidateTimestamp <= 0L || candidateFrameNs <= 0L) {
+                break;
+            }
+            if (candidateTimestamp < windowStartNs) {
+                break;
+            }
+            totalFrameNs += candidateFrameNs;
+            framesInWindow++;
+        }
+        if (framesInWindow <= 0 || totalFrameNs <= 0L) {
+            return 0.0;
+        }
+        return framesInWindow * 1_000_000_000.0 / totalFrameNs;
     }
 
     private double computeRollingFps(long endTimestampNs, int newestIndex, int availableSamples) {

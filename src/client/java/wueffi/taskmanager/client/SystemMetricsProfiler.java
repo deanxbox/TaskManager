@@ -167,6 +167,7 @@ public class SystemMetricsProfiler {
     private final double[] loadedChunkHistory = new double[HISTORY_SIZE];
     private final double[] renderedChunkHistory = new double[HISTORY_SIZE];
     private final WindowsTelemetryBridge windowsBridge = new WindowsTelemetryBridge();
+    private final NativeWindowsSensors nativeWindowsSensors = new NativeWindowsSensors();
     private int historyIndex;
     private int historyCount;
 
@@ -174,10 +175,10 @@ public class SystemMetricsProfiler {
     private long lastSampleAtMillis;
     private int lastSampleIntervalMillis = ConfigManager.getMetricsUpdateIntervalMs();
     private long lastDirectMemoryUsedBytes = -1L;
-    private double lastCpuLoadPercent = Double.NaN;
-    private double lastGpuLoadPercent = Double.NaN;
-    private double lastCpuTemperatureC = Double.NaN;
-    private double lastGpuTemperatureC = Double.NaN;
+    private final TrendTracker cpuLoadTrendTracker = new TrendTracker(1_000L, 100.0);
+    private final TrendTracker gpuLoadTrendTracker = new TrendTracker(1_000L, 100.0);
+    private final TrendTracker cpuTemperatureTrendTracker = new TrendTracker(2_000L, 30.0);
+    private final TrendTracker gpuTemperatureTrendTracker = new TrendTracker(2_000L, 30.0);
     private double lastPlayerX;
     private double lastPlayerY;
     private double lastPlayerZ;
@@ -225,6 +226,8 @@ public class SystemMetricsProfiler {
 
         windowsBridge.requestRefreshIfNeeded();
         WindowsTelemetryBridge.Sample bridgeSample = windowsBridge.getLatest();
+        NativeWindowsSensors.Sample nativeSample = nativeWindowsSensors.sample(renderer, vendor);
+        WindowsTelemetryBridge.Sample mergedSample = mergeTelemetrySamples(bridgeSample, nativeSample);
         Map<String, ThreadLoadProfiler.ThreadSnapshot> threadDetails = new LinkedHashMap<>(ThreadLoadProfiler.getInstance().getLatestThreadSnapshots());
         Map<String, Double> threadLoads = new LinkedHashMap<>();
         threadDetails.forEach((name, details) -> threadLoads.put(name, details.loadPercent()));
@@ -239,7 +242,7 @@ public class SystemMetricsProfiler {
         int idleWorkers = countWorkers(threadDetails, false);
         double workerRatio = idleWorkers > 0 ? activeWorkers / (double) idleWorkers : activeWorkers;
         int totalEntities = entityCounts.totalEntities();
-        double bytesPerEntity = totalEntities > 0 && bridgeSample.bytesReceivedPerSecond() >= 0 ? bridgeSample.bytesReceivedPerSecond() / (double) totalEntities : -1.0;
+        double bytesPerEntity = totalEntities > 0 && mergedSample.bytesReceivedPerSecond() >= 0 ? mergedSample.bytesReceivedPerSecond() / (double) totalEntities : -1.0;
         NetworkPacketProfiler.Snapshot latestPacketSnapshot = NetworkPacketProfiler.getInstance().getLatestSnapshot();
         long packetVolume = latestPacketSnapshot.inboundPackets() + latestPacketSnapshot.outboundPackets();
         double packetProcessingLatencyMs = packetVolume > 0 ? Math.min(250.0, (packetVolume / 20.0) + (TickProfiler.getInstance().getAverageClientTickNs() / 1_000_000.0 * 0.25)) : -1.0;
@@ -257,14 +260,10 @@ public class SystemMetricsProfiler {
         PlayerMotionSnapshot motion = samplePlayerMotion(now);
         List<ProfilerManager.HotChunkSnapshot> hotChunks = ProfilerManager.getInstance().getLatestHotChunks();
         int maxEntitiesInHotChunk = hotChunks.isEmpty() ? 0 : hotChunks.getFirst().entityCount();
-        double cpuLoadChangePerSecond = computeDeltaPerSecond(bridgeSample.cpuCoreLoadPercent(), lastCpuLoadPercent, elapsedMillis);
-        double gpuLoadChangePerSecond = computeDeltaPerSecond(bridgeSample.gpuCoreLoadPercent(), lastGpuLoadPercent, elapsedMillis);
-        double cpuTemperatureChangePerSecond = computeDeltaPerSecond(bridgeSample.cpuTemperatureC(), lastCpuTemperatureC, elapsedMillis);
-        double gpuTemperatureChangePerSecond = computeDeltaPerSecond(bridgeSample.gpuTemperatureC(), lastGpuTemperatureC, elapsedMillis);
-        lastCpuLoadPercent = bridgeSample.cpuCoreLoadPercent();
-        lastGpuLoadPercent = bridgeSample.gpuCoreLoadPercent();
-        lastCpuTemperatureC = bridgeSample.cpuTemperatureC();
-        lastGpuTemperatureC = bridgeSample.gpuTemperatureC();
+        double cpuLoadChangePerSecond = cpuLoadTrendTracker.update(mergedSample.cpuCoreLoadPercent(), now);
+        double gpuLoadChangePerSecond = gpuLoadTrendTracker.update(mergedSample.gpuCoreLoadPercent(), now);
+        double cpuTemperatureChangePerSecond = cpuTemperatureTrendTracker.update(mergedSample.cpuTemperatureC(), now);
+        double gpuTemperatureChangePerSecond = gpuTemperatureTrendTracker.update(mergedSample.gpuTemperatureC(), now);
 
         snapshot = new Snapshot(
                 vendor,
@@ -276,29 +275,29 @@ public class SystemMetricsProfiler {
                 committedVirtualMemoryBytes,
                 directMemoryUsedBytes,
                 directMemoryMaxBytes,
-                bridgeSample.bridgeActive(),
-                bridgeSample.counterSource(),
-                bridgeSample.sensorSource(),
-                bridgeSample.sensorErrorCode(),
-                buildCpuTemperatureUnavailableReason(bridgeSample),
-                bridgeSample.cpuCoreLoadPercent(),
-                bridgeSample.gpuCoreLoadPercent(),
-                bridgeSample.gpuTemperatureC(),
-                bridgeSample.cpuTemperatureC(),
+                mergedSample.bridgeActive(),
+                mergedSample.counterSource(),
+                mergedSample.sensorSource(),
+                mergedSample.sensorErrorCode(),
+                buildCpuTemperatureUnavailableReason(mergedSample),
+                mergedSample.cpuCoreLoadPercent(),
+                mergedSample.gpuCoreLoadPercent(),
+                mergedSample.gpuTemperatureC(),
+                mergedSample.cpuTemperatureC(),
                 cpuLoadChangePerSecond,
                 gpuLoadChangePerSecond,
                 cpuTemperatureChangePerSecond,
                 gpuTemperatureChangePerSecond,
                 InputLatencyProfiler.getInstance().getLastPresentedLatencyMs(),
-                bridgeSample.bytesReceivedPerSecond(),
-                bridgeSample.bytesSentPerSecond(),
-                bridgeSample.diskReadBytesPerSecond(),
-                bridgeSample.diskWriteBytesPerSecond(),
+                mergedSample.bytesReceivedPerSecond(),
+                mergedSample.bytesSentPerSecond(),
+                mergedSample.diskReadBytesPerSecond(),
+                mergedSample.diskWriteBytesPerSecond(),
                 threadLoads,
                 threadDetails,
                 buildSchedulingConflictSummary(threadDetails),
                 buildParallelismFlag(threadDetails),
-                buildCpuSensorStatus(bridgeSample.sensorSource()),
+                buildCpuSensorStatus(mergedSample.sensorSource()),
                 countHighLoadThreads(threadDetails),
                 estimatePhysicalCores(),
                 buildMainLogicSummary(threadDetails),
@@ -380,11 +379,46 @@ public class SystemMetricsProfiler {
         history[historyIndex] = value;
     }
 
-    private double computeDeltaPerSecond(double currentValue, double previousValue, long elapsedMillis) {
-        if (!Double.isFinite(currentValue) || currentValue < 0.0 || !Double.isFinite(previousValue) || previousValue < 0.0 || elapsedMillis <= 0L) {
-            return 0.0;
+    private static final class TrendTracker {
+        private final long windowMillis;
+        private final double clampMagnitude;
+        private long baselineAtMillis;
+        private double baselineValue = Double.NaN;
+        private double lastRate;
+
+        private TrendTracker(long windowMillis, double clampMagnitude) {
+            this.windowMillis = windowMillis;
+            this.clampMagnitude = clampMagnitude;
         }
-        return (currentValue - previousValue) * 1000.0 / elapsedMillis;
+
+        private double update(double currentValue, long now) {
+            if (!Double.isFinite(currentValue) || currentValue < 0.0) {
+                return 0.0;
+            }
+            if (!Double.isFinite(baselineValue) || baselineAtMillis <= 0L) {
+                baselineValue = currentValue;
+                baselineAtMillis = now;
+                lastRate = 0.0;
+                return 0.0;
+            }
+            long elapsedMillis = Math.max(1L, now - baselineAtMillis);
+            if (elapsedMillis < windowMillis) {
+                return lastRate;
+            }
+            double rawRate = (currentValue - baselineValue) * 1000.0 / elapsedMillis;
+            baselineValue = currentValue;
+            baselineAtMillis = now;
+            if (!Double.isFinite(rawRate)) {
+                lastRate = 0.0;
+                return 0.0;
+            }
+            double smoothedRate = (lastRate * 0.6) + (rawRate * 0.4);
+            lastRate = Math.max(-clampMagnitude, Math.min(clampMagnitude, smoothedRate));
+            if (Math.abs(lastRate) < 0.05) {
+                lastRate = 0.0;
+            }
+            return lastRate;
+        }
     }
 
     private void advanceHistory() {
@@ -476,6 +510,57 @@ public class SystemMetricsProfiler {
 
 
 
+    private WindowsTelemetryBridge.Sample mergeTelemetrySamples(WindowsTelemetryBridge.Sample bridgeSample, NativeWindowsSensors.Sample nativeSample) {
+        if (bridgeSample == null) {
+            bridgeSample = WindowsTelemetryBridge.Sample.empty();
+        }
+        if (nativeSample == null) {
+            nativeSample = NativeWindowsSensors.Sample.empty();
+        }
+        return new WindowsTelemetryBridge.Sample(
+                bridgeSample.bridgeActive() || nativeSample.active(),
+                chooseTelemetryText(nativeSample.counterSource(), bridgeSample.counterSource(), "Unavailable"),
+                chooseTelemetryText(nativeSample.sensorSource(), bridgeSample.sensorSource(), "Unavailable"),
+                mergeTelemetryErrors(nativeSample.sensorErrorCode(), bridgeSample.sensorErrorCode()),
+                chooseTelemetryDouble(nativeSample.cpuCoreLoadPercent(), bridgeSample.cpuCoreLoadPercent()),
+                chooseTelemetryDouble(nativeSample.gpuCoreLoadPercent(), bridgeSample.gpuCoreLoadPercent()),
+                chooseTelemetryDouble(nativeSample.gpuTemperatureC(), bridgeSample.gpuTemperatureC()),
+                chooseTelemetryDouble(nativeSample.cpuTemperatureC(), bridgeSample.cpuTemperatureC()),
+                bridgeSample.bytesReceivedPerSecond(),
+                bridgeSample.bytesSentPerSecond(),
+                bridgeSample.diskReadBytesPerSecond(),
+                bridgeSample.diskWriteBytesPerSecond()
+        );
+    }
+
+    private String chooseTelemetryText(String preferred, String fallback, String defaultValue) {
+        if (preferred != null && !preferred.isBlank() && !preferred.equalsIgnoreCase("Unavailable") && !preferred.equalsIgnoreCase("No bridge data")) {
+            return preferred;
+        }
+        if (fallback != null && !fallback.isBlank() && !fallback.equalsIgnoreCase("Unavailable") && !fallback.equalsIgnoreCase("No bridge data")) {
+            return fallback;
+        }
+        return defaultValue;
+    }
+
+    private String mergeTelemetryErrors(String preferred, String fallback) {
+        boolean hasPreferred = preferred != null && !preferred.isBlank() && !preferred.equalsIgnoreCase("none") && !preferred.equalsIgnoreCase("No bridge data");
+        boolean hasFallback = fallback != null && !fallback.isBlank() && !fallback.equalsIgnoreCase("none") && !fallback.equalsIgnoreCase("No bridge data");
+        if (hasPreferred && hasFallback) {
+            return preferred + " | fallback: " + fallback;
+        }
+        if (hasPreferred) {
+            return preferred;
+        }
+        if (hasFallback) {
+            return fallback;
+        }
+        return "none";
+    }
+
+    private double chooseTelemetryDouble(double preferred, double fallback) {
+        return Double.isFinite(preferred) && preferred >= 0.0 ? preferred : fallback;
+    }
     private String buildCpuTemperatureUnavailableReason(WindowsTelemetryBridge.Sample bridgeSample) {
         if (bridgeSample.cpuTemperatureC() >= 0) {
             return "CPU temperature provider active";
@@ -736,6 +821,11 @@ public class SystemMetricsProfiler {
         return value == null ? "" : value;
     }
 }
+
+
+
+
+
 
 
 

@@ -1,7 +1,12 @@
 package wueffi.taskmanager.client;
 
+import net.fabricmc.loader.api.FabricLoader;
+
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.LongAdder;
 
@@ -15,14 +20,22 @@ public class RenderPhaseProfiler {
         final LongAdder cpuCalls = new LongAdder();
         final LongAdder gpuNanos = new LongAdder();
         final LongAdder gpuCalls = new LongAdder();
+        volatile String ownerMod;
     }
 
-    public record PhaseSnapshot(long cpuNanos, long cpuCalls, long gpuNanos, long gpuCalls) {}
+    public record PhaseSnapshot(long cpuNanos, long cpuCalls, long gpuNanos, long gpuCalls, String ownerMod) {}
 
     private final Map<String, Counter> counters = new ConcurrentHashMap<>();
     private final Map<String, Long> cpuStart = new ConcurrentHashMap<>();
+    private volatile Set<String> knownModIds;
 
     public void beginCpuPhase(String phase) {
+        ensureCounter(phase);
+        cpuStart.put(phase, System.nanoTime());
+    }
+
+    public void beginCpuPhase(String phase, String ownerMod) {
+        ensureCounter(phase, ownerMod);
         cpuStart.put(phase, System.nanoTime());
     }
 
@@ -31,15 +44,19 @@ public class RenderPhaseProfiler {
         if (start == null) return;
 
         long duration = System.nanoTime() - start;
-        Counter counter = counters.computeIfAbsent(phase, ignored -> new Counter());
+        Counter counter = ensureCounter(phase);
         counter.cpuNanos.add(duration);
         counter.cpuCalls.increment();
     }
 
     public void recordGpuResult(String phase, long nanoseconds) {
-        Counter counter = counters.computeIfAbsent(phase, ignored -> new Counter());
+        Counter counter = ensureCounter(phase);
         counter.gpuNanos.add(nanoseconds);
         counter.gpuCalls.increment();
+    }
+
+    public void registerPhaseOwner(String phase, String ownerMod) {
+        ensureCounter(phase, ownerMod);
     }
 
     public Map<String, PhaseSnapshot> getSnapshot() {
@@ -48,7 +65,8 @@ public class RenderPhaseProfiler {
                 counter.cpuNanos.sum(),
                 counter.cpuCalls.sum(),
                 counter.gpuNanos.sum(),
-                counter.gpuCalls.sum()
+                counter.gpuCalls.sum(),
+                counter.ownerMod
         )));
         return result;
     }
@@ -86,5 +104,69 @@ public class RenderPhaseProfiler {
     public void reset() {
         counters.clear();
         cpuStart.clear();
+    }
+
+    private Counter ensureCounter(String phase) {
+        return ensureCounter(phase, resolveOwnerMod(phase));
+    }
+
+    private Counter ensureCounter(String phase, String ownerMod) {
+        Counter counter = counters.computeIfAbsent(phase, ignored -> new Counter());
+        if (counter.ownerMod == null || counter.ownerMod.isBlank() || counter.ownerMod.startsWith("shared/")) {
+            counter.ownerMod = normalizeOwnerMod(ownerMod);
+        }
+        return counter;
+    }
+
+    private String normalizeOwnerMod(String ownerMod) {
+        if (ownerMod == null || ownerMod.isBlank()) {
+            return "shared/render";
+        }
+        return ownerMod;
+    }
+
+    private String resolveOwnerMod(String phase) {
+        if (phase == null || phase.isBlank()) {
+            return "shared/render";
+        }
+        String normalized = phase.toLowerCase(Locale.ROOT);
+        if (normalized.startsWith("minecraft.") || normalized.startsWith("minecraft:")) {
+            return "minecraft";
+        }
+        if (normalized.startsWith("frame.") || normalized.startsWith("gamerenderer.") || normalized.startsWith("worldrenderer.") || normalized.startsWith("sky.")) {
+            return "minecraft";
+        }
+        int separator = normalized.indexOf(':');
+        if (separator > 0) {
+            String namespace = normalized.substring(0, separator);
+            if (getKnownModIds().contains(namespace)) {
+                return namespace;
+            }
+        }
+        String tokenized = normalized.replace('/', '.').replace('\\', '.').replace('$', '.').replace(':', '.').replace('-', '_');
+        for (String token : tokenized.split("[^a-z0-9_]+")) {
+            if (!token.isBlank() && getKnownModIds().contains(token)) {
+                return token;
+            }
+        }
+        for (String modId : getKnownModIds()) {
+            String candidate = modId.replace('-', '_');
+            if (tokenized.contains(candidate + ".") || tokenized.endsWith(candidate)) {
+                return modId;
+            }
+        }
+        return "shared/render";
+    }
+
+    private Set<String> getKnownModIds() {
+        Set<String> cached = knownModIds;
+        if (cached != null) {
+            return cached;
+        }
+        LinkedHashSet<String> ids = new LinkedHashSet<>();
+        ids.add("minecraft");
+        FabricLoader.getInstance().getAllMods().forEach(mod -> ids.add(mod.getMetadata().getId().toLowerCase(Locale.ROOT)));
+        knownModIds = ids;
+        return ids;
     }
 }

@@ -21,7 +21,7 @@ public class GameRendererMixin {
 
         FrameTimelineProfiler.getInstance().beginFrame();
         GpuTimer.collectResults();
-        RenderPhaseProfiler.getInstance().beginCpuPhase("frame.total");
+        RenderPhaseProfiler.getInstance().beginCpuPhase("frame.total", "minecraft");
     }
 
     @Inject(method = "render", at = @At("TAIL"))
@@ -36,7 +36,7 @@ public class GameRendererMixin {
     @Inject(method = "renderWorld", at = @At("HEAD"))
     private void taskmanager$onRenderWorldHead(CallbackInfo ci) {
         if (!TaskManagerScreen.isLiveMetricsActive()) return;
-        RenderPhaseProfiler.getInstance().beginCpuPhase("gameRenderer.renderWorld");
+        RenderPhaseProfiler.getInstance().beginCpuPhase("gameRenderer.renderWorld", "minecraft");
         GpuTimer.begin("gameRenderer.renderWorld");
     }
 
@@ -47,5 +47,6 @@ public class GameRendererMixin {
         RenderPhaseProfiler.getInstance().endCpuPhase("gameRenderer.renderWorld");
     }
 }
+
 
 
