@@ -75,8 +75,11 @@ public class ConfigManager {
 
     private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
     private static final int[] FRAME_BUDGET_TARGET_FPS_OPTIONS = {30, 45, 60, 72, 90, 120, 144, 165, 240};
+    private static final int[] PERFORMANCE_ALERT_FRAME_THRESHOLD_OPTIONS = {16, 20, 25, 30, 35, 40, 50};
+    private static final int[] PERFORMANCE_ALERT_SERVER_THRESHOLD_OPTIONS = {15, 20, 25, 30, 40, 50, 75};
+    private static final int[] PERFORMANCE_ALERT_CONSECUTIVE_OPTIONS = {1, 2, 3, 4, 5, 8};
     private static final Path CONFIG_PATH = resolveConfigPath();
-    private static ConfigData config = new ConfigData();
+    private static volatile ConfigData config = new ConfigData();
 
     private static Path resolveConfigPath() {
         try {
@@ -189,6 +192,47 @@ public class ConfigManager {
         saveConfig();
     }
 
+    public static boolean isPerformanceAlertsEnabled() { return config.performanceAlertsEnabled; }
+
+    public static void togglePerformanceAlertsEnabled() {
+        config.performanceAlertsEnabled = !isPerformanceAlertsEnabled();
+        saveConfig();
+    }
+
+    public static boolean isPerformanceAlertChatEnabled() { return config.performanceAlertChatEnabled; }
+
+    public static void togglePerformanceAlertChatEnabled() {
+        config.performanceAlertChatEnabled = !isPerformanceAlertChatEnabled();
+        saveConfig();
+    }
+
+    public static int getPerformanceAlertFrameThresholdMs() {
+        return Math.clamp(config.performanceAlertFrameThresholdMs, 10, 120);
+    }
+
+    public static void cyclePerformanceAlertFrameThresholdMs() {
+        config.performanceAlertFrameThresholdMs = cycleIntOption(getPerformanceAlertFrameThresholdMs(), PERFORMANCE_ALERT_FRAME_THRESHOLD_OPTIONS);
+        saveConfig();
+    }
+
+    public static int getPerformanceAlertServerThresholdMs() {
+        return Math.clamp(config.performanceAlertServerThresholdMs, 10, 200);
+    }
+
+    public static void cyclePerformanceAlertServerThresholdMs() {
+        config.performanceAlertServerThresholdMs = cycleIntOption(getPerformanceAlertServerThresholdMs(), PERFORMANCE_ALERT_SERVER_THRESHOLD_OPTIONS);
+        saveConfig();
+    }
+
+    public static int getPerformanceAlertConsecutiveTicks() {
+        return Math.clamp(config.performanceAlertConsecutiveTicks, 1, 10);
+    }
+
+    public static void cyclePerformanceAlertConsecutiveTicks() {
+        config.performanceAlertConsecutiveTicks = cycleIntOption(getPerformanceAlertConsecutiveTicks(), PERFORMANCE_ALERT_CONSECUTIVE_OPTIONS);
+        saveConfig();
+    }
+
     public static void cycleProfilerUpdateDelayMs() {
         int current = getProfilerUpdateDelayMs();
         int next = switch (current) {
@@ -280,31 +324,31 @@ public class ConfigManager {
     public static boolean isHudShowUtilization() { return config.hudShowUtilization; }
     public static boolean isHudShowTemperatures() { return config.hudShowTemperatures; }
     public static boolean isHudShowParallelism() { return config.hudShowParallelism; }
-    public static boolean isHudShowLogic() { return config.hudShowLogic == null || config.hudShowLogic; }
-    public static boolean isHudShowBackground() { return config.hudShowBackground == null || config.hudShowBackground; }
-    public static boolean isHudShowFrameBudget() { return config.hudShowFrameBudget == null || config.hudShowFrameBudget; }
+    public static boolean isHudShowLogic() { return config.hudShowLogic; }
+    public static boolean isHudShowBackground() { return config.hudShowBackground; }
+    public static boolean isHudShowFrameBudget() { return config.hudShowFrameBudget; }
     public static boolean isHudShowMemory() { return config.hudShowMemory; }
-    public static boolean isHudShowMemoryAllocationRate() { return config.hudShowMemoryAllocationRate == null || config.hudShowMemoryAllocationRate; }
-    public static boolean isHudShowVram() { return config.hudShowVram == null || config.hudShowVram; }
-    public static boolean isHudShowNetwork() { return config.hudShowNetwork != null && config.hudShowNetwork; }
-    public static boolean isHudShowChunkActivity() { return config.hudShowChunkActivity != null && config.hudShowChunkActivity; }
+    public static boolean isHudShowMemoryAllocationRate() { return config.hudShowMemoryAllocationRate; }
+    public static boolean isHudShowVram() { return config.hudShowVram; }
+    public static boolean isHudShowNetwork() { return config.hudShowNetwork; }
+    public static boolean isHudShowChunkActivity() { return config.hudShowChunkActivity; }
     public static boolean isHudShowWorld() { return config.hudShowWorld; }
-    public static boolean isHudShowDiskIo() { return config.hudShowDiskIo != null && config.hudShowDiskIo; }
-    public static boolean isHudShowInputLatency() { return config.hudShowInputLatency != null && config.hudShowInputLatency; }
+    public static boolean isHudShowDiskIo() { return config.hudShowDiskIo; }
+    public static boolean isHudShowInputLatency() { return config.hudShowInputLatency; }
     public static boolean isHudShowSession() { return config.hudShowSession; }
     public static boolean isHudShowFpsRateOfChange() { return config.hudShowFpsRateOfChange; }
     public static boolean isHudShowFrameRateOfChange() { return config.hudShowFrameRateOfChange; }
     public static boolean isHudShowTickRateOfChange() { return config.hudShowTickRateOfChange; }
     public static boolean isHudShowUtilizationRateOfChange() { return config.hudShowUtilizationRateOfChange; }
     public static boolean isHudShowWorldRateOfChange() { return config.hudShowWorldRateOfChange; }
-    public static boolean isHudShowVramRateOfChange() { return config.hudShowVramRateOfChange == null || config.hudShowVramRateOfChange; }
-    public static boolean isHudShowNetworkRateOfChange() { return config.hudShowNetworkRateOfChange == null || config.hudShowNetworkRateOfChange; }
-    public static boolean isHudShowChunkActivityRateOfChange() { return config.hudShowChunkActivityRateOfChange == null || config.hudShowChunkActivityRateOfChange; }
-    public static boolean isHudShowDiskIoRateOfChange() { return config.hudShowDiskIoRateOfChange == null || config.hudShowDiskIoRateOfChange; }
-    public static boolean isHudShowInputLatencyRateOfChange() { return config.hudShowInputLatencyRateOfChange == null || config.hudShowInputLatencyRateOfChange; }
+    public static boolean isHudShowVramRateOfChange() { return config.hudShowVramRateOfChange; }
+    public static boolean isHudShowNetworkRateOfChange() { return config.hudShowNetworkRateOfChange; }
+    public static boolean isHudShowChunkActivityRateOfChange() { return config.hudShowChunkActivityRateOfChange; }
+    public static boolean isHudShowDiskIoRateOfChange() { return config.hudShowDiskIoRateOfChange; }
+    public static boolean isHudShowInputLatencyRateOfChange() { return config.hudShowInputLatencyRateOfChange; }
     public static boolean isHudShowZeroRateOfChange() { return config.hudShowZeroRateOfChange; }
-    public static boolean isHudAutoFocusAlertRow() { return config.hudAutoFocusAlertRow == null || config.hudAutoFocusAlertRow; }
-    public static boolean isHudBudgetColorMode() { return config.hudBudgetColorMode == null || config.hudBudgetColorMode; }
+    public static boolean isHudAutoFocusAlertRow() { return config.hudAutoFocusAlertRow; }
+    public static boolean isHudBudgetColorMode() { return config.hudBudgetColorMode; }
 
     public static HudTriggerMode getHudTriggerMode() {
         try {
@@ -390,6 +434,7 @@ public class ConfigManager {
     public static String getGpuSearch() { return config.gpuSearch == null ? "" : config.gpuSearch; }
     public static String getMemorySearch() { return config.memorySearch == null ? "" : config.memorySearch; }
     public static String getStartupSearch() { return config.startupSearch == null ? "" : config.startupSearch; }
+    public static String getGlobalSearch() { return config.globalSearch == null ? "" : config.globalSearch; }
     public static String getTaskSort() { return config.taskSort == null || config.taskSort.isBlank() ? "CPU" : config.taskSort; }
     public static boolean isTaskSortDescending() { return config.taskSortDescending; }
     public static String getGpuSort() { return config.gpuSort == null || config.gpuSort.isBlank() ? "EST_GPU" : config.gpuSort; }
@@ -398,17 +443,18 @@ public class ConfigManager {
     public static boolean isMemorySortDescending() { return config.memorySortDescending; }
     public static String getStartupSort() { return config.startupSort == null || config.startupSort.isBlank() ? "ACTIVE" : config.startupSort; }
     public static boolean isStartupSortDescending() { return config.startupSortDescending; }
-    public static boolean isTaskEffectiveView() { return config.taskEffectiveView == null || config.taskEffectiveView; }
-    public static boolean isTaskShowSharedRows() { return config.taskShowSharedRows != null && config.taskShowSharedRows; }
-    public static boolean isGpuEffectiveView() { return config.gpuEffectiveView == null || config.gpuEffectiveView; }
-    public static boolean isGpuShowSharedRows() { return config.gpuShowSharedRows != null && config.gpuShowSharedRows; }
-    public static boolean isMemoryEffectiveView() { return config.memoryEffectiveView == null || config.memoryEffectiveView; }
-    public static boolean isMemoryShowSharedRows() { return config.memoryShowSharedRows != null && config.memoryShowSharedRows; }
+    public static boolean isTaskEffectiveView() { return config.taskEffectiveView; }
+    public static boolean isTaskShowSharedRows() { return config.taskShowSharedRows; }
+    public static boolean isGpuEffectiveView() { return config.gpuEffectiveView; }
+    public static boolean isGpuShowSharedRows() { return config.gpuShowSharedRows; }
+    public static boolean isMemoryEffectiveView() { return config.memoryEffectiveView; }
+    public static boolean isMemoryShowSharedRows() { return config.memoryShowSharedRows; }
 
     public static void setTasksSearch(String value) { config.tasksSearch = value == null ? "" : value; saveConfig(); }
     public static void setGpuSearch(String value) { config.gpuSearch = value == null ? "" : value; saveConfig(); }
     public static void setMemorySearch(String value) { config.memorySearch = value == null ? "" : value; saveConfig(); }
     public static void setStartupSearch(String value) { config.startupSearch = value == null ? "" : value; saveConfig(); }
+    public static void setGlobalSearch(String value) { config.globalSearch = value == null ? "" : value; saveConfig(); }
     public static void setTaskSortState(String sort, boolean descending) { config.taskSort = sort; config.taskSortDescending = descending; saveConfig(); }
     public static void setGpuSortState(String sort, boolean descending) { config.gpuSort = sort; config.gpuSortDescending = descending; saveConfig(); }
     public static void setMemorySortState(String sort, boolean descending) { config.memorySort = sort; config.memorySortDescending = descending; saveConfig(); }
@@ -429,7 +475,7 @@ public class ConfigManager {
         setCaptureMode(value ? ProfilerManager.CaptureMode.OPEN_ONLY : ProfilerManager.CaptureMode.PASSIVE_LIGHTWEIGHT);
     }
 
-    public static void loadConfig() {
+    public static synchronized void loadConfig() {
         if (Files.exists(CONFIG_PATH)) {
             try {
                 String json = Files.readString(CONFIG_PATH);
@@ -447,7 +493,7 @@ public class ConfigManager {
         }
     }
 
-    public static void saveConfig() {
+    public static synchronized void saveConfig() {
         try {
             String json = GSON.toJson(config);
             Files.writeString(CONFIG_PATH, json);
@@ -550,24 +596,15 @@ public class ConfigManager {
         if (config.frameBudgetTargetFps <= 0) {
             config.frameBudgetTargetFps = 60;
         }
-        if (config.hudShowMemoryAllocationRate == null) {
-            config.hudShowMemoryAllocationRate = true;
+        if (config.performanceAlertFrameThresholdMs <= 0) {
+            config.performanceAlertFrameThresholdMs = 25;
         }
-        if (config.hudShowLogic == null) config.hudShowLogic = true;
-        if (config.hudShowBackground == null) config.hudShowBackground = true;
-        if (config.hudShowFrameBudget == null) config.hudShowFrameBudget = true;
-        if (config.hudShowVram == null) config.hudShowVram = true;
-        if (config.hudShowNetwork == null) config.hudShowNetwork = false;
-        if (config.hudShowChunkActivity == null) config.hudShowChunkActivity = false;
-        if (config.hudShowDiskIo == null) config.hudShowDiskIo = false;
-        if (config.hudShowInputLatency == null) config.hudShowInputLatency = false;
-        if (config.hudShowVramRateOfChange == null) config.hudShowVramRateOfChange = true;
-        if (config.hudShowNetworkRateOfChange == null) config.hudShowNetworkRateOfChange = true;
-        if (config.hudShowChunkActivityRateOfChange == null) config.hudShowChunkActivityRateOfChange = true;
-        if (config.hudShowDiskIoRateOfChange == null) config.hudShowDiskIoRateOfChange = true;
-        if (config.hudShowInputLatencyRateOfChange == null) config.hudShowInputLatencyRateOfChange = true;
-        if (config.hudAutoFocusAlertRow == null) config.hudAutoFocusAlertRow = true;
-        if (config.hudBudgetColorMode == null) config.hudBudgetColorMode = true;
+        if (config.performanceAlertServerThresholdMs <= 0) {
+            config.performanceAlertServerThresholdMs = 20;
+        }
+        if (config.performanceAlertConsecutiveTicks <= 0) {
+            config.performanceAlertConsecutiveTicks = 3;
+        }
         if (config.tasksColumns == null || config.tasksColumns.isBlank()) {
             config.tasksColumns = "cpu,threads,samples,invokes";
         }
@@ -581,16 +618,11 @@ public class ConfigManager {
         if (config.gpuSearch == null) config.gpuSearch = "";
         if (config.memorySearch == null) config.memorySearch = "";
         if (config.startupSearch == null) config.startupSearch = "";
+        if (config.globalSearch == null) config.globalSearch = "";
         if (config.taskSort == null || config.taskSort.isBlank()) config.taskSort = "CPU";
         if (config.gpuSort == null || config.gpuSort.isBlank()) config.gpuSort = "EST_GPU";
         if (config.memorySort == null || config.memorySort.isBlank()) config.memorySort = "MEMORY_MB";
         if (config.startupSort == null || config.startupSort.isBlank()) config.startupSort = "ACTIVE";
-        if (config.taskEffectiveView == null) config.taskEffectiveView = true;
-        if (config.taskShowSharedRows == null) config.taskShowSharedRows = false;
-        if (config.gpuEffectiveView == null) config.gpuEffectiveView = true;
-        if (config.gpuShowSharedRows == null) config.gpuShowSharedRows = false;
-        if (config.memoryEffectiveView == null) config.memoryEffectiveView = true;
-        if (config.memoryShowSharedRows == null) config.memoryShowSharedRows = false;
         if ((config.cpuGraphColor == null || config.cpuGraphColor.isBlank()) && config.cpuIntelColor != null) config.cpuGraphColor = config.cpuIntelColor;
         if ((config.gpuGraphColor == null || config.gpuGraphColor.isBlank()) && config.gpuNvidiaColor != null) config.gpuGraphColor = config.gpuNvidiaColor;
         config.cpuGraphColor = normalizeColorHex(config.cpuGraphColor, 0xFF5EA9FF);
@@ -614,37 +646,42 @@ public class ConfigManager {
         public int hudMemoryDisplayDelayMs = 100;
         public int hudTransparencyPercent = 100;
         public int frameBudgetTargetFps = 60;
+        public boolean performanceAlertsEnabled = true;
+        public boolean performanceAlertChatEnabled = true;
+        public int performanceAlertFrameThresholdMs = 25;
+        public int performanceAlertServerThresholdMs = 20;
+        public int performanceAlertConsecutiveTicks = 3;
         public boolean hudShowFps = true;
         public boolean hudShowFrame = true;
         public boolean hudShowTicks = true;
         public boolean hudShowUtilization = true;
         public boolean hudShowTemperatures = true;
         public boolean hudShowParallelism = false;
-        public Boolean hudShowLogic = true;
-        public Boolean hudShowBackground = true;
-        public Boolean hudShowFrameBudget = true;
+        public boolean hudShowLogic = true;
+        public boolean hudShowBackground = true;
+        public boolean hudShowFrameBudget = true;
         public boolean hudShowMemory = true;
-        public Boolean hudShowMemoryAllocationRate = true;
-        public Boolean hudShowVram = true;
-        public Boolean hudShowNetwork = false;
-        public Boolean hudShowChunkActivity = false;
+        public boolean hudShowMemoryAllocationRate = true;
+        public boolean hudShowVram = true;
+        public boolean hudShowNetwork = false;
+        public boolean hudShowChunkActivity = false;
         public boolean hudShowWorld = true;
-        public Boolean hudShowDiskIo = false;
-        public Boolean hudShowInputLatency = false;
+        public boolean hudShowDiskIo = false;
+        public boolean hudShowInputLatency = false;
         public boolean hudShowSession = true;
         public boolean hudShowFpsRateOfChange = true;
         public boolean hudShowFrameRateOfChange = true;
         public boolean hudShowTickRateOfChange = true;
         public boolean hudShowUtilizationRateOfChange = true;
         public boolean hudShowWorldRateOfChange = true;
-        public Boolean hudShowVramRateOfChange = true;
-        public Boolean hudShowNetworkRateOfChange = true;
-        public Boolean hudShowChunkActivityRateOfChange = true;
-        public Boolean hudShowDiskIoRateOfChange = true;
-        public Boolean hudShowInputLatencyRateOfChange = true;
+        public boolean hudShowVramRateOfChange = true;
+        public boolean hudShowNetworkRateOfChange = true;
+        public boolean hudShowChunkActivityRateOfChange = true;
+        public boolean hudShowDiskIoRateOfChange = true;
+        public boolean hudShowInputLatencyRateOfChange = true;
         public boolean hudShowZeroRateOfChange = false;
-        public Boolean hudAutoFocusAlertRow = true;
-        public Boolean hudBudgetColorMode = true;
+        public boolean hudAutoFocusAlertRow = true;
+        public boolean hudBudgetColorMode = true;
         public boolean hudSpikeOnly = false;
         public String hudTriggerMode = HudTriggerMode.ALWAYS.name();
         public String hudPreset = HudPreset.COMPACT.name();
@@ -657,6 +694,7 @@ public class ConfigManager {
         public String gpuSearch = "";
         public String memorySearch = "";
         public String startupSearch = "";
+        public String globalSearch = "";
         public String taskSort = "CPU";
         public boolean taskSortDescending = true;
         public String gpuSort = "EST_GPU";
@@ -665,12 +703,12 @@ public class ConfigManager {
         public boolean memorySortDescending = true;
         public String startupSort = "ACTIVE";
         public boolean startupSortDescending = true;
-        public Boolean taskEffectiveView = true;
-        public Boolean taskShowSharedRows = false;
-        public Boolean gpuEffectiveView = true;
-        public Boolean gpuShowSharedRows = false;
-        public Boolean memoryEffectiveView = true;
-        public Boolean memoryShowSharedRows = false;
+        public boolean taskEffectiveView = true;
+        public boolean taskShowSharedRows = false;
+        public boolean gpuEffectiveView = true;
+        public boolean gpuShowSharedRows = false;
+        public boolean memoryEffectiveView = true;
+        public boolean memoryShowSharedRows = false;
         public String cpuGraphColor = "#5EA9FF";
         public String gpuGraphColor = "#77DD77";
         public String worldEntityGraphColor = "#FFC857";

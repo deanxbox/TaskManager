@@ -13,6 +13,9 @@ import net.minecraft.entity.Entity;
 import net.minecraft.entity.LivingEntity;
 import net.minecraft.util.math.ChunkPos;
 import net.minecraft.registry.entry.RegistryEntry;
+import wueffi.taskmanager.client.AttributionModelBuilder.EffectiveCpuAttribution;
+import wueffi.taskmanager.client.AttributionModelBuilder.EffectiveGpuAttribution;
+import wueffi.taskmanager.client.AttributionModelBuilder.EffectiveMemoryAttribution;
 import wueffi.taskmanager.client.util.ConfigManager;
 import wueffi.taskmanager.client.util.ModTimingSnapshot;
 
@@ -27,7 +30,8 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import java.util.function.ToLongFunction;
+import java.util.Objects;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -73,6 +77,41 @@ public class ProfilerManager {
     public record BlockEntityHotspot(String className, int count, String heuristic) {}
 
     public record RuleFinding(String severity, String category, String message, String confidence, String details, String nextStep, String metricSummary) {}
+    public record ConflictObservation(
+            String waiterMod,
+            String ownerMod,
+            String lockName,
+            String waiterThreadName,
+            String ownerThreadName,
+            String waiterRole,
+            String ownerRole,
+            long blockedTimeDeltaMs,
+            long waitedTimeDeltaMs,
+            boolean slowdownOverlap,
+            String confidence,
+            List<String> waiterCandidates,
+            List<String> ownerCandidates
+    ) {}
+    public record ConflictEdge(
+            String waiterMod,
+            String ownerMod,
+            String lockName,
+            String waiterThreadName,
+            String ownerThreadName,
+            String waiterRole,
+            String ownerRole,
+            long observations,
+            long slowdownObservations,
+            long blockedTimeMs,
+            long waitedTimeMs,
+            String confidence,
+            List<String> waiterCandidates,
+            List<String> ownerCandidates
+    ) {}
+    public record PerformanceAlert(String key, String label, String message, String severity, long triggeredAtEpochMillis, double value, double threshold, int consecutiveBreaches) {}
+    private record WorldScanResult(EntityCounts entityCounts, List<HotChunkSnapshot> hotChunks, List<EntityHotspot> entityHotspots, List<BlockEntityHotspot> blockEntityHotspots) {}
+
+    record ExportResult(String status, Path directory, Path htmlReport, Path chromeTrace) {}
 
     public record ExportMetadata(
             String taskManagerVersion,
@@ -113,6 +152,40 @@ public class ProfilerManager {
             String likelyBottleneck,
             List<RuleFinding> findings
     ) {}
+
+    public record SessionBaseline(
+            double avgFps,
+            double onePercentLowFps,
+            double avgMspt,
+            double msptP95,
+            long avgHeapUsedBytes,
+            Map<String, Double> cpuEffectivePercentByMod,
+            Map<String, Double> gpuEffectivePercentByMod,
+            Map<String, Double> memoryEffectiveMbByMod,
+            long capturedAtEpochMillis,
+            String label
+    ) {}
+
+    public record SessionDelta(
+            double fpsChange,
+            double onePercentLowFpsChange,
+            double msptChange,
+            double msptP95Change,
+            double heapChangeMb,
+            Map<String, Double> cpuDeltaByMod,
+            Map<String, Double> gpuDeltaByMod,
+            Map<String, Double> memoryDeltaMbByMod
+    ) {}
+
+    public record SpikeDelta(
+            double frameDurationDeltaMs,
+            double stutterScoreDelta,
+            List<String> newTopCpuMods,
+            List<String> removedTopCpuMods,
+            String bottleneckChange
+    ) {}
+
+    public record SaveEvent(long startedAtEpochMillis, long durationMs, String type) {}
 
     public record SessionPoint(
             long capturedAtEpochMillis,
@@ -188,14 +261,19 @@ public class ProfilerManager {
             Map<String, Double> gpuRawPercentByMod,
             Map<String, Double> gpuEffectivePercentByMod,
             Map<String, Double> memoryRawMbByMod,
-            Map<String, Double> memoryEffectiveMbByMod
+            Map<String, Double> memoryEffectiveMbByMod,
+            Map<String, String> cpuConfidenceByMod,
+            Map<String, String> gpuConfidenceByMod,
+            Map<String, String> memoryConfidenceByMod,
+            Map<String, String> cpuProvenanceByMod,
+            Map<String, String> gpuProvenanceByMod,
+            Map<String, String> memoryProvenanceByMod,
+            String collectorGovernorMode,
+            double profilerSelfCostMs,
+            boolean isSaveEvent,
+            long saveDurationMs,
+            String saveType
     ) {}
-
-    private record EffectiveCpuAttribution(Map<String, CpuSamplingProfiler.Snapshot> displaySnapshots, Map<String, Long> redistributedSamplesByMod, Map<String, Long> redistributedRenderSamplesByMod, long totalSamples, long totalRenderSamples) {}
-
-    private record EffectiveGpuAttribution(Map<String, Long> gpuNanosByMod, Map<String, Long> renderSamplesByMod, Map<String, Long> redistributedGpuNanosByMod, Map<String, Long> redistributedRenderSamplesByMod, long totalGpuNanos, long totalRenderSamples) {}
-
-    private record EffectiveMemoryAttribution(Map<String, Long> displayBytes, Map<String, Long> redistributedBytesByMod, long totalBytes) {}
 
     public record ProfilerSnapshot(
             long capturedAtEpochMillis,
@@ -271,6 +349,10 @@ public class ProfilerManager {
     private static final int WINDOW_SIZE = 20;
     private static final long SPIKE_THRESHOLD_NS = 50_000_000L;
     private static final int MAX_SPIKES = 8;
+    private static final int MAX_WORLD_SCAN_ENTITIES = 2_000;
+    private static final int MAX_WORLD_SCAN_BLOCK_ENTITIES = 1_000;
+    private static final int WORLD_SCAN_ENTITY_SAMPLE_STRIDE = 4;
+    private static final int WORLD_SCAN_BLOCK_ENTITY_SAMPLE_STRIDE = 2;
     private static final Gson EXPORT_GSON = new GsonBuilder().serializeSpecialFloatingPointValues().setPrettyPrinting().create();
     private static final Pattern CHUNK_DEBUG_PATTERN = Pattern.compile("C:\\s*(\\d+)/(\\d+)");
 
@@ -278,6 +360,7 @@ public class ProfilerManager {
     private final Deque<Map<String, CpuSamplingProfiler.DetailSnapshot>> cpuDetailWindows = new ArrayDeque<>();
     private final Deque<Map<String, ModTimingSnapshot>> modWindows = new ArrayDeque<>();
     private final Deque<Map<String, RenderPhaseProfiler.PhaseSnapshot>> renderWindows = new ArrayDeque<>();
+    private final Deque<List<ConflictObservation>> conflictWindows = new ArrayDeque<>();
     private final Deque<SpikeCapture> spikes = new ArrayDeque<>();
     private final Deque<SessionPoint> sessionHistory = new ArrayDeque<>();
     private final Deque<List<HotChunkSnapshot>> hotChunkHistory = new ArrayDeque<>();
@@ -287,6 +370,7 @@ public class ProfilerManager {
     private volatile List<HotChunkSnapshot> latestHotChunks = List.of();
     private volatile List<EntityHotspot> latestEntityHotspots = List.of();
     private volatile List<BlockEntityHotspot> latestBlockEntityHotspots = List.of();
+    private volatile List<ConflictEdge> latestConflictEdges = List.of();
     private volatile List<String> latestLockSummaries = List.of();
     private volatile List<RuleFinding> latestRuleFindings = List.of();
     private final Deque<Map<String, Object>> stutterJumpSnapshots = new ArrayDeque<>();
@@ -297,6 +381,8 @@ public class ProfilerManager {
     private volatile String lastExportStatus = "";
     private volatile Path lastExportDirectory;
     private volatile Path lastExportHtmlReport;
+    private volatile SessionBaseline sessionBaseline;
+    private volatile SpikeCapture pinnedSpike;
     private volatile EntityCounts latestEntityCounts = EntityCounts.empty();
     private volatile ChunkCounts latestChunkCounts = ChunkCounts.empty();
     private volatile boolean sessionLogging;
@@ -306,11 +392,30 @@ public class ProfilerManager {
     private volatile int sessionMissedSamples;
     private volatile long sessionMaxSampleGapMillis;
     private volatile long sessionExpectedSampleIntervalMillis = 50L;
+    private volatile PerformanceAlert latestPerformanceAlert;
+    private volatile long performanceAlertFlashUntilMillis;
     private long lastSeenFrameSequence = 0;
     private long lastSnapshotPublishedAtMillis = 0L;
+    private long lastWorldScanAtMillis = 0L;
+    private long lastWorldScanDurationMillis = 0L;
+    private long lastChunkCountsAtMillis = 0L;
+    private int frameAlertConsecutiveBreaches = 0;
+    private int serverAlertConsecutiveBreaches = 0;
+    private volatile long activeSaveStartedAtMillis;
+    private volatile long activeSaveStartedAtEpochMillis;
+    private volatile String activeSaveType = "";
+    private volatile long lastCompletedSaveStartedAtMillis;
+    private volatile long lastCompletedSaveDurationMillis;
+    private volatile String lastCompletedSaveType = "";
+    private final Map<String, Long> lastPerformanceAlertAtMillis = new ConcurrentHashMap<>();
+    private final Deque<SaveEvent> recentSaves = new ArrayDeque<>();
+    private final RuleEngine ruleEngine = new RuleEngine();
+    private final SessionExporter sessionExporter = new SessionExporter();
 
     public void initialize() {
         mode = ConfigManager.getCaptureMode();
+        sessionBaseline = sessionExporter.loadBaseline();
+        ThreadSnapshotCollector.getInstance().start();
         CpuSamplingProfiler.getInstance().start();
         publishSnapshot(true);
     }
@@ -318,21 +423,19 @@ public class ProfilerManager {
     public void onScreenOpened() {
         screenOpen = true;
         if (mode == CaptureMode.OPEN_ONLY || mode == CaptureMode.MANUAL_DEEP) {
-            clearRollingWindows();
+            clearLiveWindows();
             RenderPhaseProfiler.getInstance().reset();
             ModTimingProfiler.getInstance().reset();
             CpuSamplingProfiler.getInstance().reset();
             FlamegraphProfiler.getInstance().reset();
             TickProfiler.getInstance().reset();
         }
-        MemoryProfiler.getInstance().sampleJvm();
-        publishSnapshot(true);
     }
 
     public void onScreenClosed() {
         screenOpen = false;
         if (mode == CaptureMode.OPEN_ONLY) {
-            clearRollingWindows();
+            clearLiveWindows();
             publishSnapshot(true);
         }
     }
@@ -344,11 +447,18 @@ public class ProfilerManager {
     public void setMode(CaptureMode mode) {
         this.mode = mode;
         ConfigManager.setCaptureMode(mode);
-        clearRollingWindows();
+        clearLiveWindows();
         publishSnapshot(true);
     }
 
     public boolean isCaptureActive() {
+        return computeCaptureActive(mode, screenOpen, sessionLogging);
+    }
+
+    static boolean computeCaptureActive(CaptureMode mode, boolean screenOpen, boolean sessionLogging) {
+        if (sessionLogging) {
+            return true;
+        }
         return switch (mode) {
             case OFF -> false;
             case OPEN_ONLY -> screenOpen;
@@ -382,14 +492,207 @@ public class ProfilerManager {
     }
 
     public boolean shouldCollectDetailedMetrics() {
+        if (isProfilerSelfProtectionActive() && !screenOpen && !sessionLogging) {
+            return false;
+        }
         return switch (getLiveCollectionMode()) {
             case SCREEN, SESSION, CAPTURE -> true;
             default -> false;
         };
     }
 
+    public String getCollectorGovernorMode() {
+        if (isProfilerSelfProtectionActive()) {
+            return "self-protect";
+        }
+        double latestFrameMs = FrameTimelineProfiler.getInstance().getLatestFrameNs() / 1_000_000.0;
+        double targetFrameMs = ConfigManager.getFrameBudgetTargetFrameMs();
+        if (sessionLogging || screenOpen || isPerformanceAlertFlashActive() || latestFrameMs >= targetFrameMs * 1.75) {
+            return "burst";
+        }
+        if (latestFrameMs >= targetFrameMs * 1.2) {
+            return "tight";
+        }
+        if (!shouldCollectFrameMetrics()) {
+            return "light";
+        }
+        return "normal";
+    }
+
+    public boolean isProfilerSelfProtectionActive() {
+        if (screenOpen || sessionLogging) {
+            return false;
+        }
+        SystemMetricsProfiler.Snapshot system = currentSnapshot.systemMetrics();
+        return system != null && (system.profilerCpuLoadPercent() >= 4.0 || system.worldScanCostMillis() >= 12L || system.memoryHistogramCostMillis() >= 20L);
+    }
+
+    public long getLastWorldScanDurationMillis() {
+        return lastWorldScanDurationMillis;
+    }
+
     public ProfilerSnapshot getCurrentSnapshot() {
         return currentSnapshot;
+    }
+
+    public SessionBaseline getSessionBaseline() {
+        return sessionBaseline;
+    }
+
+    public void setBaseline(SessionBaseline baseline) {
+        sessionBaseline = baseline;
+        sessionExporter.saveBaseline(baseline);
+        requestSnapshotPublish();
+    }
+
+    public void clearBaseline() {
+        sessionBaseline = null;
+        sessionExporter.clearBaseline();
+        requestSnapshotPublish();
+    }
+
+    public SessionBaseline captureBaseline(String label) {
+        List<SessionPoint> points = getSessionHistory();
+        if (points.isEmpty()) {
+            return new SessionBaseline(0.0, 0.0, 0.0, 0.0, 0L, Map.of(), Map.of(), Map.of(), System.currentTimeMillis(), label == null || label.isBlank() ? "current" : label);
+        }
+        double avgFps = averageDouble(points, SessionPoint::averageFps);
+        double onePercentLow = averageDouble(points, SessionPoint::onePercentLowFps);
+        double avgMspt = averageDouble(points, SessionPoint::msptAvg);
+        double msptP95 = averageDouble(points, SessionPoint::msptP95);
+        long avgHeapUsedBytes = Math.round(points.stream().mapToLong(SessionPoint::heapUsedBytes).average().orElse(0.0));
+        return new SessionBaseline(
+                avgFps,
+                onePercentLow,
+                avgMspt,
+                msptP95,
+                avgHeapUsedBytes,
+                averageMap(points, SessionPoint::cpuEffectivePercentByMod),
+                averageMap(points, SessionPoint::gpuEffectivePercentByMod),
+                averageMap(points, SessionPoint::memoryEffectiveMbByMod),
+                System.currentTimeMillis(),
+                label == null || label.isBlank() ? "baseline" : label
+        );
+    }
+
+    public SessionDelta compareToBaseline(SessionBaseline baseline) {
+        if (baseline == null) {
+            return null;
+        }
+        SessionBaseline current = captureBaseline("current");
+        return new SessionDelta(
+                current.avgFps() - baseline.avgFps(),
+                current.onePercentLowFps() - baseline.onePercentLowFps(),
+                current.avgMspt() - baseline.avgMspt(),
+                current.msptP95() - baseline.msptP95(),
+                (current.avgHeapUsedBytes() - baseline.avgHeapUsedBytes()) / (1024.0 * 1024.0),
+                subtractMaps(current.cpuEffectivePercentByMod(), baseline.cpuEffectivePercentByMod()),
+                subtractMaps(current.gpuEffectivePercentByMod(), baseline.gpuEffectivePercentByMod()),
+                subtractMaps(current.memoryEffectiveMbByMod(), baseline.memoryEffectiveMbByMod())
+        );
+    }
+
+    public boolean importBaselineFromLatestExport() {
+        SessionBaseline imported = sessionExporter.importLatestSessionBaseline();
+        if (imported == null) {
+            return false;
+        }
+        setBaseline(imported);
+        return true;
+    }
+
+    private double averageDouble(List<SessionPoint> points, java.util.function.ToDoubleFunction<SessionPoint> extractor) {
+        return points.stream().mapToDouble(extractor).average().orElse(0.0);
+    }
+
+    private Map<String, Double> averageMap(List<SessionPoint> points, java.util.function.Function<SessionPoint, Map<String, Double>> extractor) {
+        Map<String, Double> totals = new LinkedHashMap<>();
+        Map<String, Integer> counts = new LinkedHashMap<>();
+        for (SessionPoint point : points) {
+            Map<String, Double> values = extractor.apply(point);
+            if (values == null) {
+                continue;
+            }
+            values.forEach((key, value) -> {
+                totals.merge(key, value == null ? 0.0 : value, Double::sum);
+                counts.merge(key, 1, Integer::sum);
+            });
+        }
+        Map<String, Double> averages = new LinkedHashMap<>();
+        totals.forEach((key, total) -> averages.put(key, total / Math.max(1, counts.getOrDefault(key, points.size()))));
+        return averages;
+    }
+
+    private Map<String, Double> subtractMaps(Map<String, Double> current, Map<String, Double> baseline) {
+        Map<String, Double> delta = new LinkedHashMap<>();
+        current.forEach((key, value) -> delta.put(key, value - baseline.getOrDefault(key, 0.0)));
+        baseline.forEach((key, value) -> delta.putIfAbsent(key, -(value == null ? 0.0 : value)));
+        return delta;
+    }
+
+    public void pinSpike(SpikeCapture spike) {
+        pinnedSpike = spike;
+        requestSnapshotPublish();
+    }
+
+    public void clearPinnedSpike() {
+        pinnedSpike = null;
+        requestSnapshotPublish();
+    }
+
+    public SpikeCapture getPinnedSpike() {
+        return pinnedSpike;
+    }
+
+    public SpikeDelta compareSpikeToPinned(SpikeCapture spike) {
+        if (spike == null || pinnedSpike == null) {
+            return null;
+        }
+        List<String> newTopCpuMods = spike.topCpuMods().stream()
+                .filter(mod -> !pinnedSpike.topCpuMods().contains(mod))
+                .toList();
+        List<String> removedTopCpuMods = pinnedSpike.topCpuMods().stream()
+                .filter(mod -> !spike.topCpuMods().contains(mod))
+                .toList();
+        String bottleneckChange = Objects.equals(pinnedSpike.likelyBottleneck(), spike.likelyBottleneck())
+                ? "Same bottleneck"
+                : pinnedSpike.likelyBottleneck() + " -> " + spike.likelyBottleneck();
+        return new SpikeDelta(
+                spike.frameDurationMs() - pinnedSpike.frameDurationMs(),
+                spike.stutterScore() - pinnedSpike.stutterScore(),
+                newTopCpuMods,
+                removedTopCpuMods,
+                bottleneckChange
+        );
+    }
+
+    public List<SaveEvent> getRecentSaves() {
+        return List.copyOf(recentSaves);
+    }
+
+    public void beginSaveEvent(String type) {
+        activeSaveStartedAtMillis = System.nanoTime();
+        activeSaveStartedAtEpochMillis = System.currentTimeMillis();
+        activeSaveType = type == null || type.isBlank() ? "save" : type;
+    }
+
+    public void endSaveEvent() {
+        long startedAtNanos = activeSaveStartedAtMillis;
+        if (startedAtNanos <= 0L) {
+            return;
+        }
+        long durationMs = Math.max(0L, (System.nanoTime() - startedAtNanos) / 1_000_000L);
+        SaveEvent saveEvent = new SaveEvent(activeSaveStartedAtEpochMillis, durationMs, activeSaveType == null || activeSaveType.isBlank() ? "save" : activeSaveType);
+        activeSaveStartedAtMillis = 0L;
+        activeSaveStartedAtEpochMillis = 0L;
+        activeSaveType = "";
+        lastCompletedSaveStartedAtMillis = saveEvent.startedAtEpochMillis();
+        lastCompletedSaveDurationMillis = saveEvent.durationMs();
+        lastCompletedSaveType = saveEvent.type();
+        recentSaves.addFirst(saveEvent);
+        while (recentSaves.size() > 16) {
+            recentSaves.removeLast();
+        }
     }
 
     public boolean isSessionLogging() {
@@ -420,11 +723,7 @@ public class ProfilerManager {
             publishSnapshot(true);
             return;
         }
-        sessionHistory.clear();
-        hotChunkHistory.clear();
-        chunkActivityHistory.clear();
-        latestHotChunks = List.of();
-        latestRuleFindings = List.of();
+        clearSessionState();
         sessionLogging = true;
         sessionRecorded = false;
         sessionRecordedAtMillis = 0L;
@@ -436,53 +735,122 @@ public class ProfilerManager {
     }
 
     public void onClientTickEnd(MinecraftClient client) {
-        latestEntityCounts = sampleEntityCounts(client);
-        latestChunkCounts = sampleChunkCounts(client);
-        latestHotChunks = sampleHotChunks(client);
-        latestEntityHotspots = sampleEntityHotspots(client);
-        latestBlockEntityHotspots = sampleBlockEntityHotspots(client);
+        long selfCostStartedAt = System.nanoTime();
+        try {
+            WorldScanResult worldScan = sampleWorldData(client);
+            latestEntityCounts = worldScan.entityCounts();
+            latestChunkCounts = sampleChunkCounts(client);
+            latestHotChunks = worldScan.hotChunks();
+            latestEntityHotspots = worldScan.entityHotspots();
+            latestBlockEntityHotspots = worldScan.blockEntityHotspots();
+            String collectorGovernorMode = getCollectorGovernorMode();
 
-        if (shouldCollectFrameMetrics() || (client.world != null && client.world.getTime() % 200 == 0)) {
-            MemoryProfiler.getInstance().sampleJvm();
-        }
-        SystemMetricsProfiler.getInstance().sample(MemoryProfiler.getInstance().getDetailedSnapshot(), latestEntityCounts, latestChunkCounts);
-        ThreadLoadProfiler.getInstance().sample();
-        NetworkPacketProfiler.getInstance().drainWindow();
-        latestLockSummaries = buildLockSummaries(SystemMetricsProfiler.getInstance().getSnapshot());
+            boolean selfProtecting = "self-protect".equals(collectorGovernorMode);
+            if ((!selfProtecting && shouldCollectFrameMetrics()) || sessionLogging || screenOpen || (client.world != null && client.world.getTime() % 200 == 0)) {
+                MemoryProfiler.getInstance().sampleJvm();
+            }
+            MemoryProfiler.Snapshot memorySnapshot = MemoryProfiler.getInstance().getDetailedSnapshot();
+            ThreadLoadProfiler.getInstance().sample();
+            SystemMetricsProfiler.getInstance().sample(memorySnapshot, latestEntityCounts, latestChunkCounts);
+            NetworkPacketProfiler.getInstance().drainWindow();
+            updateConflictTracking(SystemMetricsProfiler.getInstance().getSnapshot());
+            latestLockSummaries = buildLockSummaries(SystemMetricsProfiler.getInstance().getSnapshot());
 
-        if (!isCaptureActive()) {
+            if (!isCaptureActive()) {
+                enforceSessionWindow(client);
+                publishSnapshot(false);
+                return;
+            }
+
+            CpuSamplingProfiler.WindowSnapshot cpuWindow = CpuSamplingProfiler.getInstance().drainWindow();
+            Map<String, ModTimingSnapshot> modWindow = ModTimingProfiler.getInstance().drainSnapshot();
+            Map<String, RenderPhaseProfiler.PhaseSnapshot> renderWindow = RenderPhaseProfiler.getInstance().drainSnapshot();
+
+            pushWindow(cpuWindows, cpuWindow.samples());
+            pushWindow(cpuDetailWindows, cpuWindow.detailsByMod());
+            pushWindow(modWindows, modWindow);
+            pushWindow(renderWindows, renderWindow);
+
+            boolean shouldSamplePerModMemory = shouldCollectDetailedMetrics() || sessionLogging;
+            long memoryCadenceMillis = CollectorMath.computeAdaptiveMemoryCadenceMillis(collectorGovernorMode, screenOpen, sessionLogging);
+            boolean allowExpensiveMemoryCollection = (!"light".equals(collectorGovernorMode) && !"self-protect".equals(collectorGovernorMode)) || screenOpen || sessionLogging;
+            if (shouldSamplePerModMemory && allowExpensiveMemoryCollection && MemoryProfiler.getInstance().getLastModSampleAgeMillis() > memoryCadenceMillis) {
+                MemoryProfiler.getInstance().requestPerModSample();
+            }
+
+            latestRuleFindings = ruleEngine.buildRuleFindings(this, memorySnapshot);
+            evaluatePerformanceAlerts(client);
+            captureSpikeIfNeeded();
+            captureStutterJumpSnapshot(client);
+            recordSessionPoint();
             enforceSessionWindow(client);
-            publishSnapshot(false);
-            return;
+            publishSnapshot(false, cpuWindow.lastSampleAgeMillis());
+        } finally {
+            FrameTimelineProfiler.getInstance().addSelfCost(System.nanoTime() - selfCostStartedAt);
         }
-
-        CpuSamplingProfiler.WindowSnapshot cpuWindow = CpuSamplingProfiler.getInstance().drainWindow();
-        Map<String, ModTimingSnapshot> modWindow = ModTimingProfiler.getInstance().drainSnapshot();
-        Map<String, RenderPhaseProfiler.PhaseSnapshot> renderWindow = RenderPhaseProfiler.getInstance().drainSnapshot();
-
-        pushWindow(cpuWindows, cpuWindow.samples());
-        pushWindow(cpuDetailWindows, cpuWindow.detailsByMod());
-        pushWindow(modWindows, modWindow);
-        pushWindow(renderWindows, renderWindow);
-
-        boolean allowDeepMemory = screenOpen || mode == CaptureMode.MANUAL_DEEP;
-        if (allowDeepMemory && TaskManagerScreen.isMemoryTabActive(client) && MemoryProfiler.getInstance().getLastModSampleAgeMillis() > 2000) {
-            MemoryProfiler.getInstance().samplePerMod();
-        }
-
-        latestRuleFindings = buildRuleFindings();
-        captureSpikeIfNeeded();
-        captureStutterJumpSnapshot(client);
-        recordSessionPoint();
-        enforceSessionWindow(client);
-        publishSnapshot(false, cpuWindow.lastSampleAgeMillis());
     }
 
     public java.util.List<SessionPoint> getSessionHistory() {
         return java.util.List.copyOf(sessionHistory);
     }
 
+    public PerformanceAlert getLatestPerformanceAlert() {
+        PerformanceAlert alert = latestPerformanceAlert;
+        if (alert == null) {
+            return null;
+        }
+        return System.currentTimeMillis() - alert.triggeredAtEpochMillis() > 6_000L ? null : alert;
+    }
+
+    public boolean isPerformanceAlertFlashActive() {
+        return performanceAlertFlashUntilMillis > System.currentTimeMillis();
+    }
+
+    public java.util.List<String> getJvmTuningAdvisor() {
+        return ruleEngine.buildJvmTuningAdvisor(currentSnapshot.memory(), SystemMetricsProfiler.getInstance().getSnapshot());
+    }
+
+    public java.util.List<String> getEnabledResourcePackNames() {
+        return detectEnabledResourcePacks(MinecraftClient.getInstance());
+    }
+
+    public String getGraphicsPipelineSummary() {
+        String shaderPack = detectShaderPackName();
+        String sodiumThreads = detectSodiumChunkThreads();
+        boolean irisLoaded = FabricLoader.getInstance().isModLoaded("iris");
+        boolean sodiumLoaded = FabricLoader.getInstance().isModLoaded("sodium");
+        return "Iris " + (irisLoaded ? "on" : "off")
+                + " | Sodium " + (sodiumLoaded ? "on" : "off")
+                + " | shader " + shaderPack
+                + " | chunk threads " + sodiumThreads;
+    }
+
     public String exportSession() {
+        return sessionExporter.exportSession(this);
+    }
+
+    void beginExport() {
+        lastExportStatus = "Exporting session...";
+        lastExportDirectory = null;
+        lastExportHtmlReport = null;
+    }
+
+    String lastExportStatus() {
+        return lastExportStatus == null || lastExportStatus.isBlank() ? "Export already in progress..." : lastExportStatus;
+    }
+
+    void finishExport(ExportResult result) {
+        lastExportDirectory = result.directory();
+        lastExportHtmlReport = result.htmlReport();
+        lastExportStatus = result.status();
+        requestSnapshotPublish();
+    }
+
+    ExportResult runSessionExport() {
+        return sessionExporter.runSessionExport(this);
+    }
+
+    Map<String, Object> buildSessionExportPayload() {
         Map<String, Object> export = new LinkedHashMap<>();
         export.put("generatedAtEpochMillis", System.currentTimeMillis());
         export.put("executiveSummary", buildExecutiveSummary());
@@ -511,10 +879,15 @@ public class ProfilerManager {
         export.put("exportSummary", buildExportSummary());
         export.put("diagnosis", buildDiagnosis());
         export.put("spikes", new ArrayList<>(spikes));
+        export.put("pinnedSpike", pinnedSpike);
+        export.put("baseline", sessionBaseline);
+        export.put("baselineDelta", compareToBaseline(sessionBaseline));
+        export.put("recentSaves", new ArrayList<>(recentSaves));
         export.put("sessionPoints", new ArrayList<>(sessionHistory));
         export.put("frameTimeTimelineMs", FrameTimelineProfiler.getInstance().getOrderedFrameMsHistory());
         export.put("frameTimestampTimelineNs", FrameTimelineProfiler.getInstance().getOrderedFrameTimestampHistory());
         export.put("fpsTimeline", FrameTimelineProfiler.getInstance().getOrderedFpsHistory());
+        export.put("profilerSelfCostTimelineMs", FrameTimelineProfiler.getInstance().getOrderedSelfCostMsHistory());
         export.put("chunkPipelineTimeline", buildChunkPipelineTimeline());
         export.put("startupRows", currentSnapshot.startupRows());
         export.put("startupSummary", buildStartupSummary());
@@ -522,35 +895,86 @@ public class ProfilerManager {
         export.put("attribution", buildAttributionExport());
         export.put("renderPhaseOwners", buildRenderPhaseOwnerSummary());
         export.put("sharedBucketBreakdowns", buildSharedBucketBreakdownExport());
+        export.put("chunkWork", ChunkWorkProfiler.getInstance().getSnapshot());
+        export.put("entityCosts", EntityCostProfiler.getInstance().getSnapshot());
+        export.put("shaderCompiles", ShaderCompilationProfiler.getInstance().getSnapshot());
+        export.put("textureUploads", TextureUploadProfiler.getInstance().getSnapshot());
+        return export;
+    }
 
-        Path dir = FabricLoader.getInstance().getGameDir().resolve("taskmanager-sessions");
-        try {
-            Files.createDirectories(dir);
-            long exportTimestamp = System.currentTimeMillis();
-            Path file = dir.resolve("taskmanager-session-" + exportTimestamp + ".json");
-            Files.writeString(file, EXPORT_GSON.toJson(export));
-            Path htmlFile = dir.resolve("taskmanager-session-" + exportTimestamp + ".html");
-            Files.writeString(htmlFile, buildHtmlReport(export));
-            lastExportDirectory = dir;
-            lastExportHtmlReport = htmlFile;
-            lastExportStatus = "Exported " + file.getFileName() + " + " + htmlFile.getFileName();
-            taskmanagerClient.LOGGER.info(
-                    "TaskManager export {} entities total/living/block {}/{}/{} chunks loaded/rendered {}/{} stutterScore {}",
-                    file.getFileName(),
-                    latestEntityCounts.totalEntities(),
-                    latestEntityCounts.livingEntities(),
-                    latestEntityCounts.blockEntities(),
-                    latestChunkCounts.loadedChunks(),
-                    latestChunkCounts.renderedChunks(),
-                    String.format("%.1f", FrameTimelineProfiler.getInstance().getStutterScore())
-            );
-        } catch (Exception e) {
-            lastExportDirectory = null;
-            lastExportHtmlReport = null;
-            lastExportStatus = "Export failed: " + e.getMessage();
+    String exportJson(Map<String, Object> export) {
+        return EXPORT_GSON.toJson(export);
+    }
+
+    String buildSessionHtmlReport(Map<String, Object> export) {
+        return buildHtmlReport(export);
+    }
+
+    String buildChromeTraceJson() {
+        List<Map<String, Object>> events = new ArrayList<>();
+        for (SessionPoint point : sessionHistory) {
+            appendTraceSpan(events, "Frame", "render", point.capturedAtEpochMillis(), point.frameTimeMs());
+            appendTraceSpan(events, "GPU Frame", "gpu", point.capturedAtEpochMillis(), point.gpuFrameTimeMs());
+            appendTraceSpan(events, "Client Tick", "client", point.capturedAtEpochMillis(), point.clientTickMs());
+            appendTraceSpan(events, "Server Tick", "server", point.capturedAtEpochMillis(), point.serverTickMs());
+            if (point.gcPauseDurationMs() > 0L) {
+                appendTraceSpan(events, "GC Pause: " + point.gcType(), "jvm", point.capturedAtEpochMillis(), point.gcPauseDurationMs());
+            }
         }
-        publishSnapshot();
-        return lastExportStatus;
+        for (SpikeCapture spike : spikes) {
+            appendTraceSpan(events, "Spike: " + spike.likelyBottleneck(), "markers", spike.capturedAtEpochMillis(), spike.frameDurationMs());
+        }
+        for (ShaderCompilationProfiler.CompileEvent event : ShaderCompilationProfiler.getInstance().getSnapshot().recentEvents()) {
+            appendTraceSpan(events, "Shader Compile: " + event.label(), "render", event.completedAtEpochMillis(), event.durationNs() / 1_000_000.0);
+        }
+        for (SaveEvent saveEvent : recentSaves) {
+            appendTraceSpan(events, "Save: " + saveEvent.type(), "io", saveEvent.startedAtEpochMillis(), saveEvent.durationMs());
+        }
+        return EXPORT_GSON.toJson(events);
+    }
+
+    void logSessionExport(Path file) {
+        taskmanagerClient.LOGGER.info(
+                "TaskManager export {} entities total/living/block {}/{}/{} chunks loaded/rendered {}/{} stutterScore {}",
+                file.getFileName(),
+                latestEntityCounts.totalEntities(),
+                latestEntityCounts.livingEntities(),
+                latestEntityCounts.blockEntities(),
+                latestChunkCounts.loadedChunks(),
+                latestChunkCounts.renderedChunks(),
+                String.format("%.1f", FrameTimelineProfiler.getInstance().getStutterScore())
+        );
+    }
+
+    void notifyExportFinished(MinecraftClient client, ExportResult result) {
+        if (client.player == null) {
+            return;
+        }
+        client.player.sendMessage(Text.literal("Task Manager: " + result.status()), false);
+        if (result.htmlReport() != null) {
+            Text openReport = Text.literal("[Open Session Report]")
+                    .setStyle(Style.EMPTY
+                            .withColor(Formatting.AQUA)
+                            .withUnderline(true)
+                            .withClickEvent(new ClickEvent.OpenFile(result.htmlReport().toAbsolutePath().toString())));
+            client.player.sendMessage(openReport, false);
+        }
+        if (result.chromeTrace() != null) {
+            Text openTrace = Text.literal("[Open Chrome Trace]")
+                    .setStyle(Style.EMPTY
+                            .withColor(Formatting.GOLD)
+                            .withUnderline(true)
+                            .withClickEvent(new ClickEvent.OpenFile(result.chromeTrace().toAbsolutePath().toString())));
+            client.player.sendMessage(openTrace, false);
+        }
+        if (result.directory() != null) {
+            Text openFolder = Text.literal("[Open Session Logs Folder]")
+                    .setStyle(Style.EMPTY
+                            .withColor(Formatting.GREEN)
+                            .withUnderline(true)
+                            .withClickEvent(new ClickEvent.OpenFile(result.directory().toAbsolutePath().toString())));
+            client.player.sendMessage(openFolder, false);
+        }
     }
 
     private void recordSessionPoint() {
@@ -558,9 +982,9 @@ public class ProfilerManager {
         Map<String, CpuSamplingProfiler.DetailSnapshot> cpuDetails = aggregateCpuDetailWindows();
         Map<String, ModTimingSnapshot> modInvokes = aggregateModWindows();
         Map<String, RenderPhaseProfiler.PhaseSnapshot> renderPhases = aggregateRenderWindows();
-        EffectiveCpuAttribution effectiveCpu = buildEffectiveCpuAttribution(cpu, modInvokes);
-        EffectiveGpuAttribution rawGpuAttribution = buildEffectiveGpuAttribution(renderPhases, cpu, modInvokes, false);
-        EffectiveGpuAttribution effectiveGpuAttribution = buildEffectiveGpuAttribution(renderPhases, cpu, modInvokes, true);
+        EffectiveCpuAttribution effectiveCpu = AttributionModelBuilder.buildEffectiveCpuAttribution(cpu, cpuDetails, modInvokes);
+        EffectiveGpuAttribution rawGpuAttribution = AttributionModelBuilder.buildEffectiveGpuAttribution(renderPhases, cpu, effectiveCpu, false);
+        EffectiveGpuAttribution effectiveGpuAttribution = AttributionModelBuilder.buildEffectiveGpuAttribution(renderPhases, cpu, effectiveCpu, true);
         long totalRenderSamples = cpu.values().stream().mapToLong(CpuSamplingProfiler.Snapshot::renderSamples).sum();
         List<String> topCpu = effectiveCpu.displaySnapshots().entrySet().stream()
                 .sorted((a, b) -> Long.compare(b.getValue().totalSamples(), a.getValue().totalSamples()))
@@ -575,7 +999,7 @@ public class ProfilerManager {
 
         MemoryProfiler.Snapshot memory = MemoryProfiler.getInstance().getDetailedSnapshot();
         Map<String, Long> rawMemoryMods = MemoryProfiler.getInstance().getModMemoryBytes();
-        EffectiveMemoryAttribution effectiveMemory = buildEffectiveMemoryAttribution(rawMemoryMods);
+        EffectiveMemoryAttribution effectiveMemory = AttributionModelBuilder.buildEffectiveMemoryAttribution(rawMemoryMods);
         double usedHeapMb = memory.heapUsedBytes() / (1024.0 * 1024.0);
         double allocatedHeapMb = memory.heapCommittedBytes() / (1024.0 * 1024.0);
         SessionPoint previous = sessionHistory.peekLast();
@@ -617,6 +1041,12 @@ public class ProfilerManager {
         Map<String, Double> gpuEffectivePercentByMod = buildGpuPercentByMod(effectiveGpuAttribution);
         Map<String, Double> memoryRawMbByMod = buildMemoryMbByMod(rawMemoryMods);
         Map<String, Double> memoryEffectiveMbByMod = buildMemoryMbByMod(effectiveMemory.displayBytes());
+        Map<String, String> cpuConfidenceByMod = buildCpuConfidenceByMod(cpu, effectiveCpu, cpuDetails);
+        Map<String, String> gpuConfidenceByMod = buildGpuConfidenceByMod(rawGpuAttribution, effectiveGpuAttribution);
+        Map<String, String> memoryConfidenceByMod = buildMemoryConfidenceByMod(rawMemoryMods, effectiveMemory, MemoryProfiler.getInstance().getLastModSampleAgeMillis());
+        Map<String, String> cpuProvenanceByMod = buildCpuProvenanceByMod(cpu, effectiveCpu, cpuDetails);
+        Map<String, String> gpuProvenanceByMod = buildGpuProvenanceByMod(rawGpuAttribution, effectiveGpuAttribution);
+        Map<String, String> memoryProvenanceByMod = buildMemoryProvenanceByMod(rawMemoryMods, effectiveMemory, MemoryProfiler.getInstance().getLastModSampleAgeMillis());
 
         long capturedAtMillis = System.currentTimeMillis();
         SessionPoint previousPoint = sessionHistory.peekLast();
@@ -624,6 +1054,9 @@ public class ProfilerManager {
         int missedSamplesSincePrevious = computeMissedSamples(previousPoint == null ? 0L : previousPoint.capturedAtEpochMillis(), capturedAtMillis, (int) sessionExpectedSampleIntervalMillis);
         sessionMissedSamples += missedSamplesSincePrevious;
         sessionMaxSampleGapMillis = Math.max(sessionMaxSampleGapMillis, sampleIntervalMs);
+        boolean saveEventComplete = lastCompletedSaveDurationMillis > 0L
+                && lastCompletedSaveStartedAtMillis > 0L
+                && (previousPoint == null || lastCompletedSaveStartedAtMillis > previousPoint.capturedAtEpochMillis());
 
         sessionHistory.addLast(new SessionPoint(
                 capturedAtMillis,
@@ -699,7 +1132,18 @@ public class ProfilerManager {
                 gpuRawPercentByMod,
                 gpuEffectivePercentByMod,
                 memoryRawMbByMod,
-                memoryEffectiveMbByMod
+                memoryEffectiveMbByMod,
+                cpuConfidenceByMod,
+                gpuConfidenceByMod,
+                memoryConfidenceByMod,
+                cpuProvenanceByMod,
+                gpuProvenanceByMod,
+                memoryProvenanceByMod,
+                getCollectorGovernorMode(),
+                frameTimeline.getSelfCostAvgMs(),
+                saveEventComplete,
+                saveEventComplete ? lastCompletedSaveDurationMillis : 0L,
+                saveEventComplete ? lastCompletedSaveType : ""
         ));
     }
 
@@ -779,6 +1223,7 @@ public class ProfilerManager {
         summary.put("topHotChunk", latestHotChunks.isEmpty() ? null : latestHotChunks.getFirst());
         summary.put("topEntityHotspots", latestEntityHotspots);
         summary.put("topBlockEntityHotspots", latestBlockEntityHotspots);
+        summary.put("conflictEdges", latestConflictEdges);
         summary.put("lockSummaries", latestLockSummaries);
         summary.put("networkSpikeBookmarks", NetworkPacketProfiler.getInstance().getSpikeHistory());
         summary.put("ruleFindingsBySeverity", buildRuleFindingSeverityBreakdown());
@@ -791,6 +1236,7 @@ public class ProfilerManager {
         summary.put("lightUpdateQueue", system.lightUpdateQueue());
         summary.put("maxEntitiesInHotChunk", system.maxEntitiesInHotChunk());
         summary.put("sensorErrors", system.sensorErrorCode());
+        summary.put("jvmTuningAdvisor", buildJvmTuningAdvisor(currentSnapshot.memory(), system));
         summary.put("redFlagThresholds", buildRedFlagThresholds());
         double frameAvg = FrameTimelineProfiler.getInstance().getAverageFrameNs() / 1_000_000.0;
         double frameP95 = FrameTimelineProfiler.getInstance().getPercentileFrameNs(0.95) / 1_000_000.0;
@@ -888,10 +1334,7 @@ public class ProfilerManager {
         String loaderVersion = FabricLoader.getInstance().getModContainer("fabricloader")
                 .map(mod -> mod.getMetadata().getVersion().getFriendlyString())
                 .orElse("unknown");
-        String cpuInfo = System.getenv("PROCESSOR_IDENTIFIER");
-        if (cpuInfo == null || cpuInfo.isBlank()) {
-            cpuInfo = System.getProperty("os.arch", "unknown");
-        }
+        String cpuInfo = HardwareInfoResolver.getCpuDisplayName();
         SystemMetricsProfiler.Snapshot system = SystemMetricsProfiler.getInstance().getSnapshot();
         String gpuInfo = (system.gpuVendor() == null || system.gpuVendor().isBlank() ? "Unknown GPU" : system.gpuVendor())
                 + " | " + (system.gpuRenderer() == null || system.gpuRenderer().isBlank() ? "Unknown renderer" : system.gpuRenderer());
@@ -983,6 +1426,7 @@ public class ProfilerManager {
         settings.put("sodiumDetected", FabricLoader.getInstance().isModLoaded("sodium"));
         settings.put("shaderPack", detectShaderPackName());
         settings.put("chunkUpdateThreads", detectSodiumChunkThreads());
+        settings.put("resourcePacks", detectEnabledResourcePacks(client));
         return settings;
     }
 
@@ -1044,6 +1488,122 @@ public class ProfilerManager {
         return null;
     }
 
+    private List<String> detectEnabledResourcePacks(MinecraftClient client) {
+        if (client == null) {
+            return List.of();
+        }
+        try {
+            Object manager = client.getClass().getMethod("getResourcePackManager").invoke(client);
+            if (manager == null) {
+                return List.of();
+            }
+            Object enabledProfiles = manager.getClass().getMethod("getEnabledProfiles").invoke(manager);
+            if (!(enabledProfiles instanceof Iterable<?> iterable)) {
+                return List.of();
+            }
+            List<String> packs = new ArrayList<>();
+            for (Object profile : iterable) {
+                if (profile == null) {
+                    continue;
+                }
+                String name = extractPackDisplayName(profile);
+                if (name != null && !name.isBlank()) {
+                    packs.add(name);
+                }
+            }
+            return packs;
+        } catch (ReflectiveOperationException ignored) {
+            return List.of();
+        }
+    }
+
+    void requestSnapshotPublish() {
+        publishSnapshot();
+    }
+
+    private String extractPackDisplayName(Object profile) {
+        for (String methodName : List.of("getDisplayName", "getName", "getId")) {
+            try {
+                Object value = profile.getClass().getMethod(methodName).invoke(profile);
+                if (value instanceof Text text) {
+                    return text.getString();
+                }
+                if (value != null) {
+                    return value.toString();
+                }
+            } catch (ReflectiveOperationException ignored) {
+            }
+        }
+        return null;
+    }
+
+    private List<String> buildJvmTuningAdvisor(MemoryProfiler.Snapshot memory, SystemMetricsProfiler.Snapshot system) {
+        return ruleEngine.buildJvmTuningAdvisor(memory, system);
+    }
+
+    private String firstJvmArgValue(List<String> args, String prefix) {
+        for (String arg : args) {
+            if (arg != null && arg.startsWith(prefix)) {
+                return arg.substring(prefix.length());
+            }
+        }
+        return null;
+    }
+
+    private void evaluatePerformanceAlerts(MinecraftClient client) {
+        if (!ConfigManager.isPerformanceAlertsEnabled()) {
+            latestPerformanceAlert = null;
+            performanceAlertFlashUntilMillis = 0L;
+            frameAlertConsecutiveBreaches = 0;
+            serverAlertConsecutiveBreaches = 0;
+            return;
+        }
+
+        long now = System.currentTimeMillis();
+        double latestFrameMs = FrameTimelineProfiler.getInstance().getLatestFrameNs() / 1_000_000.0;
+        double serverTickMs = TickProfiler.getInstance().getAverageServerTickNs() / 1_000_000.0;
+        int required = ConfigManager.getPerformanceAlertConsecutiveTicks();
+        frameAlertConsecutiveBreaches = latestFrameMs >= ConfigManager.getPerformanceAlertFrameThresholdMs() ? frameAlertConsecutiveBreaches + 1 : 0;
+        serverAlertConsecutiveBreaches = serverTickMs >= ConfigManager.getPerformanceAlertServerThresholdMs() ? serverAlertConsecutiveBreaches + 1 : 0;
+
+        PerformanceAlert nextAlert = null;
+        if (serverAlertConsecutiveBreaches >= required) {
+            nextAlert = createPerformanceAlert("server-mspt", "Server MSPT", serverTickMs, ConfigManager.getPerformanceAlertServerThresholdMs(), serverAlertConsecutiveBreaches);
+        }
+        if (frameAlertConsecutiveBreaches >= required) {
+            PerformanceAlert frameAlert = createPerformanceAlert("frame-ms", "Frame Time", latestFrameMs, ConfigManager.getPerformanceAlertFrameThresholdMs(), frameAlertConsecutiveBreaches);
+            if (nextAlert == null || frameAlert.value() > nextAlert.value()) {
+                nextAlert = frameAlert;
+            }
+        }
+
+        if (nextAlert == null) {
+            if (latestPerformanceAlert != null && now - latestPerformanceAlert.triggeredAtEpochMillis() > 6_000L) {
+                latestPerformanceAlert = null;
+            }
+            return;
+        }
+
+        long lastAlertAt = lastPerformanceAlertAtMillis.getOrDefault(nextAlert.key(), 0L);
+        if (now - lastAlertAt < 8_000L) {
+            return;
+        }
+        lastPerformanceAlertAtMillis.put(nextAlert.key(), now);
+        latestPerformanceAlert = nextAlert;
+        performanceAlertFlashUntilMillis = now + 2_500L;
+        if (ConfigManager.isPerformanceAlertChatEnabled() && client != null && client.inGameHud != null) {
+            client.inGameHud.getChatHud().addMessage(Text.literal("[Task Manager] " + nextAlert.message()).formatted(Formatting.YELLOW));
+        }
+    }
+
+    private PerformanceAlert createPerformanceAlert(String key, String label, double value, double threshold, int consecutiveBreaches) {
+        double ratio = threshold <= 0.0 ? 0.0 : value / threshold;
+        String severity = ratio >= 1.75 ? "critical" : ratio >= 1.25 ? "warning" : "info";
+        String message = label + " stayed above " + String.format(Locale.ROOT, "%.1f", threshold)
+                + " ms for " + consecutiveBreaches + " consecutive ticks (now " + String.format(Locale.ROOT, "%.1f", value) + " ms).";
+        return new PerformanceAlert(key, label, message, severity, System.currentTimeMillis(), value, threshold, consecutiveBreaches);
+    }
+
     private List<Map<String, Object>> buildChunkPipelineTimeline() {
         List<Map<String, Object>> timeline = new ArrayList<>();
         for (SessionPoint point : sessionHistory) {
@@ -1069,244 +1629,28 @@ public class ProfilerManager {
         return diagnostics;
     }
 
-    private boolean isSharedAttributionBucket(String modId) {
-        return modId != null && (modId.startsWith("shared/") || modId.startsWith("runtime/"));
-    }
-
-    private EffectiveCpuAttribution buildEffectiveCpuAttribution(Map<String, CpuSamplingProfiler.Snapshot> rawCpu, Map<String, ModTimingSnapshot> invokes) {
-        LinkedHashMap<String, CpuSamplingProfiler.Snapshot> concrete = new LinkedHashMap<>();
-        long sharedTotalSamples = 0L;
-        long sharedClientSamples = 0L;
-        long sharedRenderSamples = 0L;
-        for (Map.Entry<String, CpuSamplingProfiler.Snapshot> entry : rawCpu.entrySet()) {
-            String modId = entry.getKey();
-            CpuSamplingProfiler.Snapshot sample = entry.getValue();
-            if (isSharedAttributionBucket(modId)) {
-                sharedTotalSamples += sample.totalSamples();
-                sharedClientSamples += sample.clientSamples();
-                sharedRenderSamples += sample.renderSamples();
-            } else {
-                concrete.put(modId, sample);
-            }
-        }
-        if (concrete.isEmpty()) {
-            long totalSamples = rawCpu.values().stream().mapToLong(CpuSamplingProfiler.Snapshot::totalSamples).sum();
-            long totalRenderSamples = rawCpu.values().stream().mapToLong(CpuSamplingProfiler.Snapshot::renderSamples).sum();
-            return new EffectiveCpuAttribution(new LinkedHashMap<>(rawCpu), Map.of(), Map.of(), totalSamples, totalRenderSamples);
-        }
-
-        Map<String, Double> totalWeights = buildCpuWeightMap(concrete, invokes, CpuSamplingProfiler.Snapshot::totalSamples);
-        Map<String, Double> clientWeights = buildCpuWeightMap(concrete, invokes, CpuSamplingProfiler.Snapshot::clientSamples);
-        Map<String, Double> renderWeights = buildCpuWeightMap(concrete, invokes, CpuSamplingProfiler.Snapshot::renderSamples);
-        Map<String, Long> redistributedTotals = distributeLongProportionally(sharedTotalSamples, totalWeights);
-        Map<String, Long> redistributedClients = distributeLongProportionally(sharedClientSamples, clientWeights);
-        Map<String, Long> redistributedRenders = distributeLongProportionally(sharedRenderSamples, renderWeights);
-
-        LinkedHashMap<String, CpuSamplingProfiler.Snapshot> display = new LinkedHashMap<>();
-        for (Map.Entry<String, CpuSamplingProfiler.Snapshot> entry : concrete.entrySet()) {
-            String modId = entry.getKey();
-            CpuSamplingProfiler.Snapshot sample = entry.getValue();
-            display.put(modId, new CpuSamplingProfiler.Snapshot(
-                    sample.totalSamples() + redistributedTotals.getOrDefault(modId, 0L),
-                    sample.clientSamples() + redistributedClients.getOrDefault(modId, 0L),
-                    sample.renderSamples() + redistributedRenders.getOrDefault(modId, 0L)
-            ));
-        }
-
-        long totalSamples = display.values().stream().mapToLong(CpuSamplingProfiler.Snapshot::totalSamples).sum();
-        long totalRenderSamples = display.values().stream().mapToLong(CpuSamplingProfiler.Snapshot::renderSamples).sum();
-        return new EffectiveCpuAttribution(display, redistributedTotals, redistributedRenders, totalSamples, totalRenderSamples);
-    }
-
-    private EffectiveGpuAttribution buildEffectiveGpuAttribution(Map<String, RenderPhaseProfiler.PhaseSnapshot> renderPhases, Map<String, CpuSamplingProfiler.Snapshot> rawCpu, Map<String, ModTimingSnapshot> invokes, boolean effectiveView) {
-        EffectiveCpuAttribution effectiveCpu = buildEffectiveCpuAttribution(rawCpu, invokes);
-        Map<String, CpuSamplingProfiler.Snapshot> renderSource = effectiveView ? effectiveCpu.displaySnapshots() : rawCpu;
-        LinkedHashMap<String, Long> renderSamplesByMod = new LinkedHashMap<>();
-        renderSource.forEach((modId, sample) -> {
-            if (sample.renderSamples() > 0L) {
-                renderSamplesByMod.put(modId, sample.renderSamples());
-            }
-        });
-
-        LinkedHashMap<String, Long> directGpuByMod = new LinkedHashMap<>();
-        long sharedGpuNanos = 0L;
-        for (RenderPhaseProfiler.PhaseSnapshot phase : renderPhases.values()) {
-            if (phase.gpuNanos() <= 0L) {
-                continue;
-            }
-            String ownerMod = phase.ownerMod() == null || phase.ownerMod().isBlank() ? "shared/render" : phase.ownerMod();
-            if (isSharedAttributionBucket(ownerMod)) {
-                sharedGpuNanos += phase.gpuNanos();
-            } else {
-                directGpuByMod.merge(ownerMod, phase.gpuNanos(), Long::sum);
-            }
-        }
-
-        if (!effectiveView) {
-            if (sharedGpuNanos > 0L) {
-                directGpuByMod.merge("shared/render", sharedGpuNanos, Long::sum);
-                renderSamplesByMod.putIfAbsent("shared/render", 0L);
-            }
-            long totalGpuNanos = Math.max(1L, directGpuByMod.values().stream().mapToLong(Long::longValue).sum());
-            long totalRenderSamples = Math.max(1L, renderSamplesByMod.values().stream().mapToLong(Long::longValue).sum());
-            return new EffectiveGpuAttribution(directGpuByMod, renderSamplesByMod, Map.of(), Map.of(), totalGpuNanos, totalRenderSamples);
-        }
-
-        LinkedHashMap<String, Long> effectiveGpuByMod = new LinkedHashMap<>();
-        renderSamplesByMod.keySet().forEach(modId -> effectiveGpuByMod.put(modId, directGpuByMod.getOrDefault(modId, 0L)));
-        directGpuByMod.forEach(effectiveGpuByMod::putIfAbsent);
-        Map<String, Double> weights = buildGpuWeightMap(renderSamplesByMod, effectiveGpuByMod);
-        Map<String, Long> redistributedGpu = distributeLongProportionally(sharedGpuNanos, weights);
-        redistributedGpu.forEach((modId, gpuNanos) -> effectiveGpuByMod.merge(modId, gpuNanos, Long::sum));
-        effectiveGpuByMod.entrySet().removeIf(entry -> entry.getValue() <= 0L && renderSamplesByMod.getOrDefault(entry.getKey(), 0L) <= 0L);
-        long totalGpuNanos = Math.max(1L, effectiveGpuByMod.values().stream().mapToLong(Long::longValue).sum());
-        long totalRenderSamples = Math.max(1L, renderSamplesByMod.values().stream().mapToLong(Long::longValue).sum());
-        return new EffectiveGpuAttribution(effectiveGpuByMod, renderSamplesByMod, redistributedGpu, effectiveCpu.redistributedRenderSamplesByMod(), totalGpuNanos, totalRenderSamples);
-    }
-
-    private EffectiveMemoryAttribution buildEffectiveMemoryAttribution(Map<String, Long> rawMemoryMods) {
-        LinkedHashMap<String, Long> concrete = new LinkedHashMap<>();
-        long sharedBytes = 0L;
-        for (Map.Entry<String, Long> entry : rawMemoryMods.entrySet()) {
-            if (isSharedAttributionBucket(entry.getKey())) {
-                sharedBytes += entry.getValue();
-            } else {
-                concrete.put(entry.getKey(), entry.getValue());
-            }
-        }
-        if (concrete.isEmpty()) {
-            long totalBytes = rawMemoryMods.values().stream().mapToLong(Long::longValue).sum();
-            return new EffectiveMemoryAttribution(new LinkedHashMap<>(rawMemoryMods), Map.of(), totalBytes);
-        }
-        Map<String, Double> weights = buildMemoryWeightMap(concrete);
-        Map<String, Long> redistributed = distributeLongProportionally(sharedBytes, weights);
-        LinkedHashMap<String, Long> display = new LinkedHashMap<>();
-        for (Map.Entry<String, Long> entry : concrete.entrySet()) {
-            display.put(entry.getKey(), entry.getValue() + redistributed.getOrDefault(entry.getKey(), 0L));
-        }
-        long totalBytes = display.values().stream().mapToLong(Long::longValue).sum();
-        return new EffectiveMemoryAttribution(display, redistributed, totalBytes);
-    }
-
-    private Map<String, Double> buildCpuWeightMap(Map<String, CpuSamplingProfiler.Snapshot> concrete, Map<String, ModTimingSnapshot> invokes, ToLongFunction<CpuSamplingProfiler.Snapshot> extractor) {
-        LinkedHashMap<String, Double> weights = new LinkedHashMap<>();
-        double total = 0.0;
-        for (Map.Entry<String, CpuSamplingProfiler.Snapshot> entry : concrete.entrySet()) {
-            double weight = Math.max(0L, extractor.applyAsLong(entry.getValue()));
-            weights.put(entry.getKey(), weight);
-            total += weight;
-        }
-        if (total > 0.0) {
-            return weights;
-        }
-        double invokeTotal = 0.0;
-        for (String modId : concrete.keySet()) {
-            double weight = Math.max(0L, invokes.getOrDefault(modId, new ModTimingSnapshot(0, 0)).calls());
-            weights.put(modId, weight);
-            invokeTotal += weight;
-        }
-        if (invokeTotal > 0.0) {
-            return weights;
-        }
-        for (String modId : concrete.keySet()) {
-            weights.put(modId, 1.0);
-        }
-        return weights;
-    }
-
-    private Map<String, Double> buildMemoryWeightMap(Map<String, Long> concrete) {
-        LinkedHashMap<String, Double> weights = new LinkedHashMap<>();
-        double total = 0.0;
-        for (Map.Entry<String, Long> entry : concrete.entrySet()) {
-            double weight = Math.max(0L, entry.getValue());
-            weights.put(entry.getKey(), weight);
-            total += weight;
-        }
-        if (total > 0.0) {
-            return weights;
-        }
-        for (String modId : concrete.keySet()) {
-            weights.put(modId, 1.0);
-        }
-        return weights;
-    }
-
-    private Map<String, Double> buildGpuWeightMap(Map<String, Long> renderSamplesByMod, Map<String, Long> directGpuByMod) {
-        LinkedHashMap<String, Double> weights = new LinkedHashMap<>();
-        double total = 0.0;
-        for (Map.Entry<String, Long> entry : renderSamplesByMod.entrySet()) {
-            if (isSharedAttributionBucket(entry.getKey())) {
-                continue;
-            }
-            double weight = Math.max(0L, entry.getValue());
-            weights.put(entry.getKey(), weight);
-            total += weight;
-        }
-        if (total > 0.0) {
-            return weights;
-        }
-        for (Map.Entry<String, Long> entry : directGpuByMod.entrySet()) {
-            if (isSharedAttributionBucket(entry.getKey())) {
-                continue;
-            }
-            double weight = Math.max(0L, entry.getValue());
-            weights.put(entry.getKey(), weight);
-            total += weight;
-        }
-        if (total > 0.0) {
-            return weights;
-        }
-        for (String modId : renderSamplesByMod.keySet()) {
-            if (!isSharedAttributionBucket(modId)) {
-                weights.put(modId, 1.0);
-            }
-        }
-        if (weights.isEmpty()) {
-            directGpuByMod.keySet().stream().filter(modId -> !isSharedAttributionBucket(modId)).forEach(modId -> weights.put(modId, 1.0));
-        }
-        return weights;
-    }
-
-    private Map<String, Long> distributeLongProportionally(long total, Map<String, Double> weights) {
-        if (total <= 0L || weights.isEmpty()) {
-            return Map.of();
-        }
-        LinkedHashMap<String, Long> result = new LinkedHashMap<>();
-        ArrayList<Map.Entry<String, Double>> entries = new ArrayList<>(weights.entrySet());
-        double weightSum = entries.stream().mapToDouble(entry -> Math.max(0.0, entry.getValue())).sum();
-        if (weightSum <= 0.0) {
-            for (Map.Entry<String, Double> entry : entries) {
-                result.put(entry.getKey(), 0L);
-            }
-            return result;
-        }
-        LinkedHashMap<String, Double> remainders = new LinkedHashMap<>();
-        long assigned = 0L;
-        for (Map.Entry<String, Double> entry : entries) {
-            double exact = total * Math.max(0.0, entry.getValue()) / weightSum;
-            long whole = (long) Math.floor(exact);
-            result.put(entry.getKey(), whole);
-            remainders.put(entry.getKey(), exact - whole);
-            assigned += whole;
-        }
-        long remainder = total - assigned;
-        if (remainder > 0L) {
-            entries.sort((a, b) -> Double.compare(remainders.getOrDefault(b.getKey(), 0.0), remainders.getOrDefault(a.getKey(), 0.0)));
-            for (int i = 0; i < remainder; i++) {
-                String modId = entries.get(i % entries.size()).getKey();
-                result.put(modId, result.getOrDefault(modId, 0L) + 1L);
-            }
-        }
-        return result;
-    }
-
     private Map<String, Double> buildCpuPercentByMod(Map<String, CpuSamplingProfiler.Snapshot> snapshots) {
         LinkedHashMap<String, Double> result = new LinkedHashMap<>();
-        double total = Math.max(1L, snapshots.values().stream().mapToLong(CpuSamplingProfiler.Snapshot::totalSamples).sum());
+        double total = Math.max(1L, totalCpuMetric(snapshots));
         snapshots.entrySet().stream()
-                .sorted((a, b) -> Long.compare(b.getValue().totalSamples(), a.getValue().totalSamples()))
-                .forEach(entry -> result.put(entry.getKey(), entry.getValue().totalSamples() * 100.0 / total));
+                .sorted((a, b) -> Long.compare(cpuMetricValue(b.getValue()), cpuMetricValue(a.getValue())))
+                .forEach(entry -> result.put(entry.getKey(), cpuMetricValue(entry.getValue()) * 100.0 / total));
         return result;
+    }
+
+    private long cpuMetricValue(CpuSamplingProfiler.Snapshot snapshot) {
+        if (snapshot == null) {
+            return 0L;
+        }
+        return snapshot.totalCpuNanos() > 0L ? snapshot.totalCpuNanos() : snapshot.totalSamples();
+    }
+
+    private long totalCpuMetric(Map<String, CpuSamplingProfiler.Snapshot> snapshots) {
+        long totalCpuNanos = snapshots.values().stream().mapToLong(CpuSamplingProfiler.Snapshot::totalCpuNanos).sum();
+        if (totalCpuNanos > 0L) {
+            return totalCpuNanos;
+        }
+        return snapshots.values().stream().mapToLong(CpuSamplingProfiler.Snapshot::totalSamples).sum();
     }
 
     private Map<String, Double> buildGpuPercentByMod(EffectiveGpuAttribution attribution) {
@@ -1326,29 +1670,118 @@ public class ProfilerManager {
         return result;
     }
 
+    private Map<String, String> buildCpuConfidenceByMod(Map<String, CpuSamplingProfiler.Snapshot> rawCpu, EffectiveCpuAttribution effectiveCpu, Map<String, CpuSamplingProfiler.DetailSnapshot> cpuDetails) {
+        LinkedHashMap<String, String> result = new LinkedHashMap<>();
+        effectiveCpu.displaySnapshots().forEach((modId, snapshot) -> {
+            long rawSamples = rawCpu.getOrDefault(modId, new CpuSamplingProfiler.Snapshot(0, 0, 0)).totalSamples();
+            long shownSamples = snapshot.totalSamples();
+            long redistributedSamples = effectiveCpu.redistributedSamplesByMod().getOrDefault(modId, 0L);
+            AttributionInsights.Confidence confidence = AttributionInsights.cpuConfidence(modId, cpuDetails.get(modId), rawSamples, shownSamples, redistributedSamples);
+            result.put(modId, confidence.label());
+        });
+        return result;
+    }
+
+    private Map<String, String> buildGpuConfidenceByMod(EffectiveGpuAttribution rawGpu, EffectiveGpuAttribution effectiveGpu) {
+        LinkedHashMap<String, String> result = new LinkedHashMap<>();
+        effectiveGpu.gpuNanosByMod().forEach((modId, displayGpuNanos) -> {
+            AttributionInsights.Confidence confidence = AttributionInsights.gpuConfidence(
+                    modId,
+                    rawGpu.gpuNanosByMod().getOrDefault(modId, 0L),
+                    displayGpuNanos,
+                    effectiveGpu.redistributedGpuNanosByMod().getOrDefault(modId, 0L),
+                    rawGpu.renderSamplesByMod().getOrDefault(modId, 0L),
+                    effectiveGpu.renderSamplesByMod().getOrDefault(modId, 0L)
+            );
+            result.put(modId, confidence.label());
+        });
+        return result;
+    }
+
+    private Map<String, String> buildMemoryConfidenceByMod(Map<String, Long> rawMemory, EffectiveMemoryAttribution effectiveMemory, long memoryAgeMillis) {
+        LinkedHashMap<String, String> result = new LinkedHashMap<>();
+        effectiveMemory.displayBytes().forEach((modId, displayBytes) -> {
+            AttributionInsights.Confidence confidence = AttributionInsights.memoryConfidence(
+                    modId,
+                    rawMemory.getOrDefault(modId, 0L),
+                    displayBytes,
+                    effectiveMemory.redistributedBytesByMod().getOrDefault(modId, 0L),
+                    memoryAgeMillis
+            );
+            result.put(modId, confidence.label());
+        });
+        return result;
+    }
+
+    private Map<String, String> buildCpuProvenanceByMod(Map<String, CpuSamplingProfiler.Snapshot> rawCpu, EffectiveCpuAttribution effectiveCpu, Map<String, CpuSamplingProfiler.DetailSnapshot> cpuDetails) {
+        LinkedHashMap<String, String> result = new LinkedHashMap<>();
+        effectiveCpu.displaySnapshots().forEach((modId, snapshot) -> result.put(
+                modId,
+                AttributionInsights.cpuProvenance(
+                        rawCpu.getOrDefault(modId, new CpuSamplingProfiler.Snapshot(0, 0, 0)).totalSamples(),
+                        effectiveCpu.redistributedSamplesByMod().getOrDefault(modId, 0L),
+                        cpuDetails.get(modId)
+                )
+        ));
+        return result;
+    }
+
+    private Map<String, String> buildGpuProvenanceByMod(EffectiveGpuAttribution rawGpu, EffectiveGpuAttribution effectiveGpu) {
+        LinkedHashMap<String, String> result = new LinkedHashMap<>();
+        effectiveGpu.gpuNanosByMod().forEach((modId, displayGpuNanos) -> result.put(
+                modId,
+                AttributionInsights.gpuProvenance(
+                        rawGpu.gpuNanosByMod().getOrDefault(modId, 0L),
+                        effectiveGpu.redistributedGpuNanosByMod().getOrDefault(modId, 0L),
+                        rawGpu.renderSamplesByMod().getOrDefault(modId, 0L),
+                        effectiveGpu.renderSamplesByMod().getOrDefault(modId, 0L)
+                )
+        ));
+        return result;
+    }
+
+    private Map<String, String> buildMemoryProvenanceByMod(Map<String, Long> rawMemory, EffectiveMemoryAttribution effectiveMemory, long memoryAgeMillis) {
+        LinkedHashMap<String, String> result = new LinkedHashMap<>();
+        effectiveMemory.displayBytes().forEach((modId, displayBytes) -> result.put(
+                modId,
+                AttributionInsights.memoryProvenance(
+                        rawMemory.getOrDefault(modId, 0L),
+                        effectiveMemory.redistributedBytesByMod().getOrDefault(modId, 0L),
+                        memoryAgeMillis
+                )
+        ));
+        return result;
+    }
+
     private Map<String, Object> buildAttributionExport() {
         Map<String, Object> export = new LinkedHashMap<>();
-        EffectiveCpuAttribution effectiveCpu = buildEffectiveCpuAttribution(currentSnapshot.cpuMods(), currentSnapshot.modInvokes());
-        EffectiveGpuAttribution rawGpu = buildEffectiveGpuAttribution(currentSnapshot.renderPhases(), currentSnapshot.cpuMods(), currentSnapshot.modInvokes(), false);
-        EffectiveGpuAttribution effectiveGpu = buildEffectiveGpuAttribution(currentSnapshot.renderPhases(), currentSnapshot.cpuMods(), currentSnapshot.modInvokes(), true);
-        EffectiveMemoryAttribution effectiveMemory = buildEffectiveMemoryAttribution(currentSnapshot.memoryMods());
+        EffectiveCpuAttribution effectiveCpu = AttributionModelBuilder.buildEffectiveCpuAttribution(currentSnapshot.cpuMods(), currentSnapshot.cpuDetails(), currentSnapshot.modInvokes());
+        EffectiveGpuAttribution rawGpu = AttributionModelBuilder.buildEffectiveGpuAttribution(currentSnapshot.renderPhases(), currentSnapshot.cpuMods(), effectiveCpu, false);
+        EffectiveGpuAttribution effectiveGpu = AttributionModelBuilder.buildEffectiveGpuAttribution(currentSnapshot.renderPhases(), currentSnapshot.cpuMods(), effectiveCpu, true);
+        EffectiveMemoryAttribution effectiveMemory = AttributionModelBuilder.buildEffectiveMemoryAttribution(currentSnapshot.memoryMods());
 
         Map<String, Object> cpu = new LinkedHashMap<>();
-        cpu.put("rawTop", topCpuRows(currentSnapshot.cpuMods(), Math.max(1L, currentSnapshot.cpuMods().values().stream().mapToLong(CpuSamplingProfiler.Snapshot::totalSamples).sum())));
-        cpu.put("effectiveTop", topCpuRows(effectiveCpu.displaySnapshots(), Math.max(1L, effectiveCpu.totalSamples())));
+        cpu.put("sampleAgeMs", currentSnapshot.cpuSampleAgeMillis());
+        cpu.put("collectorSource", "hybrid ThreadMXBean CPU budgets + sampled busy-thread stacks");
+        cpu.put("rawTop", topCpuRows(currentSnapshot.cpuMods(), Math.max(1L, totalCpuMetric(currentSnapshot.cpuMods())), currentSnapshot.cpuMods(), effectiveCpu, false));
+        cpu.put("effectiveTop", topCpuRows(effectiveCpu.displaySnapshots(), Math.max(1L, totalCpuMetric(effectiveCpu.displaySnapshots())), currentSnapshot.cpuMods(), effectiveCpu, true));
         cpu.put("redistributedSamplesByMod", effectiveCpu.redistributedSamplesByMod());
         export.put("cpu", cpu);
 
         Map<String, Object> gpu = new LinkedHashMap<>();
-        gpu.put("rawTop", topGpuRows(rawGpu));
-        gpu.put("effectiveTop", topGpuRows(effectiveGpu));
+        gpu.put("sampleAgeMs", currentSnapshot.cpuSampleAgeMillis());
+        gpu.put("collectorSource", "GPU timer queries on tagged render phases + sampled render-thread ownership");
+        gpu.put("rawTop", topGpuRows(rawGpu, rawGpu, effectiveGpu, false));
+        gpu.put("effectiveTop", topGpuRows(effectiveGpu, rawGpu, effectiveGpu, true));
         gpu.put("redistributedGpuNanosByMod", effectiveGpu.redistributedGpuNanosByMod());
         gpu.put("redistributedRenderSamplesByMod", effectiveGpu.redistributedRenderSamplesByMod());
         export.put("gpu", gpu);
 
         Map<String, Object> memory = new LinkedHashMap<>();
-        memory.put("rawTop", topMemoryRows(currentSnapshot.memoryMods()));
-        memory.put("effectiveTop", topMemoryRows(effectiveMemory.displayBytes()));
+        memory.put("sampleAgeMs", currentSnapshot.memoryAgeMillis());
+        memory.put("collectorSource", "live heap histogram + per-thread allocated-byte deltas");
+        memory.put("rawTop", topMemoryRows(currentSnapshot.memoryMods(), effectiveMemory, false));
+        memory.put("effectiveTop", topMemoryRows(effectiveMemory.displayBytes(), effectiveMemory, true));
         memory.put("redistributedBytesByMod", effectiveMemory.redistributedBytesByMod());
         export.put("memory", memory);
         return export;
@@ -1360,11 +1793,13 @@ public class ProfilerManager {
                 .map(entry -> {
                     Map<String, Object> row = new LinkedHashMap<>();
                     row.put("phase", entry.getKey());
-                    row.put("owner", entry.getValue().ownerMod() == null || entry.getValue().ownerMod().isBlank() ? "shared/render" : entry.getValue().ownerMod());
+                    row.put("owner", AttributionModelBuilder.effectiveGpuPhaseOwner(entry.getValue()));
                     row.put("cpuMs", entry.getValue().cpuNanos() / 1_000_000.0);
                     row.put("gpuMs", entry.getValue().gpuNanos() / 1_000_000.0);
                     row.put("cpuCalls", entry.getValue().cpuCalls());
                     row.put("gpuCalls", entry.getValue().gpuCalls());
+                    row.put("likelyOwners", entry.getValue().likelyOwners());
+                    row.put("likelyFrames", entry.getValue().likelyFrames());
                     return row;
                 })
                 .toList();
@@ -1374,20 +1809,22 @@ public class ProfilerManager {
         Map<String, Object> export = new LinkedHashMap<>();
         Map<String, Object> cpu = new LinkedHashMap<>();
         currentSnapshot.cpuDetails().entrySet().stream()
-                .filter(entry -> isSharedAttributionBucket(entry.getKey()))
+                .filter(entry -> AttributionModelBuilder.isSharedAttributionBucket(entry.getKey()))
                 .forEach(entry -> cpu.put(entry.getKey(), entry.getValue().topFrames()));
         export.put("cpu", cpu);
 
         Map<String, Object> gpu = new LinkedHashMap<>();
         currentSnapshot.renderPhases().entrySet().stream()
                 .filter(entry -> {
-                    String owner = entry.getValue().ownerMod() == null || entry.getValue().ownerMod().isBlank() ? "shared/render" : entry.getValue().ownerMod();
-                    return isSharedAttributionBucket(owner);
+                    String owner = AttributionModelBuilder.effectiveGpuPhaseOwner(entry.getValue());
+                    return AttributionModelBuilder.isSharedAttributionBucket(owner);
                 })
                 .forEach(entry -> gpu.put(entry.getKey(), Map.of(
-                        "owner", entry.getValue().ownerMod() == null || entry.getValue().ownerMod().isBlank() ? "shared/render" : entry.getValue().ownerMod(),
+                        "owner", AttributionModelBuilder.effectiveGpuPhaseOwner(entry.getValue()),
                         "cpuMs", entry.getValue().cpuNanos() / 1_000_000.0,
-                        "gpuMs", entry.getValue().gpuNanos() / 1_000_000.0
+                        "gpuMs", entry.getValue().gpuNanos() / 1_000_000.0,
+                        "likelyOwners", entry.getValue().likelyOwners(),
+                        "likelyFrames", entry.getValue().likelyFrames()
                 )));
         export.put("gpu", gpu);
 
@@ -1400,71 +1837,115 @@ public class ProfilerManager {
         return export;
     }
 
-    private List<Map<String, Object>> topCpuRows(Map<String, CpuSamplingProfiler.Snapshot> snapshots, long totalSamples) {
+    private List<Map<String, Object>> topCpuRows(Map<String, CpuSamplingProfiler.Snapshot> snapshots, long totalSamples, Map<String, CpuSamplingProfiler.Snapshot> rawCpu, EffectiveCpuAttribution effectiveCpu, boolean effectiveView) {
         return snapshots.entrySet().stream()
-                .sorted((a, b) -> Long.compare(b.getValue().totalSamples(), a.getValue().totalSamples()))
+                .sorted((a, b) -> Long.compare(cpuMetricValue(b.getValue()), cpuMetricValue(a.getValue())))
                 .limit(8)
                 .map(entry -> {
+                    String modId = entry.getKey();
+                    long rawSamples = rawCpu.getOrDefault(modId, new CpuSamplingProfiler.Snapshot(0, 0, 0)).totalSamples();
+                    long shownSamples = entry.getValue().totalSamples();
+                    long redistributedSamples = effectiveCpu.redistributedSamplesByMod().getOrDefault(modId, 0L);
+                    CpuSamplingProfiler.DetailSnapshot detail = currentSnapshot.cpuDetails().get(modId);
                     Map<String, Object> row = new LinkedHashMap<>();
-                    row.put("mod", entry.getKey());
+                    row.put("mod", modId);
                     row.put("samples", entry.getValue().totalSamples());
-                    row.put("percent", entry.getValue().totalSamples() * 100.0 / Math.max(1L, totalSamples));
+                    row.put("cpuNanos", entry.getValue().totalCpuNanos());
+                    row.put("percent", cpuMetricValue(entry.getValue()) * 100.0 / Math.max(1L, totalSamples));
+                    row.put("rawSamples", rawSamples);
+                    row.put("effectiveSamples", effectiveView ? shownSamples : rawSamples);
+                    row.put("redistributedSamples", redistributedSamples);
+                    row.put("confidence", AttributionInsights.cpuConfidence(modId, detail, rawSamples, shownSamples, redistributedSamples).label());
+                    row.put("provenance", AttributionInsights.cpuProvenance(rawSamples, redistributedSamples, detail));
+                    row.put("collectorSource", "hybrid ThreadMXBean CPU budgets + sampled busy-thread stacks");
+                    row.put("sampleAgeMs", currentSnapshot.cpuSampleAgeMillis());
                     return row;
                 })
                 .toList();
     }
 
-    private List<Map<String, Object>> topGpuRows(EffectiveGpuAttribution attribution) {
-        return attribution.gpuNanosByMod().entrySet().stream()
+    private List<Map<String, Object>> topGpuRows(EffectiveGpuAttribution displayAttribution, EffectiveGpuAttribution rawAttribution, EffectiveGpuAttribution effectiveAttribution, boolean effectiveView) {
+        return displayAttribution.gpuNanosByMod().entrySet().stream()
                 .sorted((a, b) -> Long.compare(b.getValue(), a.getValue()))
                 .limit(8)
                 .map(entry -> {
+                    String modId = entry.getKey();
+                    long rawGpuNanos = rawAttribution.gpuNanosByMod().getOrDefault(modId, 0L);
+                    long displayGpuNanos = entry.getValue();
+                    long redistributedGpuNanos = effectiveAttribution.redistributedGpuNanosByMod().getOrDefault(modId, 0L);
+                    long rawRenderSamples = rawAttribution.renderSamplesByMod().getOrDefault(modId, 0L);
+                    long displayRenderSamples = displayAttribution.renderSamplesByMod().getOrDefault(modId, 0L);
                     Map<String, Object> row = new LinkedHashMap<>();
-                    row.put("mod", entry.getKey());
+                    row.put("mod", modId);
                     row.put("gpuMs", entry.getValue() / 1_000_000.0);
-                    row.put("percent", entry.getValue() * 100.0 / Math.max(1L, attribution.totalGpuNanos()));
-                    row.put("renderSamples", attribution.renderSamplesByMod().getOrDefault(entry.getKey(), 0L));
+                    row.put("percent", entry.getValue() * 100.0 / Math.max(1L, displayAttribution.totalGpuNanos()));
+                    row.put("renderSamples", displayRenderSamples);
+                    row.put("rawGpuMs", rawGpuNanos / 1_000_000.0);
+                    row.put("effectiveGpuMs", effectiveView ? displayGpuNanos / 1_000_000.0 : rawGpuNanos / 1_000_000.0);
+                    row.put("redistributedGpuMs", redistributedGpuNanos / 1_000_000.0);
+                    row.put("confidence", AttributionInsights.gpuConfidence(modId, rawGpuNanos, displayGpuNanos, redistributedGpuNanos, rawRenderSamples, displayRenderSamples).label());
+                    row.put("provenance", AttributionInsights.gpuProvenance(rawGpuNanos, redistributedGpuNanos, rawRenderSamples, displayRenderSamples));
+                    row.put("collectorSource", "GPU timer queries on tagged render phases + sampled render-thread ownership");
+                    row.put("sampleAgeMs", currentSnapshot.cpuSampleAgeMillis());
                     return row;
                 })
                 .toList();
     }
 
-    private List<Map<String, Object>> topMemoryRows(Map<String, Long> memoryByMod) {
+    private List<Map<String, Object>> topMemoryRows(Map<String, Long> memoryByMod, EffectiveMemoryAttribution effectiveMemory, boolean effectiveView) {
         long total = Math.max(1L, memoryByMod.values().stream().mapToLong(Long::longValue).sum());
         return memoryByMod.entrySet().stream()
                 .sorted((a, b) -> Long.compare(b.getValue(), a.getValue()))
                 .limit(8)
                 .map(entry -> {
+                    String modId = entry.getKey();
+                    long rawBytes = currentSnapshot.memoryMods().getOrDefault(modId, 0L);
+                    long displayBytes = entry.getValue();
+                    long redistributedBytes = effectiveMemory.redistributedBytesByMod().getOrDefault(modId, 0L);
                     Map<String, Object> row = new LinkedHashMap<>();
-                    row.put("mod", entry.getKey());
+                    row.put("mod", modId);
                     row.put("memoryMb", entry.getValue() / (1024.0 * 1024.0));
                     row.put("percent", entry.getValue() * 100.0 / total);
+                    row.put("rawMemoryMb", rawBytes / (1024.0 * 1024.0));
+                    row.put("effectiveMemoryMb", effectiveView ? displayBytes / (1024.0 * 1024.0) : rawBytes / (1024.0 * 1024.0));
+                    row.put("redistributedMemoryMb", redistributedBytes / (1024.0 * 1024.0));
+                    row.put("confidence", AttributionInsights.memoryConfidence(modId, rawBytes, displayBytes, redistributedBytes, currentSnapshot.memoryAgeMillis()).label());
+                    row.put("provenance", AttributionInsights.memoryProvenance(rawBytes, redistributedBytes, currentSnapshot.memoryAgeMillis()));
+                    row.put("collectorSource", "live heap histogram + per-thread allocated-byte deltas");
+                    row.put("sampleAgeMs", currentSnapshot.memoryAgeMillis());
                     return row;
                 })
                 .toList();
     }
 
     private List<Map<String, Object>> buildTopCpuModSummary() {
-        EffectiveCpuAttribution effectiveCpu = buildEffectiveCpuAttribution(currentSnapshot.cpuMods(), currentSnapshot.modInvokes());
-        long totalCpuSamples = Math.max(1L, effectiveCpu.totalSamples());
+        EffectiveCpuAttribution effectiveCpu = AttributionModelBuilder.buildEffectiveCpuAttribution(currentSnapshot.cpuMods(), currentSnapshot.cpuDetails(), currentSnapshot.modInvokes());
+        long totalCpuSamples = Math.max(1L, totalCpuMetric(effectiveCpu.displaySnapshots()));
         return effectiveCpu.displaySnapshots().entrySet().stream()
-                .sorted((a, b) -> Long.compare(b.getValue().totalSamples(), a.getValue().totalSamples()))
+                .sorted((a, b) -> Long.compare(cpuMetricValue(b.getValue()), cpuMetricValue(a.getValue())))
                 .limit(5)
                 .map(entry -> {
                     Map<String, Object> row = new LinkedHashMap<>();
                     row.put("mod", entry.getKey());
                     row.put("samples", entry.getValue().totalSamples());
-                    row.put("percentCpu", entry.getValue().totalSamples() * 100.0 / totalCpuSamples);
+                    row.put("cpuNanos", entry.getValue().totalCpuNanos());
+                    row.put("percentCpu", cpuMetricValue(entry.getValue()) * 100.0 / totalCpuSamples);
                     row.put("rawSamples", currentSnapshot.cpuMods().getOrDefault(entry.getKey(), new CpuSamplingProfiler.Snapshot(0, 0, 0)).totalSamples());
                     row.put("redistributedSamples", effectiveCpu.redistributedSamplesByMod().getOrDefault(entry.getKey(), 0L));
                     row.put("threadCount", currentSnapshot.cpuDetails().get(entry.getKey()) == null ? 0 : currentSnapshot.cpuDetails().get(entry.getKey()).sampledThreadCount());
+                    row.put("confidence", buildCpuConfidenceByMod(currentSnapshot.cpuMods(), effectiveCpu, currentSnapshot.cpuDetails()).getOrDefault(entry.getKey(), "Unknown"));
+                    row.put("provenance", buildCpuProvenanceByMod(currentSnapshot.cpuMods(), effectiveCpu, currentSnapshot.cpuDetails()).getOrDefault(entry.getKey(), "Unknown"));
+                    row.put("sampleAgeMs", currentSnapshot.cpuSampleAgeMillis());
+                    row.put("collectorSource", "hybrid ThreadMXBean CPU budgets + sampled busy-thread stacks");
                     return row;
                 })
                 .toList();
     }
 
     private List<Map<String, Object>> buildTopGpuModSummary() {
-        EffectiveGpuAttribution effectiveGpu = buildEffectiveGpuAttribution(currentSnapshot.renderPhases(), currentSnapshot.cpuMods(), currentSnapshot.modInvokes(), true);
+        EffectiveCpuAttribution effectiveCpu = AttributionModelBuilder.buildEffectiveCpuAttribution(currentSnapshot.cpuMods(), currentSnapshot.cpuDetails(), currentSnapshot.modInvokes());
+        EffectiveGpuAttribution rawGpu = AttributionModelBuilder.buildEffectiveGpuAttribution(currentSnapshot.renderPhases(), currentSnapshot.cpuMods(), effectiveCpu, false);
+        EffectiveGpuAttribution effectiveGpu = AttributionModelBuilder.buildEffectiveGpuAttribution(currentSnapshot.renderPhases(), currentSnapshot.cpuMods(), effectiveCpu, true);
         long totalGpuNs = Math.max(1L, effectiveGpu.totalGpuNanos());
         return effectiveGpu.gpuNanosByMod().entrySet().stream()
                 .sorted((a, b) -> Long.compare(b.getValue(), a.getValue()))
@@ -1474,16 +1955,21 @@ public class ProfilerManager {
                     row.put("mod", entry.getKey());
                     row.put("gpuFrameTimeMsEstimate", entry.getValue() / 1_000_000.0);
                     row.put("percentGpuEstimate", entry.getValue() * 100.0 / totalGpuNs);
-                    row.put("rawGpuFrameTimeMs", buildEffectiveGpuAttribution(currentSnapshot.renderPhases(), currentSnapshot.cpuMods(), currentSnapshot.modInvokes(), false).gpuNanosByMod().getOrDefault(entry.getKey(), 0L) / 1_000_000.0);
+                    row.put("rawGpuFrameTimeMs", rawGpu.gpuNanosByMod().getOrDefault(entry.getKey(), 0L) / 1_000_000.0);
                     row.put("renderSamples", effectiveGpu.renderSamplesByMod().getOrDefault(entry.getKey(), 0L));
                     row.put("redistributedGpuNanos", effectiveGpu.redistributedGpuNanosByMod().getOrDefault(entry.getKey(), 0L));
                     row.put("threadCount", currentSnapshot.cpuDetails().get(entry.getKey()) == null ? 0 : currentSnapshot.cpuDetails().get(entry.getKey()).sampledThreadCount());
+                    row.put("confidence", buildGpuConfidenceByMod(rawGpu, effectiveGpu).getOrDefault(entry.getKey(), "Unknown"));
+                    row.put("provenance", buildGpuProvenanceByMod(rawGpu, effectiveGpu).getOrDefault(entry.getKey(), "Unknown"));
+                    row.put("sampleAgeMs", currentSnapshot.cpuSampleAgeMillis());
+                    row.put("collectorSource", "GPU timer queries on tagged render phases + sampled render-thread ownership");
                     return row;
                 })
                 .toList();
     }
 
     private List<Map<String, Object>> buildTopMemoryModSummary() {
+        EffectiveMemoryAttribution effectiveMemory = AttributionModelBuilder.buildEffectiveMemoryAttribution(currentSnapshot.memoryMods());
         long totalMemory = Math.max(1L, currentSnapshot.memoryMods().values().stream().mapToLong(Long::longValue).sum());
         return currentSnapshot.memoryMods().entrySet().stream()
                 .sorted((a, b) -> Long.compare(b.getValue(), a.getValue()))
@@ -1494,6 +1980,10 @@ public class ProfilerManager {
                     row.put("memoryMb", entry.getValue() / (1024.0 * 1024.0));
                     row.put("percentAttributedMemory", entry.getValue() * 100.0 / totalMemory);
                     row.put("classCount", currentSnapshot.memoryClassesByMod().getOrDefault(entry.getKey(), Map.of()).size());
+                    row.put("confidence", buildMemoryConfidenceByMod(currentSnapshot.memoryMods(), effectiveMemory, currentSnapshot.memoryAgeMillis()).getOrDefault(entry.getKey(), "Unknown"));
+                    row.put("provenance", buildMemoryProvenanceByMod(currentSnapshot.memoryMods(), effectiveMemory, currentSnapshot.memoryAgeMillis()).getOrDefault(entry.getKey(), "Unknown"));
+                    row.put("sampleAgeMs", currentSnapshot.memoryAgeMillis());
+                    row.put("collectorSource", "live heap histogram + per-thread allocated-byte deltas");
                     return row;
                 })
                 .toList();
@@ -1599,6 +2089,15 @@ public class ProfilerManager {
         SystemMetricsProfiler.Snapshot system = SystemMetricsProfiler.getInstance().getSnapshot();
         MemoryProfiler.Snapshot memory = MemoryProfiler.getInstance().getDetailedSnapshot();
         double serverTickMs = TickProfiler.getInstance().getAverageServerTickNs() / 1_000_000.0;
+        RuleFinding highestFinding = latestRuleFindings.stream()
+                .sorted((a, b) -> Integer.compare(severityRank(b.severity()), severityRank(a.severity())))
+                .findFirst()
+                .orElse(null);
+        String status = highestFinding == null ? "Stable" : switch (highestFinding.severity()) {
+            case "critical" -> "Critical";
+            case "warning", "error" -> "Warning";
+            default -> "Stable";
+        };
         String systemBound = system.gpuCoreLoadPercent() > 90.0 && serverTickMs < 15.0 ? "GPU-bound" : serverTickMs > 40.0 ? "CPU-bound" : "Balanced";
         String thermal = system.gpuTemperatureC() > 85.0 || system.cpuTemperatureC() > 90.0 ? "Thermal warning." : "Thermals are optimal.";
         boolean memoryPressure = false;
@@ -1610,8 +2109,25 @@ public class ProfilerManager {
         String logicText = serverTickMs > 40.0 ? String.format("Entity logic overhead is high (%.1fms).", serverTickMs) : String.format("Entity logic overhead is low (%.1fms).", serverTickMs);
         String schedulingText = system.schedulingConflictSummary() == null || system.schedulingConflictSummary().isBlank() ? "" : (" " + system.schedulingConflictSummary() + ".");
         String overscheduleText = sessionParallelismFlag(system, FrameTimelineProfiler.getInstance().getStutterScore()).equals("Thread Overscheduling Warning") ? " Thread overscheduling is likely." : "";
-        return "Status: Healthy. System is " + systemBound + ". " + thermal + " " + memoryText + " " + logicText + " Parallelism Efficiency: " + system.parallelismEfficiency() + schedulingText + overscheduleText;
+        String conflictText = latestConflictEdges.isEmpty() ? "" : (" Top conflict candidate: " + latestConflictEdges.getFirst().waiterMod() + " waiting on " + latestConflictEdges.getFirst().ownerMod() + " via " + latestConflictEdges.getFirst().lockName() + ".");
+        return "Status: " + status + ". System is " + systemBound + ". " + thermal + " " + memoryText + " " + logicText + " Parallelism Efficiency: " + system.parallelismEfficiency() + schedulingText + overscheduleText + conflictText;
     }
+
+    private void appendTraceSpan(List<Map<String, Object>> events, String name, String threadName, long completedAtEpochMillis, double durationMs) {
+        if (completedAtEpochMillis <= 0L || durationMs <= 0.0) {
+            return;
+        }
+        Map<String, Object> event = new LinkedHashMap<>();
+        event.put("name", name);
+        event.put("cat", "taskmanager");
+        event.put("ph", "X");
+        event.put("pid", 1);
+        event.put("tid", threadName);
+        event.put("ts", Math.max(0L, completedAtEpochMillis * 1000L - Math.round(durationMs * 1000.0)));
+        event.put("dur", Math.max(1L, Math.round(durationMs * 1000.0)));
+        events.add(event);
+    }
+
     private void enforceSessionWindow(MinecraftClient client) {
         int maxSessionPoints = Math.max(60, ConfigManager.getSessionDurationSeconds() * 20);
         while (sessionHistory.size() > maxSessionPoints) {
@@ -1624,22 +2140,6 @@ public class ProfilerManager {
             String exportStatus = exportSession();
             if (client != null && client.player != null) {
                 client.player.sendMessage(Text.literal("Task Manager: Session recorded. " + exportStatus), false);
-                if (lastExportHtmlReport != null) {
-                    Text openReport = Text.literal("[Open Session Report]")
-                            .setStyle(Style.EMPTY
-                                    .withColor(Formatting.AQUA)
-                                    .withUnderline(true)
-                                    .withClickEvent(new ClickEvent.OpenFile(lastExportHtmlReport.toAbsolutePath().toString())));
-                    client.player.sendMessage(openReport, false);
-                }
-                if (lastExportDirectory != null) {
-                    Text openFolder = Text.literal("[Open Session Logs Folder]")
-                            .setStyle(Style.EMPTY
-                                    .withColor(Formatting.GREEN)
-                                    .withUnderline(true)
-                                    .withClickEvent(new ClickEvent.OpenFile(lastExportDirectory.toAbsolutePath().toString())));
-                    client.player.sendMessage(openFolder, false);
-                }
             }
         }
     }
@@ -1750,6 +2250,10 @@ public class ProfilerManager {
         return latestHotChunks;
     }
 
+    public List<SpikeCapture> getSpikes() {
+        return List.copyOf(spikes);
+    }
+
     public List<Integer> getChunkActivityHistory(ChunkPos chunkPos) {
         if (chunkPos == null) {
             return List.of();
@@ -1768,6 +2272,10 @@ public class ProfilerManager {
 
     public List<BlockEntityHotspot> getLatestBlockEntityHotspots() {
         return latestBlockEntityHotspots;
+    }
+
+    public List<ConflictEdge> getLatestConflictEdges() {
+        return latestConflictEdges;
     }
 
     public List<String> getLatestLockSummaries() {
@@ -1849,127 +2357,8 @@ public class ProfilerManager {
         return export;
     }
 
-    private List<RuleFinding> buildRuleFindings() {
-        List<RuleFinding> findings = new ArrayList<>();
-        SystemMetricsProfiler.Snapshot system = SystemMetricsProfiler.getInstance().getSnapshot();
-        double latestFrameMs = FrameTimelineProfiler.getInstance().getLatestFrameNs() / 1_000_000.0;
-        double serverTickMs = TickProfiler.getInstance().getAverageServerTickNs() / 1_000_000.0;
-        double clientTickMs = TickProfiler.getInstance().getAverageClientTickNs() / 1_000_000.0;
-        double stutterScore = FrameTimelineProfiler.getInstance().getStutterScore();
-        double heapUsedPct = currentSnapshot.memory().heapCommittedBytes() > 0
-                ? currentSnapshot.memory().heapUsedBytes() * 100.0 / currentSnapshot.memory().heapCommittedBytes()
-                : 0.0;
-
-        if (system.gpuCoreLoadPercent() > 90.0 && latestFrameMs > ConfigManager.getFrameBudgetTargetFrameMs() && serverTickMs < 15.0) {
-            findings.add(new RuleFinding(latestFrameMs > 33.0 && system.gpuCoreLoadPercent() > 97.0 ? "critical" : "warning", "gpu", "GPU appears saturated while logic stays healthy.", "measured",
-                    "The render path is spending time on the GPU while server-side logic remains within budget.",
-                    "Check heavy shader packs, high-resolution effects, and the GPU tab's hottest render phases.",
-                    String.format(Locale.ROOT, "GPU %.0f%% | frame %.1f ms | server %.1f ms", system.gpuCoreLoadPercent(), latestFrameMs, serverTickMs)));
-        }
-        if (serverTickMs > 40.0) {
-            findings.add(new RuleFinding(serverTickMs > 80.0 ? "critical" : "warning", "logic", String.format(Locale.ROOT, "Server tick is elevated at %.1f ms.", serverTickMs), "measured",
-                    "Integrated-server work is exceeding a comfortable frame budget and will usually show up as simulation hitching.",
-                    "Inspect the World tab for hot chunks, block entities, and thread wait activity around the same window.",
-                    String.format(Locale.ROOT, "server %.1f ms | client %.1f ms | stutter %.1f", serverTickMs, clientTickMs, stutterScore)));
-        }
-        if (system.diskWriteBytesPerSecond() > 8L * 1024L * 1024L && latestFrameMs > 50.0) {
-            findings.add(new RuleFinding(system.diskWriteBytesPerSecond() > 24L * 1024L * 1024L ? "critical" : "warning", "io", "Heavy disk writes overlap with a bad frame spike.", "measured",
-                    "High write throughput is coinciding with a visible hitch and may point to saves, chunk flushes, or logging bursts.",
-                    "Check the Disk tab and world activity for saves, region writes, or mods with frequent persistence.",
-                    String.format(Locale.ROOT, "writes %s | frame %.1f ms", formatBytesPerSecond(system.diskWriteBytesPerSecond()), latestFrameMs)));
-        }
-        if (system.activeHighLoadThreads() > Math.max(1, system.estimatedPhysicalCores() / 2) && stutterScore > 10.0) {
-            findings.add(new RuleFinding(system.activeHighLoadThreads() > Math.max(2, system.estimatedPhysicalCores()) ? "critical" : "warning", "threads", "Thread overscheduling warning: too many high-load threads are active for the estimated physical core budget.", "inferred",
-                    "Multiple hot threads are competing for a limited physical-core budget during a stutter window.",
-                    "Inspect the System tab's top threads and worker activity to see whether chunk builders or async workers are crowding the CPU.",
-                    String.format(Locale.ROOT, "high-load threads %d | est. physical cores %d | stutter %.1f", system.activeHighLoadThreads(), system.estimatedPhysicalCores(), stutterScore)));
-        }
-        if (!latestHotChunks.isEmpty() && serverTickMs > 20.0) {
-            HotChunkSnapshot hot = latestHotChunks.getFirst();
-            findings.add(new RuleFinding("info", "chunks", String.format(Locale.ROOT, "Hot chunk %d,%d has %d entities and %d block entities.", hot.chunkX(), hot.chunkZ(), hot.entityCount(), hot.blockEntityCount()), "measured",
-                    "A single chunk is standing out in the current window and may be central to the slowdown.",
-                    "Select the chunk in the World tab and inspect entity density, block entities, and thread load together.",
-                    String.format(Locale.ROOT, "activity %.1f | entities %d | block entities %d", hot.activityScore(), hot.entityCount(), hot.blockEntityCount())));
-        }
-        if (!latestEntityHotspots.isEmpty()) {
-            EntityHotspot hotspot = latestEntityHotspots.getFirst();
-            if (!"none".equals(hotspot.heuristic())) {
-                findings.add(new RuleFinding(hotspot.count() >= 100 ? "critical" : "warning", "entities", hotspot.className() + " is dominating recent entity cost signals: " + hotspot.heuristic(), "inferred",
-                        "Recent world samples point to one entity family as the strongest source of per-chunk entity pressure.",
-                        "Inspect mob AI density, farms, and clustered spawns in the World tab near the hot chunk.",
-                        String.format(Locale.ROOT, "%s x%d", hotspot.className(), hotspot.count())));
-            }
-        }
-        if (!latestBlockEntityHotspots.isEmpty()) {
-            BlockEntityHotspot hotspot = latestBlockEntityHotspots.getFirst();
-            if (hotspot.count() >= 20) {
-                findings.add(new RuleFinding(hotspot.count() >= 60 ? "critical" : "warning", "block-entities", hotspot.className() + " is dense across loaded chunks and may be ticking heavily.", "inferred",
-                        "A block entity class is showing up frequently enough to plausibly drive ticking or storage pressure.",
-                        "Open the Block Entities mini-tab and inspect the selected chunk plus the global hotspot list.",
-                        String.format(Locale.ROOT, "%s x%d | %s", hotspot.className(), hotspot.count(), hotspot.heuristic())));
-            }
-        }
-        if (!latestLockSummaries.isEmpty()) {
-            findings.add(new RuleFinding("info", "locks", latestLockSummaries.getFirst(), "measured",
-                    "A thread spent time blocked or waiting in the current window.",
-                    "Use the System tab to check the owning thread and see whether the wait lines up with chunk IO or background workers.",
-                    latestLockSummaries.getFirst()));
-            boolean chunkIoLock = latestLockSummaries.stream()
-                    .map(summary -> summary.toLowerCase(Locale.ROOT))
-                    .anyMatch(summary -> summary.contains("region") || summary.contains("chunk") || summary.contains("poi") || summary.contains("anvil") || summary.contains("storage"));
-            if (chunkIoLock && (serverTickMs > 20.0 || latestFrameMs > 25.0)) {
-                findings.add(new RuleFinding((serverTickMs > 50.0 || latestFrameMs > 40.0) ? "critical" : "warning", "chunk-io", "Threads are waiting on chunk or region style locks during a slow window.", "inferred",
-                        "The lock names look chunk-storage related and overlap with a visible slowdown.",
-                        "Check async chunk mods, world storage activity, and the Disk tab for matching spikes.",
-                        String.format(Locale.ROOT, "server %.1f ms | frame %.1f ms | lock count %d", serverTickMs, latestFrameMs, latestLockSummaries.size())));
-            }
-        }
-        if (system.bytesReceivedPerSecond() > 512L * 1024L && latestFrameMs > 20.0) {
-            findings.add(new RuleFinding("info", "network", "A network burst overlaps with a slower frame window.", "measured",
-                    "Inbound traffic is elevated enough to plausibly disturb the client if packet handling or chunk delivery is busy.",
-                    "Inspect the Network tab's packet types and recent spike bookmarks.",
-                    String.format(Locale.ROOT, "inbound %s | packet latency %.1f ms", formatBytesPerSecond(system.bytesReceivedPerSecond()), system.packetProcessingLatencyMs())));
-        }
-        if ((system.chunksGenerating() > 0 || system.chunksMeshing() > 0 || system.chunksUploading() > 0) && (latestFrameMs > 20.0 || serverTickMs > 20.0)) {
-            findings.add(new RuleFinding("info", "chunk-pipeline", "Chunk generation, meshing, or upload work is active during the current slow window.", "measured",
-                    "World streaming work is non-idle and may be contributing to a hitch, especially while moving quickly or exploring new terrain.",
-                    "Check the World tab and render metrics for generation, meshing, upload, and lighting pressure.",
-                    String.format(Locale.ROOT, "gen %d | mesh %d | upload %d | lights %d", system.chunksGenerating(), system.chunksMeshing(), system.chunksUploading(), system.lightsUpdatePending())));
-        }
-        if (heapUsedPct > 85.0) {
-            findings.add(new RuleFinding("info", "memory", "Heap usage is high relative to committed memory.", "measured",
-                    "Live heap usage is near the current committed ceiling, which can increase GC pressure or mask leaks.",
-                    "Inspect the Memory tab for dominant mods and shared JVM buckets, especially if GC pauses are appearing too.",
-                    String.format(Locale.ROOT, "heap %.0f%% | used %s", heapUsedPct, formatBytesMb(currentSnapshot.memory().heapUsedBytes()))));
-        }
-        if (currentSnapshot.memory().gcPauseDurationMs() > 0) {
-            findings.add(new RuleFinding("info", "gc", "Recent GC pause detected: " + currentSnapshot.memory().gcType() + " " + currentSnapshot.memory().gcPauseDurationMs() + " ms.", "measured",
-                    "A garbage-collection pause occurred recently and may explain a hitch if it aligns with frame or tick spikes.",
-                    "Correlate the pause with frame-time spikes and high heap usage in the Timeline and Memory tabs.",
-                    String.format(Locale.ROOT, "%s | pause %d ms", currentSnapshot.memory().gcType(), currentSnapshot.memory().gcPauseDurationMs())));
-        }
-        if (system.cpuTemperatureC() < 0 && system.gpuTemperatureC() < 0) {
-            findings.add(new RuleFinding("info", "sensors", "Temperature sensors are unavailable on this machine/provider combination; falling back to load-only telemetry.", "unavailable",
-                    "The profiler can still report utilization, but package/core temperatures are not currently exposed by any detected provider.",
-                    "Open the System tab's Sensors panel to see provider attempts and the last bridge error.",
-                    system.cpuTemperatureUnavailableReason()));
-        } else if (system.cpuTemperatureC() >= 85.0 || system.gpuTemperatureC() >= 85.0) {
-            findings.add(new RuleFinding((system.cpuTemperatureC() >= 92.0 || system.gpuTemperatureC() >= 90.0) ? "critical" : "warning", "thermals", "A CPU or GPU temperature is entering a throttling-prone range.", "measured",
-                    "Sustained temperatures in the mid-80s or higher can cause clocks to drop and make spikes harder to explain from software alone.",
-                    "Check cooling, fan curves, and whether the slowdown lines up with a thermal ramp in exported sessions.",
-                    String.format(Locale.ROOT, "CPU %s | GPU %s", system.cpuTemperatureC() >= 0 ? String.format(Locale.ROOT, "%.1f C", system.cpuTemperatureC()) : "N/A", system.gpuTemperatureC() >= 0 ? String.format(Locale.ROOT, "%.1f C", system.gpuTemperatureC()) : "N/A")));
-        }
-        findings.sort((a, b) -> Integer.compare(severityRank(b.severity()), severityRank(a.severity())));
-        return findings;
-    }
-
     private int severityRank(String severity) {
-        return switch (severity == null ? "info" : severity.toLowerCase(Locale.ROOT)) {
-            case "critical" -> 3;
-            case "error" -> 2;
-            case "warning" -> 1;
-            default -> 0;
-        };
+        return RuleEngine.severityRank(severity);
     }
     private String formatBytesPerSecond(long value) {
         if (value < 0) {
@@ -2032,7 +2421,154 @@ public class ProfilerManager {
                 .toList();
     }
 
+    private void updateConflictTracking(SystemMetricsProfiler.Snapshot system) {
+        boolean slowdownOverlap = FrameTimelineProfiler.getInstance().getLatestFrameNs() / 1_000_000.0 > Math.max(20.0, ConfigManager.getFrameBudgetTargetFrameMs() * 1.25)
+                || TickProfiler.getInstance().getAverageServerTickNs() / 1_000_000.0 > 20.0
+                || FrameTimelineProfiler.getInstance().getStutterScore() > 10.0;
+        List<ConflictObservation> observations = system.contentionSamples().stream()
+                .map(sample -> new ConflictObservation(
+                        sample.waiterMod(),
+                        sample.ownerMod(),
+                        sample.lockName(),
+                        sample.waiterThreadName(),
+                        sample.ownerThreadName(),
+                        sample.waiterRole(),
+                        sample.ownerRole(),
+                        sample.blockedTimeDeltaMs(),
+                        sample.waitedTimeDeltaMs(),
+                        slowdownOverlap,
+                        sample.confidence(),
+                        List.copyOf(sample.waiterCandidates()),
+                        List.copyOf(sample.ownerCandidates())
+                ))
+                .toList();
+        conflictWindows.addLast(observations);
+        while (conflictWindows.size() > WINDOW_SIZE) {
+            conflictWindows.removeFirst();
+        }
+        latestConflictEdges = aggregateConflictEdges();
+    }
+
+    private List<ConflictEdge> aggregateConflictEdges() {
+        record Aggregate(
+                String waiterMod,
+                String ownerMod,
+                String lockName,
+                String waiterThreadName,
+                String ownerThreadName,
+                String waiterRole,
+                String ownerRole,
+                long observations,
+                long slowdownObservations,
+                long blockedTimeMs,
+                long waitedTimeMs,
+                String confidence,
+                List<String> waiterCandidates,
+                List<String> ownerCandidates
+        ) {}
+        Map<String, Aggregate> aggregates = new LinkedHashMap<>();
+        for (List<ConflictObservation> window : conflictWindows) {
+            for (ConflictObservation observation : window) {
+                String key = observation.waiterMod() + "|" + observation.ownerMod() + "|" + observation.lockName();
+                Aggregate existing = aggregates.get(key);
+                if (existing == null) {
+                    aggregates.put(key, new Aggregate(
+                            observation.waiterMod(),
+                            observation.ownerMod(),
+                            observation.lockName(),
+                            observation.waiterThreadName(),
+                            observation.ownerThreadName(),
+                            observation.waiterRole(),
+                            observation.ownerRole(),
+                            1L,
+                            observation.slowdownOverlap() ? 1L : 0L,
+                            observation.blockedTimeDeltaMs(),
+                            observation.waitedTimeDeltaMs(),
+                            observation.confidence(),
+                            observation.waiterCandidates(),
+                            observation.ownerCandidates()
+                    ));
+                    continue;
+                }
+                aggregates.put(key, new Aggregate(
+                        existing.waiterMod(),
+                        existing.ownerMod(),
+                        existing.lockName(),
+                        observation.waiterThreadName() == null || observation.waiterThreadName().isBlank() ? existing.waiterThreadName() : observation.waiterThreadName(),
+                        observation.ownerThreadName() == null || observation.ownerThreadName().isBlank() ? existing.ownerThreadName() : observation.ownerThreadName(),
+                        observation.waiterRole() == null || observation.waiterRole().isBlank() ? existing.waiterRole() : observation.waiterRole(),
+                        observation.ownerRole() == null || observation.ownerRole().isBlank() ? existing.ownerRole() : observation.ownerRole(),
+                        existing.observations() + 1L,
+                        existing.slowdownObservations() + (observation.slowdownOverlap() ? 1L : 0L),
+                        existing.blockedTimeMs() + observation.blockedTimeDeltaMs(),
+                        existing.waitedTimeMs() + observation.waitedTimeDeltaMs(),
+                        strongerConfidence(existing.confidence(), observation.confidence()),
+                        existing.waiterCandidates().isEmpty() ? observation.waiterCandidates() : existing.waiterCandidates(),
+                        existing.ownerCandidates().isEmpty() ? observation.ownerCandidates() : existing.ownerCandidates()
+                ));
+            }
+        }
+        return aggregates.values().stream()
+                .map(aggregate -> new ConflictEdge(
+                        aggregate.waiterMod(),
+                        aggregate.ownerMod(),
+                        aggregate.lockName(),
+                        aggregate.waiterThreadName(),
+                        aggregate.ownerThreadName(),
+                        aggregate.waiterRole(),
+                        aggregate.ownerRole(),
+                        aggregate.observations(),
+                        aggregate.slowdownObservations(),
+                        aggregate.blockedTimeMs(),
+                        aggregate.waitedTimeMs(),
+                        aggregate.confidence(),
+                        aggregate.waiterCandidates(),
+                        aggregate.ownerCandidates()
+                ))
+                .sorted((a, b) -> {
+                    int slowdownCompare = Long.compare(b.slowdownObservations(), a.slowdownObservations());
+                    if (slowdownCompare != 0) {
+                        return slowdownCompare;
+                    }
+                    int observationCompare = Long.compare(b.observations(), a.observations());
+                    if (observationCompare != 0) {
+                        return observationCompare;
+                    }
+                    return Long.compare((b.blockedTimeMs() + b.waitedTimeMs()), (a.blockedTimeMs() + a.waitedTimeMs()));
+                })
+                .limit(10)
+                .toList();
+    }
+
+    private String strongerConfidence(String left, String right) {
+        return confidenceRank(right) > confidenceRank(left) ? right : left;
+    }
+
+    private int confidenceRank(String confidence) {
+        if (confidence == null) {
+            return 0;
+        }
+        return switch (confidence.toLowerCase(Locale.ROOT)) {
+            case "known incompatibility" -> 4;
+            case "pairwise inferred", "measured" -> 3;
+            case "inferred" -> 2;
+            case "weak heuristic" -> 1;
+            default -> 0;
+        };
+    }
+
     private List<String> buildLockSummaries(SystemMetricsProfiler.Snapshot system) {
+        if (system.contentionSamples() != null && !system.contentionSamples().isEmpty()) {
+            return system.contentionSamples().stream()
+                    .limit(5)
+                    .map(sample -> {
+                        String waiter = formatConflictParty(sample.waiterMod(), sample.waiterThreadName(), sample.waiterRole());
+                        String owner = formatConflictParty(sample.ownerMod(), sample.ownerThreadName(), sample.ownerRole());
+                        return waiter + " waiting on " + owner + " via " + sample.lockName()
+                                + " (" + sample.confidence() + ", blocked " + sample.blockedTimeDeltaMs() + " ms, waited " + sample.waitedTimeDeltaMs() + " ms)";
+                    })
+                    .toList();
+        }
         return system.threadDetailsByName().entrySet().stream()
                 .filter(entry -> entry.getValue().blockedCountDelta() > 0 || entry.getValue().waitedCountDelta() > 0 || "BLOCKED".equals(entry.getValue().state()) || "WAITING".equals(entry.getValue().state()))
                 .limit(5)
@@ -2045,32 +2581,19 @@ public class ProfilerManager {
                 .toList();
     }
 
+    private String formatConflictParty(String modId, String threadName, String role) {
+        String mod = modId == null || modId.isBlank() ? "unknown" : modId;
+        String thread = threadName == null || threadName.isBlank() ? "unknown thread" : threadName;
+        String roleText = role == null || role.isBlank() ? "unknown role" : role;
+        return mod + " [" + roleText + " | " + thread + "]";
+    }
+
     private String classifyEntityHeuristic(String className) {
-        String lower = className.toLowerCase(Locale.ROOT);
-        if (lower.contains("villager") || lower.contains("bee") || lower.contains("piglin") || lower.contains("warden") || lower.contains("zombie") || lower.contains("creeper") || lower.contains("animal")) {
-            return "AI/pathfinding-heavy mob cluster";
-        }
-        if (lower.contains("item") || lower.contains("experience_orb") || lower.contains("projectile") || lower.contains("arrow")) {
-            return "High transient entity count";
-        }
-        if (lower.contains("boat") || lower.contains("minecart")) {
-            return "Collision-heavy vehicle cluster";
-        }
-        return "none";
+        return RuleEngine.classifyEntityHeuristic(className);
     }
 
     private String classifyBlockEntityHeuristic(String className) {
-        String lower = className.toLowerCase(Locale.ROOT);
-        if (lower.contains("hopper") || lower.contains("pipe") || lower.contains("conveyor")) {
-            return "Inventory transfer / item routing";
-        }
-        if (lower.contains("chest") || lower.contains("storage") || lower.contains("barrel")) {
-            return "Storage dense chunk";
-        }
-        if (lower.contains("spawner") || lower.contains("beacon") || lower.contains("furnace") || lower.contains("machine")) {
-            return "Ticking machine / utility block entity";
-        }
-        return "General block entity density";
+        return RuleEngine.classifyBlockEntityHeuristic(className);
     }
 
 
@@ -2126,7 +2649,7 @@ public class ProfilerManager {
 
     private List<Map<String, String>> buildRedFlagThresholds() {
         List<Map<String, String>> rows = new ArrayList<>();
-        rows.add(redFlag("Sync-Lock Latency", "Catches mod conflicts.", "> 10ms"));
+        rows.add(redFlag("Sync-Lock Latency", "Flags contention windows that can indicate mod interactions or storage stalls.", "> 10ms"));
         rows.add(redFlag("Draw Call Counter", "Tells you if your base has too many chests/signs.", "> 8,000"));
         rows.add(redFlag("Lighting Queue", "Detects lag caused by light/shadow recalculations.", "> 500 updates"));
         rows.add(redFlag("Thread State Ratio", "Shows if your CPU is working or just waiting.", "< 0.5 ratio"));
@@ -2140,6 +2663,121 @@ public class ProfilerManager {
         row.put("whyYouNeedIt", why);
         row.put("redFlagValue", value);
         return row;
+    }
+
+    private WorldScanResult sampleWorldData(MinecraftClient client) {
+        if (client.world == null) {
+            hotChunkHistory.clear();
+            chunkActivityHistory.clear();
+            lastWorldScanAtMillis = System.currentTimeMillis();
+            lastWorldScanDurationMillis = 0L;
+            return new WorldScanResult(EntityCounts.empty(), List.of(), List.of(), List.of());
+        }
+
+        long now = System.currentTimeMillis();
+        long cadenceMillis = CollectorMath.computeAdaptiveWorldScanCadenceMillis(shouldCollectDetailedMetrics(), sessionLogging, isProfilerSelfProtectionActive(), lastWorldScanDurationMillis);
+        if (lastWorldScanAtMillis > 0L && now - lastWorldScanAtMillis < cadenceMillis && !latestHotChunks.isEmpty()) {
+            return new WorldScanResult(latestEntityCounts, latestHotChunks, latestEntityHotspots, latestBlockEntityHotspots);
+        }
+        lastWorldScanAtMillis = now;
+        long scanStartedAtMillis = now;
+
+        Map<Long, int[]> chunkCounts = new LinkedHashMap<>();
+        Map<Long, Map<String, Integer>> chunkEntityClasses = new LinkedHashMap<>();
+        Map<Long, Map<String, Integer>> chunkBlockEntityClasses = new LinkedHashMap<>();
+        Map<String, Integer> globalEntityCounts = new LinkedHashMap<>();
+        Map<String, Integer> globalBlockEntityCounts = new LinkedHashMap<>();
+        int totalEntities = 0;
+        int livingEntities = 0;
+        int sampledEntities = 0;
+        for (Entity entity : client.world.getEntities()) {
+            totalEntities++;
+            if (entity instanceof LivingEntity) {
+                livingEntities++;
+            }
+            boolean includeInHotspotScan = sampledEntities < MAX_WORLD_SCAN_ENTITIES
+                    || (totalEntities - MAX_WORLD_SCAN_ENTITIES) % WORLD_SCAN_ENTITY_SAMPLE_STRIDE == 0;
+            if (!includeInHotspotScan) {
+                continue;
+            }
+            sampledEntities++;
+            String entityKey = entity.getType().toString();
+            globalEntityCounts.merge(entityKey, 1, Integer::sum);
+            ChunkPos pos = entity.getChunkPos();
+            long key = chunkKey(pos.x, pos.z);
+            chunkCounts.computeIfAbsent(key, ignored -> new int[2])[0]++;
+            chunkEntityClasses.computeIfAbsent(key, ignored -> new LinkedHashMap<>()).merge(entity.getClass().getSimpleName(), 1, Integer::sum);
+        }
+
+        int blockEntities = 0;
+        int sampledBlockEntities = 0;
+        for (BlockEntity blockEntity : client.world.getBlockEntities()) {
+            blockEntities++;
+            boolean includeInHotspotScan = sampledBlockEntities < MAX_WORLD_SCAN_BLOCK_ENTITIES
+                    || (blockEntities - MAX_WORLD_SCAN_BLOCK_ENTITIES) % WORLD_SCAN_BLOCK_ENTITY_SAMPLE_STRIDE == 0;
+            if (!includeInHotspotScan) {
+                continue;
+            }
+            sampledBlockEntities++;
+            String blockEntityKey = blockEntity.getClass().getSimpleName();
+            globalBlockEntityCounts.merge(blockEntityKey, 1, Integer::sum);
+            ChunkPos pos = new ChunkPos(blockEntity.getPos());
+            long key = chunkKey(pos.x, pos.z);
+            chunkCounts.computeIfAbsent(key, ignored -> new int[2])[1]++;
+            chunkBlockEntityClasses.computeIfAbsent(key, ignored -> new LinkedHashMap<>()).merge(blockEntityKey, 1, Integer::sum);
+        }
+
+        List<HotChunkSnapshot> hotChunks = chunkCounts.entrySet().stream()
+                .sorted((a, b) -> Integer.compare((b.getValue()[0] + (b.getValue()[1] * 2)), (a.getValue()[0] + (a.getValue()[1] * 2))))
+                .limit(8)
+                .map(entry -> new HotChunkSnapshot(
+                        (int) (entry.getKey() >> 32),
+                        (int) (long) entry.getKey(),
+                        entry.getValue()[0],
+                        entry.getValue()[1],
+                        topClassName(chunkEntityClasses.get(entry.getKey())),
+                        topClassName(chunkBlockEntityClasses.get(entry.getKey())),
+                        entry.getValue()[0] + (entry.getValue()[1] * 2.0)
+                ))
+                .toList();
+
+        hotChunkHistory.addLast(hotChunks);
+        while (hotChunkHistory.size() > 120) {
+            hotChunkHistory.removeFirst();
+        }
+        for (HotChunkSnapshot chunk : hotChunks) {
+            long key = chunkKey(chunk.chunkX(), chunk.chunkZ());
+            Deque<Integer> history = chunkActivityHistory.computeIfAbsent(key, ignored -> new ArrayDeque<>());
+            history.addLast(chunk.entityCount() + chunk.blockEntityCount() * 2);
+            while (history.size() > 120) {
+                history.removeFirst();
+            }
+        }
+        if (chunkActivityHistory.size() > 64) {
+            List<Long> keep = hotChunks.stream().map(chunk -> chunkKey(chunk.chunkX(), chunk.chunkZ())).toList();
+            chunkActivityHistory.keySet().removeIf(key -> !keep.contains(key));
+        }
+
+        List<EntityHotspot> entityHotspots = globalEntityCounts.entrySet().stream()
+                .sorted((a, b) -> Integer.compare(b.getValue(), a.getValue()))
+                .limit(8)
+                .map(entry -> new EntityHotspot(entry.getKey(), entry.getValue(), classifyEntityHeuristic(entry.getKey())))
+                .toList();
+
+        List<BlockEntityHotspot> blockEntityHotspots = globalBlockEntityCounts.entrySet().stream()
+                .sorted((a, b) -> Integer.compare(b.getValue(), a.getValue()))
+                .limit(8)
+                .map(entry -> new BlockEntityHotspot(entry.getKey(), entry.getValue(), classifyBlockEntityHeuristic(entry.getKey())))
+                .toList();
+
+        WorldScanResult result = new WorldScanResult(
+                new EntityCounts(totalEntities, livingEntities, blockEntities),
+                hotChunks,
+                entityHotspots,
+                blockEntityHotspots
+        );
+        lastWorldScanDurationMillis = Math.max(0L, System.currentTimeMillis() - scanStartedAtMillis);
+        return result;
     }
 
 
@@ -2166,6 +2804,12 @@ public class ProfilerManager {
             return ChunkCounts.empty();
         }
 
+        long now = System.currentTimeMillis();
+        if (lastChunkCountsAtMillis > 0L && now - lastChunkCountsAtMillis < 250L && latestChunkCounts.loadedChunks() > 0) {
+            return latestChunkCounts;
+        }
+        lastChunkCountsAtMillis = now;
+
         String debug = client.worldRenderer.getChunksDebugString();
         if (debug == null || debug.isBlank()) {
             return ChunkCounts.empty();
@@ -2189,17 +2833,20 @@ public class ProfilerManager {
         Map<String, long[]> totals = new LinkedHashMap<>();
         for (Map<String, CpuSamplingProfiler.Snapshot> window : cpuWindows) {
             window.forEach((mod, snapshot) -> {
-                long[] value = totals.computeIfAbsent(mod, ignored -> new long[3]);
+                long[] value = totals.computeIfAbsent(mod, ignored -> new long[6]);
                 value[0] += snapshot.totalSamples();
                 value[1] += snapshot.clientSamples();
                 value[2] += snapshot.renderSamples();
+                value[3] += snapshot.totalCpuNanos();
+                value[4] += snapshot.clientCpuNanos();
+                value[5] += snapshot.renderCpuNanos();
             });
         }
 
         Map<String, CpuSamplingProfiler.Snapshot> result = new LinkedHashMap<>();
         totals.entrySet().stream()
                 .sorted((a, b) -> Long.compare(b.getValue()[0], a.getValue()[0]))
-                .forEach(entry -> result.put(entry.getKey(), new CpuSamplingProfiler.Snapshot(entry.getValue()[0], entry.getValue()[1], entry.getValue()[2])));
+                .forEach(entry -> result.put(entry.getKey(), new CpuSamplingProfiler.Snapshot(entry.getValue()[0], entry.getValue()[1], entry.getValue()[2], entry.getValue()[3], entry.getValue()[4], entry.getValue()[5])));
         return result;
     }
 
@@ -2264,6 +2911,8 @@ public class ProfilerManager {
 
     private Map<String, RenderPhaseProfiler.PhaseSnapshot> aggregateRenderWindows() {
         Map<String, long[]> totals = new LinkedHashMap<>();
+        Map<String, Map<String, Long>> likelyOwnerTotals = new LinkedHashMap<>();
+        Map<String, Map<String, Long>> likelyFrameTotals = new LinkedHashMap<>();
         for (Map<String, RenderPhaseProfiler.PhaseSnapshot> window : renderWindows) {
             window.forEach((phase, snapshot) -> {
                 long[] value = totals.computeIfAbsent(phase, ignored -> new long[4]);
@@ -2271,6 +2920,8 @@ public class ProfilerManager {
                 value[1] += snapshot.cpuCalls();
                 value[2] += snapshot.gpuNanos();
                 value[3] += snapshot.gpuCalls();
+                mergeLongMap(likelyOwnerTotals.computeIfAbsent(phase, ignored -> new LinkedHashMap<>()), snapshot.likelyOwners());
+                mergeLongMap(likelyFrameTotals.computeIfAbsent(phase, ignored -> new LinkedHashMap<>()), snapshot.likelyFrames());
             });
         }
 
@@ -2288,7 +2939,9 @@ public class ProfilerManager {
                                 .map(RenderPhaseProfiler.PhaseSnapshot::ownerMod)
                                 .filter(owner -> owner != null && !owner.isBlank())
                                 .findFirst()
-                                .orElse("shared/render")
+                                .orElse("shared/render"),
+                        topEntries(likelyOwnerTotals.get(entry.getKey()), 4),
+                        topEntries(likelyFrameTotals.get(entry.getKey()), 4)
                 )));
         return result;
     }
@@ -2348,6 +3001,21 @@ public class ProfilerManager {
         for (RuleFinding finding : latestRuleFindings) {
             html.append("<li><strong>").append(escapeHtml(finding.category())).append("</strong> [").append(escapeHtml(finding.severity())).append("] ")
                     .append(escapeHtml(finding.message())).append(" <code>").append(escapeHtml(finding.confidence())).append("</code><br><small>").append(escapeHtml(finding.metricSummary())).append("</small><br><small>").append(escapeHtml(finding.details())).append("</small><br><small><strong>Next:</strong> ").append(escapeHtml(finding.nextStep())).append("</small></li>");
+        }
+        html.append("</ul></section>");
+        html.append("<section><h2>Conflict Findings</h2><ul>");
+        for (ConflictEdge edge : latestConflictEdges) {
+            html.append("<li>")
+                    .append(escapeHtml(edge.waiterMod()))
+                    .append(" -> ")
+                    .append(escapeHtml(edge.ownerMod()))
+                    .append(" via ")
+                    .append(escapeHtml(edge.lockName()))
+                    .append(" <code>")
+                    .append(escapeHtml(edge.confidence()))
+                    .append("</code><br><small>")
+                    .append(escapeHtml(String.format(Locale.ROOT, "obs %d | slowdown %d | blocked %d ms | waited %d ms", edge.observations(), edge.slowdownObservations(), edge.blockedTimeMs(), edge.waitedTimeMs())))
+                    .append("</small></li>");
         }
         html.append("</ul></section>");
         html.append("<section><h2>Entity Hotspots</h2><ul>");
@@ -2413,25 +3081,39 @@ public class ProfilerManager {
                 .replace("\"", "&quot;");
     }
 
-    private void clearRollingWindows() {
+    private void clearLiveWindows() {
         cpuWindows.clear();
         cpuDetailWindows.clear();
         modWindows.clear();
         renderWindows.clear();
+        conflictWindows.clear();
         spikes.clear();
-        sessionHistory.clear();
-        hotChunkHistory.clear();
-        chunkActivityHistory.clear();
         latestHotChunks = List.of();
         latestEntityHotspots = List.of();
         latestBlockEntityHotspots = List.of();
+        latestConflictEdges = List.of();
         latestLockSummaries = List.of();
         latestRuleFindings = List.of();
         stutterJumpSnapshots.clear();
         lastStutterScore = 0.0;
+        latestPerformanceAlert = null;
+        performanceAlertFlashUntilMillis = 0L;
+        frameAlertConsecutiveBreaches = 0;
+        serverAlertConsecutiveBreaches = 0;
+        lastWorldScanDurationMillis = 0L;
+        lastChunkCountsAtMillis = 0L;
         NetworkPacketProfiler.getInstance().reset();
         ThreadLoadProfiler.getInstance().reset();
+        ChunkWorkProfiler.getInstance().reset();
+        EntityCostProfiler.getInstance().reset();
+        ShaderCompilationProfiler.getInstance().reset();
         lastSeenFrameSequence = 0;
+    }
+
+    private void clearSessionState() {
+        sessionHistory.clear();
+        hotChunkHistory.clear();
+        chunkActivityHistory.clear();
         sessionLoggingStartedAtMillis = 0L;
         sessionLogging = false;
         sessionRecorded = false;
@@ -2439,6 +3121,7 @@ public class ProfilerManager {
         sessionMissedSamples = 0;
         sessionMaxSampleGapMillis = 0L;
         sessionExpectedSampleIntervalMillis = 50L;
+        lastPerformanceAlertAtMillis.clear();
     }
 }
 

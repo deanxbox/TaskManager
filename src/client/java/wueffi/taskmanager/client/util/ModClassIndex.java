@@ -5,13 +5,17 @@ import net.fabricmc.loader.api.ModContainer;
 
 import java.nio.file.Path;
 import java.security.CodeSource;
-import java.util.HashMap;
 import java.util.Map;
 
 public class ModClassIndex {
 
-    private static final Map<String, String> cache = new HashMap<>();
-    private static final Map<String, String> normalizedRootToMod = new HashMap<>();
+    private static final String UNKNOWN_SENTINEL = "\u0000";
+    private static final int MAX_CLASS_CACHE_ENTRIES = 16_384;
+    private static final int MAX_ROOT_CACHE_ENTRIES = 1_024;
+    private static final int MAX_PACKAGE_CACHE_ENTRIES = 8_192;
+    private static final Map<String, String> cache = BoundedMaps.synchronizedLru(MAX_CLASS_CACHE_ENTRIES);
+    private static final Map<String, String> normalizedRootToMod = BoundedMaps.synchronizedLru(MAX_ROOT_CACHE_ENTRIES);
+    private static final Map<String, String> packageCache = BoundedMaps.synchronizedLru(MAX_PACKAGE_CACHE_ENTRIES);
     private static boolean built = false;
 
     public static void build() {
@@ -23,7 +27,7 @@ public class ModClassIndex {
             for (Path root : container.getRootPaths()) {
                 try {
                     String normalized = normalizePath(root.toUri().toURL().toString());
-                    normalizedRootToMod.put(normalized, modId);
+                    BoundedMaps.put(normalizedRootToMod, normalized, modId);
                 } catch (Exception ignored) {
                 }
             }
@@ -37,7 +41,13 @@ public class ModClassIndex {
         if (className == null || className.isBlank()) {
             return null;
         }
-        if (cache.containsKey(className)) return cache.get(className);
+        String cached = BoundedMaps.get(cache, className);
+        if (cached != null) return decodeCachedValue(cached);
+        String packageHit = lookupPackageCache(className);
+        if (packageHit != null) {
+            BoundedMaps.put(cache, className, encodeCachedValue(packageHit));
+            return packageHit;
+        }
 
         String classSource = null;
         try {
@@ -49,15 +59,18 @@ public class ModClassIndex {
         }
 
         if (classSource != null) {
-            for (Map.Entry<String, String> entry : normalizedRootToMod.entrySet()) {
-                if (classSource.equals(entry.getKey()) || classSource.startsWith(entry.getKey())) {
-                    cache.put(className, entry.getValue());
-                    return entry.getValue();
+            synchronized (normalizedRootToMod) {
+                for (Map.Entry<String, String> entry : normalizedRootToMod.entrySet()) {
+                    if (classSource.equals(entry.getKey()) || classSource.startsWith(entry.getKey())) {
+                        BoundedMaps.put(cache, className, encodeCachedValue(entry.getValue()));
+                        cachePackagePrefixes(className, entry.getValue());
+                        return entry.getValue();
+                    }
                 }
             }
         }
 
-        cache.put(className, null);
+        BoundedMaps.put(cache, className, UNKNOWN_SENTINEL);
         return null;
     }
 
@@ -69,15 +82,30 @@ public class ModClassIndex {
             return null;
         }
 
-        if (cache.containsKey(className)) {
-            return cache.get(className);
+        String cached = BoundedMaps.get(cache, className);
+        if (cached != null) {
+            return decodeCachedValue(cached);
+        }
+        String packageHit = lookupPackageCache(className);
+        if (packageHit != null) {
+            BoundedMaps.put(cache, className, encodeCachedValue(packageHit));
+            return packageHit;
+        }
+
+        ClassLoader contextLoader = Thread.currentThread().getContextClassLoader();
+        if (contextLoader != null) {
+            try {
+                Class<?> clazz = Class.forName(className, false, contextLoader);
+                return getModForClassName(clazz);
+            } catch (Throwable ignored) {
+            }
         }
 
         try {
             Class<?> clazz = Class.forName(className, false, ModClassIndex.class.getClassLoader());
             return getModForClassName(clazz);
         } catch (Throwable ignored) {
-            cache.put(className, null);
+            BoundedMaps.put(cache, className, UNKNOWN_SENTINEL);
             return null;
         }
     }
@@ -120,5 +148,38 @@ public class ModClassIndex {
                 .replace("!/", "")
                 .replace("!", "")
                 .toLowerCase();
+    }
+
+    private static String lookupPackageCache(String className) {
+        int separator = className.length();
+        while (separator > 0) {
+            separator = className.lastIndexOf('.', separator - 1);
+            if (separator <= 0) {
+                break;
+            }
+            String prefix = className.substring(0, separator);
+            String cached = BoundedMaps.get(packageCache, prefix);
+            if (cached != null) {
+                return cached;
+            }
+        }
+        return null;
+    }
+
+    private static void cachePackagePrefixes(String className, String modId) {
+        int separator = className.lastIndexOf('.');
+        while (separator > 0) {
+            String prefix = className.substring(0, separator);
+            BoundedMaps.putIfAbsent(packageCache, prefix, modId);
+            separator = className.lastIndexOf('.', separator - 1);
+        }
+    }
+
+    private static String encodeCachedValue(String modId) {
+        return modId == null ? UNKNOWN_SENTINEL : modId;
+    }
+
+    private static String decodeCachedValue(String cachedValue) {
+        return UNKNOWN_SENTINEL.equals(cachedValue) ? null : cachedValue;
     }
 }

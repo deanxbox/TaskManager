@@ -29,13 +29,17 @@ final class NativeWindowsSensors {
             String counterSource,
             String sensorSource,
             String sensorErrorCode,
+            String cpuTemperatureProvider,
+            String gpuTemperatureProvider,
+            String gpuHotSpotTemperatureProvider,
             double cpuCoreLoadPercent,
             double gpuCoreLoadPercent,
             double gpuTemperatureC,
+            double gpuHotSpotTemperatureC,
             double cpuTemperatureC
     ) {
         static Sample empty() {
-            return new Sample(false, "Unavailable", "Unavailable", "No bridge data", -1.0, -1.0, -1.0, -1.0);
+            return new Sample(false, "Unavailable", "Unavailable", "No bridge data", "Unavailable", "Unavailable", "Unavailable", -1.0, -1.0, -1.0, -1.0, -1.0);
         }
     }
 
@@ -61,9 +65,13 @@ final class NativeWindowsSensors {
                 counterSource,
                 sensors.buildSensorSource(),
                 sensors.buildErrorSummary(),
+                sensors.cpuTemperatureProvider,
+                sensors.gpuTemperatureProvider,
+                sensors.gpuHotSpotTemperatureProvider,
                 cpuLoad,
                 sensors.gpuLoad,
                 sensors.gpuTemperature,
+                sensors.gpuHotSpotTemperature,
                 sensors.cpuTemperature
         );
     }
@@ -181,27 +189,13 @@ final class NativeWindowsSensors {
     }
 
     private byte[] readMapping(String mappingName, int size) {
-        WinNT.HANDLE mapping = null;
-        Pointer view = null;
-        try {
-            mapping = Kernel32.INSTANCE.OpenFileMapping(FILE_MAP_READ, false, mappingName);
-            if (mapping == null) {
+        try (MappedView mappedView = MappedView.open(mappingName, size)) {
+            if (mappedView == null || mappedView.view() == null) {
                 return null;
             }
-            view = Kernel32.INSTANCE.MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, size);
-            if (view == null) {
-                return null;
-            }
-            return view.getByteArray(0, size);
+            return mappedView.view().getByteArray(0, size);
         } catch (Throwable ignored) {
             return null;
-        } finally {
-            if (view != null) {
-                try { Kernel32.INSTANCE.UnmapViewOfFile(view); } catch (Throwable ignored) {}
-            }
-            if (mapping != null) {
-                try { Kernel32.INSTANCE.CloseHandle(mapping); } catch (Throwable ignored) {}
-            }
         }
     }
 
@@ -225,13 +219,16 @@ final class NativeWindowsSensors {
         private final String normalizedTarget;
         private final List<String> attempts = new ArrayList<>();
         private final List<String> errors = new ArrayList<>();
-        private String cpuSensorSource = "Unavailable";
-        private String gpuSensorSource = "Unavailable";
-        private String cpuSensorMatch = "none";
-        private String gpuSensorMatch = "none";
+        private String cpuTemperatureProvider = "Unavailable";
+        private String gpuTemperatureProvider = "Unavailable";
+        private String gpuHotSpotTemperatureProvider = "Unavailable";
+        private String cpuTemperatureMatch = "none";
+        private String gpuTemperatureMatch = "none";
+        private String gpuHotSpotTemperatureMatch = "none";
         private boolean preferredGpuMatchFound;
         private double cpuTemperature = -1.0;
         private double gpuTemperature = -1.0;
+        private double gpuHotSpotTemperature = -1.0;
         private double gpuLoad = -1.0;
 
         private SensorAccumulator(String activeRenderer, String activeVendor) {
@@ -258,24 +255,37 @@ final class NativeWindowsSensors {
                 boolean cpuMatch = search.matches(".*(cpu package|package id|tctl|tdie|ccd|die|cpu core|core max|core average|processor|socket|ryzen|intel).*")
                         || ((hardwareName + " " + sensorName).toLowerCase(Locale.ROOT).matches(".*(cpu|processor).*") && sensorName.toLowerCase(Locale.ROOT).matches(".*(temperature|tdie|tctl|package|cpu).*"))
                         || sensorName.equalsIgnoreCase("cpu");
-                boolean gpuMatch = search.matches(".*(gpu temperature|gpu core|hot spot|hotspot|junction|edge|graphics|mem junction|radeon|nvidia|intel graphics).*")
+                boolean gpuMatch = search.matches(".*(gpu temperature|gpu core|hot spot|hotspot|junction|junction temperature|edge|graphics|mem junction|memory junction|radeon|nvidia|intel graphics|hot point).*")
                         || ((hardwareName + " " + sensorName).toLowerCase(Locale.ROOT).matches(".*(gpu|graphics|radeon|nvidia|intel).*") && sensorName.toLowerCase(Locale.ROOT).matches(".*(temperature|edge|junction|hot).*"));
                 if (cpuMatch && (cpuTemperature < 0.0 || value > cpuTemperature)) {
                     acceptCpuTemperature(origin, hardwareName + " / " + sensorName, value);
                 }
                 if (gpuMatch) {
+                    boolean hotSpotMatch = search.matches(".*(hot spot|hotspot|junction|junction temperature|mem junction|memory junction|hot point).*");
                     boolean preferred = isPreferredGpu(hardwareName, sensorName, sensorIdentifier);
                     if (preferred) {
-                        if (!preferredGpuMatchFound || gpuTemperature < 0.0 || value > gpuTemperature) {
+                        if (hotSpotMatch) {
+                            if (gpuHotSpotTemperature < 0.0 || value > gpuHotSpotTemperature) {
+                                gpuHotSpotTemperature = roundOneDecimal(value);
+                                gpuHotSpotTemperatureProvider = origin;
+                                gpuHotSpotTemperatureMatch = hardwareName + " / " + sensorName;
+                            }
+                        } else if (!preferredGpuMatchFound || gpuTemperature < 0.0 || value > gpuTemperature) {
                             gpuTemperature = roundOneDecimal(value);
-                            gpuSensorSource = origin;
-                            gpuSensorMatch = hardwareName + " / " + sensorName;
-                            preferredGpuMatchFound = true;
+                            gpuTemperatureProvider = origin;
+                            gpuTemperatureMatch = hardwareName + " / " + sensorName;
+                        }
+                        preferredGpuMatchFound = true;
+                    } else if (hotSpotMatch) {
+                        if (gpuHotSpotTemperature < 0.0 || value > gpuHotSpotTemperature) {
+                            gpuHotSpotTemperature = roundOneDecimal(value);
+                            gpuHotSpotTemperatureProvider = origin;
+                            gpuHotSpotTemperatureMatch = hardwareName + " / " + sensorName;
                         }
                     } else if (!preferredGpuMatchFound && (gpuTemperature < 0.0 || value > gpuTemperature)) {
                         gpuTemperature = roundOneDecimal(value);
-                        gpuSensorSource = origin;
-                        gpuSensorMatch = hardwareName + " / " + sensorName;
+                        gpuTemperatureProvider = origin;
+                        gpuTemperatureMatch = hardwareName + " / " + sensorName;
                     }
                 }
             }
@@ -287,16 +297,16 @@ final class NativeWindowsSensors {
                         if (!preferredGpuMatchFound || gpuLoad < 0.0 || value > gpuLoad) {
                             gpuLoad = Math.max(0.0, Math.min(100.0, value));
                             preferredGpuMatchFound = true;
-                            if ("Unavailable".equals(gpuSensorSource)) {
-                                gpuSensorSource = origin;
-                                gpuSensorMatch = hardwareName + " / " + sensorName;
+                            if ("Unavailable".equals(gpuTemperatureProvider)) {
+                                gpuTemperatureProvider = origin;
+                                gpuTemperatureMatch = hardwareName + " / " + sensorName;
                             }
                         }
                     } else if (!preferredGpuMatchFound && value > gpuLoad) {
                         gpuLoad = Math.max(0.0, Math.min(100.0, value));
-                        if ("Unavailable".equals(gpuSensorSource)) {
-                            gpuSensorSource = origin;
-                            gpuSensorMatch = hardwareName + " / " + sensorName;
+                        if ("Unavailable".equals(gpuTemperatureProvider)) {
+                            gpuTemperatureProvider = origin;
+                            gpuTemperatureMatch = hardwareName + " / " + sensorName;
                         }
                     }
                 }
@@ -305,8 +315,8 @@ final class NativeWindowsSensors {
 
         private void acceptCpuTemperature(String origin, String match, double value) {
             cpuTemperature = roundOneDecimal(value);
-            cpuSensorSource = origin;
-            cpuSensorMatch = match;
+            cpuTemperatureProvider = origin;
+            cpuTemperatureMatch = match;
         }
 
         private void acceptFallbackGpuLoad(String origin, String match, double value) {
@@ -314,15 +324,18 @@ final class NativeWindowsSensors {
                 return;
             }
             gpuLoad = Math.max(0.0, Math.min(100.0, value));
-            if ("Unavailable".equals(gpuSensorSource)) {
-                gpuSensorSource = origin;
-                gpuSensorMatch = match;
+            if ("Unavailable".equals(gpuTemperatureProvider)) {
+                gpuTemperatureProvider = origin;
+                gpuTemperatureMatch = match;
             }
         }
 
         private String buildSensorSource() {
             String attemptText = attempts.isEmpty() ? "" : " | Tried: " + String.join(", ", attempts);
-            return "CPU: " + cpuSensorSource + " [" + cpuSensorMatch + "] | GPU: " + gpuSensorSource + " [" + gpuSensorMatch + "]" + attemptText;
+            return "CPU: " + cpuTemperatureProvider + " [" + cpuTemperatureMatch + "]"
+                    + " | GPU: " + gpuTemperatureProvider + " [" + gpuTemperatureMatch + "]"
+                    + " | GPU Hot Spot: " + gpuHotSpotTemperatureProvider + " [" + gpuHotSpotTemperatureMatch + "]"
+                    + attemptText;
         }
 
         private String buildErrorSummary() {
@@ -355,6 +368,55 @@ final class NativeWindowsSensors {
                 return "";
             }
             return value.toLowerCase(Locale.ROOT).replaceAll("[^a-z0-9]+", " ").trim();
+        }
+    }
+
+    private static final class MappedView implements AutoCloseable {
+        private final WinNT.HANDLE mapping;
+        private final Pointer view;
+
+        private MappedView(WinNT.HANDLE mapping, Pointer view) {
+            this.mapping = mapping;
+            this.view = view;
+        }
+
+        static MappedView open(String mappingName, int size) {
+            WinNT.HANDLE mapping = Kernel32.INSTANCE.OpenFileMapping(FILE_MAP_READ, false, mappingName);
+            if (mapping == null) {
+                return null;
+            }
+            Pointer view = null;
+            boolean success = false;
+            try {
+                view = Kernel32.INSTANCE.MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, size);
+                if (view == null) {
+                    return null;
+                }
+                MappedView mappedView = new MappedView(mapping, view);
+                success = true;
+                return mappedView;
+            } finally {
+                if (!success) {
+                    if (view != null) {
+                        try { Kernel32.INSTANCE.UnmapViewOfFile(view); } catch (Throwable ignored) {}
+                    }
+                    try { Kernel32.INSTANCE.CloseHandle(mapping); } catch (Throwable ignored) {}
+                }
+            }
+        }
+
+        Pointer view() {
+            return view;
+        }
+
+        @Override
+        public void close() {
+            if (view != null) {
+                try { Kernel32.INSTANCE.UnmapViewOfFile(view); } catch (Throwable ignored) {}
+            }
+            if (mapping != null) {
+                try { Kernel32.INSTANCE.CloseHandle(mapping); } catch (Throwable ignored) {}
+            }
         }
     }
 

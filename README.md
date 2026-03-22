@@ -1,4 +1,5 @@
 ![Static Badge](https://img.shields.io/badge/Version-1.2.3-blue) ![Modrinth Downloads](https://img.shields.io/modrinth/dt/taskmanager)
+
 # Task Manager
 
 Task Manager is a Fabric client profiler for modded Minecraft that helps you identify frame drops, high MSPT, hot mods, rendering spikes, block-entity pressure, and JVM/runtime issues while the game is still running.
@@ -65,7 +66,10 @@ Session exports include a polished summary with:
 - top memory mods
 - hot chunk summary
 - block entity classes
+- repeated conflict edges and pairwise lock contention summaries
 - rule findings and sensor diagnostics
+
+For `MANUAL_DEEP`, press `F11` to start recording, play normally while reproducing the issue, then press `F11` again to stop. The session will continue recording even if the Task Manager screen is closed.
 
 ## Notes on Accuracy
 
@@ -78,4 +82,3 @@ Task Manager aims to be honest about what is measured versus estimated:
 - For CPU temperature on Windows, running Core Temp is the primary recommended setup; LibreHardwareMonitor/OpenHardwareMonitor and HWiNFO can also work
 
 That means the profiler is very useful for finding hotspots and spikes, but some values, especially GPU-per-mod and shared JVM memory, should be interpreted as guidance rather than perfect ground truth.
-

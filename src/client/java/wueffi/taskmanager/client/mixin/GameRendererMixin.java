@@ -36,7 +36,7 @@ public class GameRendererMixin {
     @Inject(method = "renderWorld", at = @At("HEAD"))
     private void taskmanager$onRenderWorldHead(CallbackInfo ci) {
         if (!TaskManagerScreen.isLiveMetricsActive()) return;
-        RenderPhaseProfiler.getInstance().beginCpuPhase("gameRenderer.renderWorld", "minecraft");
+        RenderPhaseProfiler.getInstance().beginCpuPhase("gameRenderer.renderWorld", "shared/render");
         GpuTimer.begin("gameRenderer.renderWorld");
     }
 
@@ -45,6 +45,20 @@ public class GameRendererMixin {
         if (!TaskManagerScreen.isLiveMetricsActive()) return;
         GpuTimer.end("gameRenderer.renderWorld");
         RenderPhaseProfiler.getInstance().endCpuPhase("gameRenderer.renderWorld");
+    }
+
+    @Inject(method = "renderHand", at = @At("HEAD"), require = 0)
+    private void taskmanager$onRenderHandHead(CallbackInfo ci) {
+        if (!TaskManagerScreen.isLiveMetricsActive()) return;
+        RenderPhaseProfiler.getInstance().beginCpuPhase("gameRenderer.renderHand", "shared/render");
+        GpuTimer.begin("gameRenderer.renderHand");
+    }
+
+    @Inject(method = "renderHand", at = @At("TAIL"), require = 0)
+    private void taskmanager$onRenderHandTail(CallbackInfo ci) {
+        if (!TaskManagerScreen.isLiveMetricsActive()) return;
+        GpuTimer.end("gameRenderer.renderHand");
+        RenderPhaseProfiler.getInstance().endCpuPhase("gameRenderer.renderHand");
     }
 }
 

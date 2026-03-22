@@ -17,8 +17,8 @@ public class TickProfiler {
     private int serverIndex = 0;
     private int serverCount = 0;
 
-    private long clientStart;
-    private long serverStart;
+    private volatile long clientStart;
+    private volatile long serverStart;
 
     public void beginTick() {
         clientStart = System.nanoTime();

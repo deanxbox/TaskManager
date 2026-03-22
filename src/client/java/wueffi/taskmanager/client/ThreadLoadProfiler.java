@@ -13,11 +13,11 @@ import java.util.concurrent.ConcurrentHashMap;
 
 public class ThreadLoadProfiler {
 
-    public record ThreadSnapshot(double loadPercent, String state, long blockedCountDelta, long waitedCountDelta, long blockedTimeDeltaMs, long waitedTimeDeltaMs, String lockName, String lockOwnerName) {}
+    public record ThreadSnapshot(double loadPercent, String state, long blockedCountDelta, long waitedCountDelta, long blockedTimeDeltaMs, long waitedTimeDeltaMs, String lockName, String lockOwnerName, long lockOwnerThreadId) {}
+    public record RawThreadSnapshot(long threadId, String threadName, String canonicalThreadName, ThreadSnapshot snapshot) {}
     public record ThreadLoadSample(long capturedAtEpochMillis, Map<String, ThreadSnapshot> threadsByName) {}
 
     private static final ThreadLoadProfiler INSTANCE = new ThreadLoadProfiler();
-    private static final int MAX_THREADS = 10;
     private static final int MAX_HISTORY = 180;
 
     public static ThreadLoadProfiler getInstance() {
@@ -32,6 +32,7 @@ public class ThreadLoadProfiler {
     private final Map<Long, Long> lastWaitedTimes = new ConcurrentHashMap<>();
     private final Deque<ThreadLoadSample> history = new ArrayDeque<>();
     private volatile Map<String, ThreadSnapshot> latestThreadSnapshots = Map.of();
+    private volatile Map<Long, RawThreadSnapshot> latestRawThreadSnapshots = Map.of();
     private volatile long lastSampleTimeNs;
 
     private ThreadLoadProfiler() {
@@ -67,19 +68,22 @@ public class ThreadLoadProfiler {
         }
 
         long[] threadIds = threadBean.getAllThreadIds();
+        ThreadInfo[] threadInfos = threadBean.getThreadInfo(threadIds);
         Map<String, ThreadSnapshot> loads = new LinkedHashMap<>();
+        Map<Long, RawThreadSnapshot> rawSnapshots = new LinkedHashMap<>();
         Map<Long, Long> nextCpuTimes = new ConcurrentHashMap<>();
         Map<Long, Long> nextBlocked = new ConcurrentHashMap<>();
         Map<Long, Long> nextWaited = new ConcurrentHashMap<>();
         Map<Long, Long> nextBlockedTimes = new ConcurrentHashMap<>();
         Map<Long, Long> nextWaitedTimes = new ConcurrentHashMap<>();
-        for (long threadId : threadIds) {
+        for (int i = 0; i < threadIds.length; i++) {
+            long threadId = threadIds[i];
             long cpuTimeNs = threadBean.getThreadCpuTime(threadId);
             if (cpuTimeNs < 0L) {
                 continue;
             }
 
-            ThreadInfo info = threadBean.getThreadInfo(threadId);
+            ThreadInfo info = threadInfos == null || i >= threadInfos.length ? null : threadInfos[i];
             if (info == null) {
                 continue;
             }
@@ -105,12 +109,26 @@ public class ThreadLoadProfiler {
             }
 
             String threadName = canonicalThreadName(info.getThreadName());
-            loads.merge(threadName, new ThreadSnapshot(loadPercent, info.getThreadState().name(), blockedDelta, waitedDelta, blockedTimeDeltaMs, waitedTimeDeltaMs, info.getLockName(), info.getLockOwnerName()), this::mergeSnapshots);
+            ThreadSnapshot snapshot = new ThreadSnapshot(
+                    loadPercent,
+                    info.getThreadState().name(),
+                    blockedDelta,
+                    waitedDelta,
+                    blockedTimeDeltaMs,
+                    waitedTimeDeltaMs,
+                    info.getLockName(),
+                    info.getLockOwnerName(),
+                    info.getLockOwnerId()
+            );
+            rawSnapshots.put(threadId, new RawThreadSnapshot(threadId, info.getThreadName(), threadName, snapshot));
+            loads.merge(threadName, snapshot, this::mergeSnapshots);
         }
 
         latestThreadSnapshots = loads.entrySet().stream()
                 .sorted((a, b) -> Double.compare(scoreSnapshot(b.getValue()), scoreSnapshot(a.getValue())))
-                .limit(MAX_THREADS)
+                .collect(LinkedHashMap::new, (map, entry) -> map.put(entry.getKey(), entry.getValue()), LinkedHashMap::putAll);
+        latestRawThreadSnapshots = rawSnapshots.entrySet().stream()
+                .sorted((a, b) -> Double.compare(scoreSnapshot(b.getValue().snapshot()), scoreSnapshot(a.getValue().snapshot())))
                 .collect(LinkedHashMap::new, (map, entry) -> map.put(entry.getKey(), entry.getValue()), LinkedHashMap::putAll);
         history.addLast(new ThreadLoadSample(System.currentTimeMillis(), new LinkedHashMap<>(latestThreadSnapshots)));
         while (history.size() > MAX_HISTORY) {
@@ -139,6 +157,10 @@ public class ThreadLoadProfiler {
         return latestThreadSnapshots;
     }
 
+    public Map<Long, RawThreadSnapshot> getLatestRawThreadSnapshots() {
+        return latestRawThreadSnapshots;
+    }
+
     public java.util.List<ThreadLoadSample> getHistory() {
         return java.util.List.copyOf(history);
     }
@@ -150,6 +172,7 @@ public class ThreadLoadProfiler {
         lastBlockedTimes.clear();
         lastWaitedTimes.clear();
         latestThreadSnapshots = Map.of();
+        latestRawThreadSnapshots = Map.of();
         history.clear();
         lastSampleTimeNs = 0L;
     }
@@ -158,6 +181,7 @@ public class ThreadLoadProfiler {
         String state = left.loadPercent() >= right.loadPercent() ? left.state() : right.state();
         String lockName = left.lockName() != null ? left.lockName() : right.lockName();
         String lockOwnerName = left.lockOwnerName() != null ? left.lockOwnerName() : right.lockOwnerName();
+        long lockOwnerThreadId = left.lockOwnerThreadId() > 0L ? left.lockOwnerThreadId() : right.lockOwnerThreadId();
         return new ThreadSnapshot(
                 left.loadPercent() + right.loadPercent(),
                 state,
@@ -166,7 +190,8 @@ public class ThreadLoadProfiler {
                 left.blockedTimeDeltaMs() + right.blockedTimeDeltaMs(),
                 left.waitedTimeDeltaMs() + right.waitedTimeDeltaMs(),
                 lockName,
-                lockOwnerName
+                lockOwnerName,
+                lockOwnerThreadId
         );
     }
 

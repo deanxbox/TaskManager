@@ -8,6 +8,7 @@ import wueffi.taskmanager.client.util.ConfigManager;
 
 import java.lang.management.ManagementFactory;
 import java.lang.reflect.Method;
+import java.util.ArrayList;
 import java.util.ArrayDeque;
 import java.util.Deque;
 import java.util.LinkedHashMap;
@@ -16,6 +17,43 @@ import java.util.Locale;
 import java.util.Map;
 
 public class SystemMetricsProfiler {
+
+    public record ThreadDrilldown(
+            long threadId,
+            String threadName,
+            String canonicalThreadName,
+            double cpuLoadPercent,
+            long allocationRateBytesPerSecond,
+            String state,
+            long blockedTimeDeltaMs,
+            long waitedTimeDeltaMs,
+            String ownerMod,
+            String confidence,
+            String reasonFrame,
+            List<String> topFrames,
+            String threadRole,
+            String roleSource,
+            List<String> ownerCandidates
+    ) {}
+
+    public record ContentionSample(
+            long waiterThreadId,
+            String waiterThreadName,
+            String waiterMod,
+            String waiterConfidence,
+            String waiterRole,
+            long ownerThreadId,
+            String ownerThreadName,
+            String ownerMod,
+            String ownerConfidence,
+            String ownerRole,
+            String lockName,
+            long blockedTimeDeltaMs,
+            long waitedTimeDeltaMs,
+            List<String> waiterCandidates,
+            List<String> ownerCandidates,
+            String confidence
+    ) {}
 
     public record Snapshot(
             String gpuVendor,
@@ -35,6 +73,7 @@ public class SystemMetricsProfiler {
             double cpuCoreLoadPercent,
             double gpuCoreLoadPercent,
             double gpuTemperatureC,
+            double gpuHotSpotTemperatureC,
             double cpuTemperatureC,
             double cpuLoadChangePerSecond,
             double gpuLoadChangePerSecond,
@@ -77,7 +116,20 @@ public class SystemMetricsProfiler {
             long textureUploadRate,
             double playerSpeedBlocksPerSecond,
             int chunksEnteredLastSecond,
-            double distanceTravelledBlocks
+            double distanceTravelledBlocks,
+            Map<String, String> metricProvenance,
+            String telemetryHelperStatus,
+            long telemetrySampleAgeMillis,
+            String gpuTemperatureProvider,
+            String gpuHotSpotProvider,
+            double profilerCpuLoadPercent,
+            long worldScanCostMillis,
+            long memoryHistogramCostMillis,
+            long telemetryHelperCostMillis,
+            String collectorGovernorMode,
+            String gpuCoverageSummary,
+            List<ThreadDrilldown> threadDrilldown,
+            List<ContentionSample> contentionSamples
     ) {
         public static Snapshot empty() {
             return new Snapshot(
@@ -95,6 +147,7 @@ public class SystemMetricsProfiler {
                     "Unavailable",
                     "No bridge data",
                     "No provider exposed a readable CPU package temperature",
+                    -1.0,
                     -1.0,
                     -1.0,
                     -1.0,
@@ -140,7 +193,20 @@ public class SystemMetricsProfiler {
                     -1L,
                     -1.0,
                     -1,
-                    0.0
+                    0.0,
+                    Map.of(),
+                    "stopped",
+                    Long.MAX_VALUE,
+                    "Unavailable",
+                    "Unavailable",
+                    0.0,
+                    0L,
+                    0L,
+                    0L,
+                    "idle",
+                    "No tagged phases yet",
+                    List.of(),
+                    List.of()
             );
         }
     }
@@ -148,9 +214,33 @@ public class SystemMetricsProfiler {
     private static final SystemMetricsProfiler INSTANCE = new SystemMetricsProfiler();
     public static SystemMetricsProfiler getInstance() { return INSTANCE; }
 
+    private record ThreadRoleAnalysis(
+            String label,
+            String source,
+            boolean mainLogic,
+            boolean workerPool,
+            boolean ioPool,
+            boolean chunkGeneration,
+            boolean chunkMeshing,
+            boolean chunkUpload
+    ) {
+        boolean countsAsWorker() {
+            return workerPool || ioPool || chunkGeneration || chunkMeshing || chunkUpload;
+        }
+    }
+
+    private record ThreadObservation(
+            ThreadLoadProfiler.RawThreadSnapshot raw,
+            ThreadSnapshotCollector.ThreadStackSnapshot stackSnapshot,
+            AttributionInsights.ThreadAttribution attribution,
+            ThreadRoleAnalysis role,
+            long allocationRateBytesPerSecond
+    ) {}
+
     private static final int GPU_MEMORY_INFO_TOTAL_AVAILABLE_MEMORY_NVX = 0x9048;
     private static final int GPU_MEMORY_INFO_CURRENT_AVAILABLE_VIDMEM_NVX = 0x9049;
     private static final int HISTORY_SIZE = 180;
+    private static final long SENSOR_RETAIN_MILLIS = 10_000L;
 
     private final long[] networkInHistory = new long[HISTORY_SIZE];
     private final long[] networkOutHistory = new long[HISTORY_SIZE];
@@ -179,6 +269,9 @@ public class SystemMetricsProfiler {
     private final TrendTracker gpuLoadTrendTracker = new TrendTracker(1_000L, 100.0);
     private final TrendTracker cpuTemperatureTrendTracker = new TrendTracker(2_000L, 30.0);
     private final TrendTracker gpuTemperatureTrendTracker = new TrendTracker(2_000L, 30.0);
+    private final TemperatureRetention gpuTemperatureRetention = new TemperatureRetention();
+    private final TemperatureRetention gpuHotSpotTemperatureRetention = new TemperatureRetention();
+    private final TemperatureRetention cpuTemperatureRetention = new TemperatureRetention();
     private double lastPlayerX;
     private double lastPlayerY;
     private double lastPlayerZ;
@@ -189,10 +282,19 @@ public class SystemMetricsProfiler {
     private boolean lastPlayerChunkValid;
     private double distanceTravelledBlocks;
     private final Deque<Long> chunkEntryTimes = new ArrayDeque<>();
+    private String cachedGpuVendor = "";
+    private String cachedGpuRenderer = "";
 
     public void sample(MemoryProfiler.Snapshot memorySnapshot, ProfilerManager.EntityCounts entityCounts, ProfilerManager.ChunkCounts chunkCounts) {
         long now = System.currentTimeMillis();
-        int sampleIntervalMillis = ProfilerManager.getInstance().shouldCollectFrameMetrics() ? 50 : ConfigManager.getMetricsUpdateIntervalMs();
+        String collectorGovernorMode = ProfilerManager.getInstance().getCollectorGovernorMode();
+        int sampleIntervalMillis = switch (collectorGovernorMode) {
+            case "self-protect" -> Math.max(300, ConfigManager.getMetricsUpdateIntervalMs() * 2);
+            case "burst" -> 50;
+            case "tight" -> Math.max(100, ConfigManager.getMetricsUpdateIntervalMs());
+            case "light" -> Math.max(200, ConfigManager.getMetricsUpdateIntervalMs());
+            default -> ProfilerManager.getInstance().shouldCollectFrameMetrics() ? 50 : ConfigManager.getMetricsUpdateIntervalMs();
+        };
         if (now - lastSampleAtMillis < sampleIntervalMillis) {
             return;
         }
@@ -201,8 +303,8 @@ public class SystemMetricsProfiler {
         lastSampleAtMillis = now;
         lastSampleIntervalMillis = sampleIntervalMillis;
 
-        String vendor = stringOrEmpty(GL11.glGetString(GL11.GL_VENDOR));
-        String renderer = stringOrEmpty(GL11.glGetString(GL11.GL_RENDERER));
+        String vendor = resolveGpuVendor();
+        String renderer = resolveGpuRenderer();
 
         long vramUsedBytes = -1;
         long vramTotalBytes = -1;
@@ -224,22 +326,53 @@ public class SystemMetricsProfiler {
         long directMemoryUsedBytes = memorySnapshot.directBufferBytes() + memorySnapshot.mappedBufferBytes();
         long directMemoryMaxBytes = lookupDirectMemoryMaxBytes();
 
-        windowsBridge.requestRefreshIfNeeded();
-        WindowsTelemetryBridge.Sample bridgeSample = windowsBridge.getLatest();
         NativeWindowsSensors.Sample nativeSample = nativeWindowsSensors.sample(renderer, vendor);
+        windowsBridge.requestRefreshIfNeeded(nativeSample.active());
+        WindowsTelemetryBridge.Sample bridgeSample = windowsBridge.getLatest();
         WindowsTelemetryBridge.Sample mergedSample = mergeTelemetrySamples(bridgeSample, nativeSample);
+        WindowsTelemetryBridge.Health telemetryHealth = windowsBridge.getHealth();
+        TemperatureReading gpuTemperatureReading = gpuTemperatureRetention.resolve(
+                mergedSample.gpuTemperatureC(),
+                mergedSample.gpuTemperatureProvider(),
+                now,
+                SENSOR_RETAIN_MILLIS
+        );
+        TemperatureReading gpuHotSpotTemperatureReading = gpuHotSpotTemperatureRetention.resolve(
+                mergedSample.gpuHotSpotTemperatureC(),
+                mergedSample.gpuHotSpotTemperatureProvider(),
+                now,
+                SENSOR_RETAIN_MILLIS
+        );
+        TemperatureReading cpuTemperatureReading = cpuTemperatureRetention.resolve(
+                mergedSample.cpuTemperatureC(),
+                mergedSample.cpuTemperatureProvider(),
+                now,
+                SENSOR_RETAIN_MILLIS
+        );
         Map<String, ThreadLoadProfiler.ThreadSnapshot> threadDetails = new LinkedHashMap<>(ThreadLoadProfiler.getInstance().getLatestThreadSnapshots());
+        ThreadSnapshotCollector.Snapshot latestStacks = ThreadSnapshotCollector.getInstance().getLatestSnapshot();
+        List<ThreadObservation> threadObservations = buildThreadObservations(latestStacks);
+        List<ThreadDrilldown> threadDrilldown = buildThreadDrilldown(threadObservations);
+        List<ContentionSample> contentionSamples = buildContentionSamples(threadObservations);
         Map<String, Double> threadLoads = new LinkedHashMap<>();
         threadDetails.forEach((name, details) -> threadLoads.put(name, details.loadPercent()));
-        double totalThreadLoad = threadDetails.values().stream().mapToDouble(ThreadLoadProfiler.ThreadSnapshot::loadPercent).sum();
+        double totalThreadLoad = threadObservations.stream()
+                .map(ThreadObservation::raw)
+                .map(ThreadLoadProfiler.RawThreadSnapshot::snapshot)
+                .mapToDouble(ThreadLoadProfiler.ThreadSnapshot::loadPercent)
+                .sum();
+        double profilerCpuLoad = sumProfilerThreadLoad();
         long offHeapAllocationRate = 0L;
         if (lastDirectMemoryUsedBytes >= 0L) {
             offHeapAllocationRate = Math.max(0L, Math.round((directMemoryUsedBytes - lastDirectMemoryUsedBytes) * 1000.0 / elapsedMillis));
         }
         lastDirectMemoryUsedBytes = directMemoryUsedBytes;
-        ThreadLoadProfiler.ThreadSnapshot serverThread = threadDetails.get("Server Thread");
-        int activeWorkers = countWorkers(threadDetails, true);
-        int idleWorkers = countWorkers(threadDetails, false);
+        ThreadObservation serverThread = threadObservations.stream()
+                .filter(observation -> "Server Thread".equals(observation.raw().canonicalThreadName()))
+                .findFirst()
+                .orElse(null);
+        int activeWorkers = countWorkers(threadObservations, true);
+        int idleWorkers = countWorkers(threadObservations, false);
         double workerRatio = idleWorkers > 0 ? activeWorkers / (double) idleWorkers : activeWorkers;
         int totalEntities = entityCounts.totalEntities();
         double bytesPerEntity = totalEntities > 0 && mergedSample.bytesReceivedPerSecond() >= 0 ? mergedSample.bytesReceivedPerSecond() / (double) totalEntities : -1.0;
@@ -250,20 +383,21 @@ public class SystemMetricsProfiler {
         String biome = sampleBiome();
         String lightUpdateQueue = sampleLightQueue();
         int lightsUpdatePending = parseLeadingInt(lightUpdateQueue);
-        int chunksGenerating = countThreadsMatching(threadDetails, "gen", "generation", "worldgen");
-        int chunksMeshing = countThreadsMatching(threadDetails, "mesh", "builder", "chunk build");
-        int chunksUploading = countThreadsMatching(threadDetails, "upload", "uploader");
+        int chunksGenerating = countRoleMatches(threadObservations, ThreadRoleAnalysis::chunkGeneration);
+        int chunksMeshing = countRoleMatches(threadObservations, ThreadRoleAnalysis::chunkMeshing);
+        int chunksUploading = countRoleMatches(threadObservations, ThreadRoleAnalysis::chunkUpload);
         Map<String, RenderPhaseProfiler.PhaseSnapshot> renderPhases = RenderPhaseProfiler.getInstance().getSnapshot();
         long chunkMeshesRebuilt = sumPhaseCalls(renderPhases, "chunk", "mesh", "build", "rebuild");
         long chunkMeshesUploaded = sumPhaseCalls(renderPhases, "upload");
         long textureUploadRate = sumPhaseCalls(renderPhases, "texture", "upload");
+        String gpuCoverageSummary = buildGpuCoverageSummary(renderPhases);
         PlayerMotionSnapshot motion = samplePlayerMotion(now);
         List<ProfilerManager.HotChunkSnapshot> hotChunks = ProfilerManager.getInstance().getLatestHotChunks();
         int maxEntitiesInHotChunk = hotChunks.isEmpty() ? 0 : hotChunks.getFirst().entityCount();
         double cpuLoadChangePerSecond = cpuLoadTrendTracker.update(mergedSample.cpuCoreLoadPercent(), now);
         double gpuLoadChangePerSecond = gpuLoadTrendTracker.update(mergedSample.gpuCoreLoadPercent(), now);
-        double cpuTemperatureChangePerSecond = cpuTemperatureTrendTracker.update(mergedSample.cpuTemperatureC(), now);
-        double gpuTemperatureChangePerSecond = gpuTemperatureTrendTracker.update(mergedSample.gpuTemperatureC(), now);
+        double cpuTemperatureChangePerSecond = cpuTemperatureTrendTracker.update(cpuTemperatureReading.value(), now);
+        double gpuTemperatureChangePerSecond = gpuTemperatureTrendTracker.update(gpuTemperatureReading.value(), now);
 
         snapshot = new Snapshot(
                 vendor,
@@ -279,11 +413,12 @@ public class SystemMetricsProfiler {
                 mergedSample.counterSource(),
                 mergedSample.sensorSource(),
                 mergedSample.sensorErrorCode(),
-                buildCpuTemperatureUnavailableReason(mergedSample),
+                buildCpuTemperatureUnavailableReason(cpuTemperatureReading, mergedSample),
                 mergedSample.cpuCoreLoadPercent(),
                 mergedSample.gpuCoreLoadPercent(),
-                mergedSample.gpuTemperatureC(),
-                mergedSample.cpuTemperatureC(),
+                gpuTemperatureReading.value(),
+                gpuHotSpotTemperatureReading.value(),
+                cpuTemperatureReading.value(),
                 cpuLoadChangePerSecond,
                 gpuLoadChangePerSecond,
                 cpuTemperatureChangePerSecond,
@@ -295,17 +430,17 @@ public class SystemMetricsProfiler {
                 mergedSample.diskWriteBytesPerSecond(),
                 threadLoads,
                 threadDetails,
-                buildSchedulingConflictSummary(threadDetails),
-                buildParallelismFlag(threadDetails),
+                buildSchedulingConflictSummary(threadObservations),
+                buildParallelismFlag(threadObservations),
                 buildCpuSensorStatus(mergedSample.sensorSource()),
-                countHighLoadThreads(threadDetails),
+                countHighLoadThreads(threadObservations),
                 estimatePhysicalCores(),
-                buildMainLogicSummary(threadDetails),
-                buildBackgroundSummary(threadDetails),
+                buildMainLogicSummary(threadObservations),
+                buildBackgroundSummary(threadObservations),
                 totalThreadLoad,
-                buildParallelismEfficiency(totalThreadLoad),
-                serverThread == null ? 0L : serverThread.blockedTimeDeltaMs(),
-                serverThread == null ? 0L : serverThread.waitedTimeDeltaMs(),
+                buildParallelismEfficiency(totalThreadLoad, activeWorkers, idleWorkers),
+                serverThread == null ? 0L : serverThread.raw().snapshot().blockedTimeDeltaMs(),
+                serverThread == null ? 0L : serverThread.raw().snapshot().waitedTimeDeltaMs(),
                 activeWorkers,
                 idleWorkers,
                 workerRatio,
@@ -325,7 +460,20 @@ public class SystemMetricsProfiler {
                 textureUploadRate,
                 motion.speedBlocksPerSecond(),
                 motion.chunksEnteredLastSecond(),
-                motion.distanceTravelledBlocks()
+                motion.distanceTravelledBlocks(),
+                buildMetricProvenance(),
+                telemetryHealth.helperStatus(),
+                telemetryHealth.latestSampleAgeMillis(),
+                gpuTemperatureReading.provider(),
+                gpuHotSpotTemperatureReading.provider(),
+                profilerCpuLoad,
+                ProfilerManager.getInstance().getLastWorldScanDurationMillis(),
+                MemoryProfiler.getInstance().getLastModSampleDurationMillis(),
+                Math.max(telemetryHealth.latestSampleDurationMillis(), mergedSample.sampleDurationMillis()),
+                collectorGovernorMode,
+                gpuCoverageSummary,
+                threadDrilldown,
+                contentionSamples
         );
 
         pushHistory(networkInHistory, Math.max(0L, snapshot.bytesReceivedPerSecond()));
@@ -334,8 +482,8 @@ public class SystemMetricsProfiler {
         pushHistory(diskWriteHistory, Math.max(0L, snapshot.diskWriteBytesPerSecond()));
         pushHistory(cpuLoadHistory, Math.max(0.0, snapshot.cpuCoreLoadPercent()));
         pushHistory(gpuLoadHistory, Math.max(0.0, snapshot.gpuCoreLoadPercent()));
-        pushHistory(cpuTemperatureHistory, snapshot.cpuTemperatureC());
-        pushHistory(gpuTemperatureHistory, snapshot.gpuTemperatureC());
+        pushHistory(cpuTemperatureHistory, cpuTemperatureReading.value());
+        pushHistory(gpuTemperatureHistory, gpuTemperatureReading.value());
         pushHistory(vramUsedHistory, snapshot.vramUsedBytes() >= 0L ? Math.max(0.0, snapshot.vramUsedBytes() / (1024.0 * 1024.0)) : -1.0);
         pushHistory(memoryUsedHistory, Math.max(0.0, memorySnapshot.heapUsedBytes() / (1024.0 * 1024.0)));
         pushHistory(memoryCommittedHistory, Math.max(0.0, memorySnapshot.heapCommittedBytes() / (1024.0 * 1024.0)));
@@ -347,6 +495,22 @@ public class SystemMetricsProfiler {
 
     public Snapshot getSnapshot() {
         return snapshot;
+    }
+
+    private String resolveGpuVendor() {
+        if (!cachedGpuVendor.isBlank()) {
+            return cachedGpuVendor;
+        }
+        cachedGpuVendor = stringOrEmpty(GL11.glGetString(GL11.GL_VENDOR));
+        return cachedGpuVendor;
+    }
+
+    private String resolveGpuRenderer() {
+        if (!cachedGpuRenderer.isBlank()) {
+            return cachedGpuRenderer;
+        }
+        cachedGpuRenderer = stringOrEmpty(GL11.glGetString(GL11.GL_RENDERER));
+        return cachedGpuRenderer;
     }
 
     public long[] getNetworkInHistory() { return networkInHistory; }
@@ -418,6 +582,27 @@ public class SystemMetricsProfiler {
                 lastRate = 0.0;
             }
             return lastRate;
+        }
+    }
+
+    private record TemperatureReading(double value, String provider) {}
+
+    private static final class TemperatureRetention {
+        private double lastValue = -1.0;
+        private long lastCapturedAtMillis;
+        private String lastProvider = "Unavailable";
+
+        private synchronized TemperatureReading resolve(double currentValue, String currentProvider, long now, long retainMillis) {
+            if (Double.isFinite(currentValue) && currentValue >= 0.0) {
+                lastValue = currentValue;
+                lastCapturedAtMillis = now;
+                lastProvider = currentProvider == null || currentProvider.isBlank() ? "Unavailable" : currentProvider;
+                return new TemperatureReading(currentValue, lastProvider);
+            }
+            if (lastCapturedAtMillis > 0L && now - lastCapturedAtMillis <= retainMillis && Double.isFinite(lastValue) && lastValue >= 0.0) {
+                return new TemperatureReading(lastValue, lastProvider);
+            }
+            return new TemperatureReading(-1.0, "Unavailable");
         }
     }
 
@@ -514,22 +699,31 @@ public class SystemMetricsProfiler {
         if (bridgeSample == null) {
             bridgeSample = WindowsTelemetryBridge.Sample.empty();
         }
+        if (bridgeSample.capturedAtEpochMillis() > 0L && System.currentTimeMillis() - bridgeSample.capturedAtEpochMillis() > 3_000L) {
+            bridgeSample = WindowsTelemetryBridge.Sample.empty();
+        }
         if (nativeSample == null) {
             nativeSample = NativeWindowsSensors.Sample.empty();
         }
         return new WindowsTelemetryBridge.Sample(
+                bridgeSample.capturedAtEpochMillis(),
                 bridgeSample.bridgeActive() || nativeSample.active(),
                 chooseTelemetryText(nativeSample.counterSource(), bridgeSample.counterSource(), "Unavailable"),
                 chooseTelemetryText(nativeSample.sensorSource(), bridgeSample.sensorSource(), "Unavailable"),
                 mergeTelemetryErrors(nativeSample.sensorErrorCode(), bridgeSample.sensorErrorCode()),
+                chooseTelemetryProvider(nativeSample.cpuTemperatureC(), nativeSample.cpuTemperatureProvider(), bridgeSample.cpuTemperatureC(), bridgeSample.cpuTemperatureProvider()),
+                chooseTelemetryProvider(nativeSample.gpuTemperatureC(), nativeSample.gpuTemperatureProvider(), bridgeSample.gpuTemperatureC(), bridgeSample.gpuTemperatureProvider()),
+                chooseTelemetryProvider(nativeSample.gpuHotSpotTemperatureC(), nativeSample.gpuHotSpotTemperatureProvider(), bridgeSample.gpuHotSpotTemperatureC(), bridgeSample.gpuHotSpotTemperatureProvider()),
                 chooseTelemetryDouble(nativeSample.cpuCoreLoadPercent(), bridgeSample.cpuCoreLoadPercent()),
                 chooseTelemetryDouble(nativeSample.gpuCoreLoadPercent(), bridgeSample.gpuCoreLoadPercent()),
                 chooseTelemetryDouble(nativeSample.gpuTemperatureC(), bridgeSample.gpuTemperatureC()),
+                chooseTelemetryDouble(nativeSample.gpuHotSpotTemperatureC(), bridgeSample.gpuHotSpotTemperatureC()),
                 chooseTelemetryDouble(nativeSample.cpuTemperatureC(), bridgeSample.cpuTemperatureC()),
                 bridgeSample.bytesReceivedPerSecond(),
                 bridgeSample.bytesSentPerSecond(),
                 bridgeSample.diskReadBytesPerSecond(),
-                bridgeSample.diskWriteBytesPerSecond()
+                bridgeSample.diskWriteBytesPerSecond(),
+                bridgeSample.sampleDurationMillis()
         );
     }
 
@@ -561,8 +755,94 @@ public class SystemMetricsProfiler {
     private double chooseTelemetryDouble(double preferred, double fallback) {
         return Double.isFinite(preferred) && preferred >= 0.0 ? preferred : fallback;
     }
-    private String buildCpuTemperatureUnavailableReason(WindowsTelemetryBridge.Sample bridgeSample) {
-        if (bridgeSample.cpuTemperatureC() >= 0) {
+
+    private String chooseTelemetryProvider(double preferredValue, String preferredProvider, double fallbackValue, String fallbackProvider) {
+        if (Double.isFinite(preferredValue) && preferredValue >= 0.0) {
+            return normalizeTemperatureProvider(preferredProvider);
+        }
+        if (Double.isFinite(fallbackValue) && fallbackValue >= 0.0) {
+            return normalizeTemperatureProvider(fallbackProvider);
+        }
+        return "Unavailable";
+    }
+
+    private Map<String, String> buildMetricProvenance() {
+        Map<String, String> provenance = new LinkedHashMap<>();
+        provenance.put("packetProcessingLatencyMs", "inferred from packet volume and client tick pressure");
+        provenance.put("networkBufferSaturation", "inferred from packet burst thresholds");
+        provenance.put("bytesPerEntity", "derived from inbound bytes divided by loaded entity count");
+        provenance.put("chunkPipeline", "heuristic from thread names and render phase call counts");
+        provenance.put("estimatedPhysicalCores", "heuristic estimate from logical processor count");
+        provenance.put("parallelismEfficiency", "heuristic based on aggregate thread load");
+        provenance.put("lightQueue", "best-effort parsed from chunk debug text");
+        provenance.put("chunkCounts", "best-effort parsed from chunk debug text");
+        return provenance;
+    }
+
+    private double sumProfilerThreadLoad() {
+        return ThreadLoadProfiler.getInstance().getLatestRawThreadSnapshots().values().stream()
+                .filter(raw -> raw.threadName() != null && raw.threadName().toLowerCase(Locale.ROOT).contains("taskmanager"))
+                .mapToDouble(raw -> raw.snapshot().loadPercent())
+                .sum();
+    }
+
+    private String extractTelemetryProvider(String source, String devicePrefix) {
+        if (source == null || source.isBlank()) {
+            return "Unavailable";
+        }
+        String prefix = devicePrefix == null ? "" : devicePrefix + ": ";
+        for (String part : source.split("\\|")) {
+            String trimmed = part.trim();
+            if (!prefix.isBlank() && trimmed.startsWith(prefix)) {
+                int bracket = trimmed.indexOf('[');
+                String provider = bracket >= 0 ? trimmed.substring(prefix.length(), bracket).trim() : trimmed.substring(prefix.length()).trim();
+                return normalizeTemperatureProvider(provider);
+            }
+        }
+        return "Unavailable";
+    }
+
+    private String normalizeTemperatureProvider(String provider) {
+        if (provider == null || provider.isBlank()) {
+            return "Unavailable";
+        }
+        String lower = provider.toLowerCase(Locale.ROOT);
+        if (lower.contains("windows pdh gpu counters") || lower.contains("windows performance counters") || lower.contains("jvm mxbean")) {
+            return "Unavailable";
+        }
+        return provider;
+    }
+
+    private String buildGpuCoverageSummary(Map<String, RenderPhaseProfiler.PhaseSnapshot> renderPhases) {
+        if (renderPhases == null || renderPhases.isEmpty()) {
+            return "No tagged phases yet";
+        }
+        long totalGpuNanos = renderPhases.values().stream().mapToLong(RenderPhaseProfiler.PhaseSnapshot::gpuNanos).sum();
+        long sharedGpuNanos = renderPhases.values().stream()
+                .filter(phase -> phase.ownerMod() == null || phase.ownerMod().isBlank() || phase.ownerMod().startsWith("shared/"))
+                .mapToLong(RenderPhaseProfiler.PhaseSnapshot::gpuNanos)
+                .sum();
+        long taggedPhases = renderPhases.values().stream()
+                .filter(phase -> phase.ownerMod() != null && !phase.ownerMod().isBlank() && !phase.ownerMod().startsWith("shared/"))
+                .count();
+        double sharedPct = totalGpuNanos > 0L ? sharedGpuNanos * 100.0 / totalGpuNanos : 0.0;
+        boolean irisLoaded = net.fabricmc.loader.api.FabricLoader.getInstance().isModLoaded("iris");
+        boolean sodiumLoaded = net.fabricmc.loader.api.FabricLoader.getInstance().isModLoaded("sodium");
+        List<String> coveredPaths = renderPhases.keySet().stream()
+                .filter(name -> name != null && (name.contains("world") || name.contains("sky") || name.contains("particle") || name.contains("outline")))
+                .limit(4)
+                .toList();
+        return String.format(Locale.ROOT,
+                "%d tagged phases | %.1f%% shared/render carry-over | Iris %s | Sodium %s | paths %s",
+                taggedPhases,
+                sharedPct,
+                irisLoaded ? "on" : "off",
+                sodiumLoaded ? "on" : "off",
+                coveredPaths.isEmpty() ? "warming up" : String.join(", ", coveredPaths));
+    }
+
+    private String buildCpuTemperatureUnavailableReason(TemperatureReading cpuTemperatureReading, WindowsTelemetryBridge.Sample bridgeSample) {
+        if (cpuTemperatureReading != null && cpuTemperatureReading.value() >= 0.0) {
             return "CPU temperature provider active";
         }
         String source = bridgeSample.sensorSource() == null ? "" : bridgeSample.sensorSource();
@@ -573,18 +853,91 @@ public class SystemMetricsProfiler {
         return "CPU temperature unavailable. Source: " + source + " | Last bridge error: " + error;
     }
 
-    private int countThreadsMatching(Map<String, ThreadLoadProfiler.ThreadSnapshot> threadDetails, String... needles) {
-        return (int) threadDetails.keySet().stream()
-                .map(name -> name.toLowerCase(Locale.ROOT))
-                .filter(name -> {
-                    for (String needle : needles) {
-                        if (name.contains(needle)) {
-                            return true;
-                        }
-                    }
-                    return false;
+    private List<ThreadObservation> buildThreadObservations(ThreadSnapshotCollector.Snapshot latestStacks) {
+        Map<Long, Long> threadAllocations = MemoryProfiler.getInstance().getThreadAllocationRateBytesPerSecond();
+        return ThreadLoadProfiler.getInstance().getLatestRawThreadSnapshots().values().stream()
+                .sorted((a, b) -> Double.compare(b.snapshot().loadPercent(), a.snapshot().loadPercent()))
+                .map(raw -> {
+                    ThreadSnapshotCollector.ThreadStackSnapshot stackSnapshot = latestStacks.threadsById().get(raw.threadId());
+                    StackTraceElement[] stack = stackSnapshot == null ? null : stackSnapshot.stack();
+                    AttributionInsights.ThreadAttribution attribution = AttributionInsights.attributeThread(raw.threadName(), stack);
+                    ThreadRoleAnalysis role = classifyThreadRoleAnalysis(raw.threadName(), stack);
+                    return new ThreadObservation(
+                            raw,
+                            stackSnapshot,
+                            attribution,
+                            role,
+                            threadAllocations.getOrDefault(raw.threadId(), 0L)
+                    );
                 })
-                .count();
+                .toList();
+    }
+
+    private List<ThreadDrilldown> buildThreadDrilldown(List<ThreadObservation> observations) {
+        return observations.stream()
+                .map(observation -> new ThreadDrilldown(
+                        observation.raw().threadId(),
+                        observation.raw().threadName(),
+                        observation.raw().canonicalThreadName(),
+                        observation.raw().snapshot().loadPercent(),
+                        observation.allocationRateBytesPerSecond(),
+                        observation.raw().snapshot().state(),
+                        observation.raw().snapshot().blockedTimeDeltaMs(),
+                        observation.raw().snapshot().waitedTimeDeltaMs(),
+                        observation.attribution().ownerMod(),
+                        observation.attribution().confidence().label(),
+                        observation.attribution().reasonFrame(),
+                        observation.attribution().topFrames(),
+                        observation.role().label(),
+                        observation.role().source(),
+                        observation.attribution().candidateLabels()
+                ))
+                .toList();
+    }
+
+    private List<ContentionSample> buildContentionSamples(List<ThreadObservation> observations) {
+        Map<Long, ThreadObservation> byThreadId = new LinkedHashMap<>();
+        for (ThreadObservation observation : observations) {
+            byThreadId.put(observation.raw().threadId(), observation);
+        }
+        List<ContentionSample> result = new ArrayList<>();
+        for (ThreadObservation waiter : observations) {
+            ThreadLoadProfiler.ThreadSnapshot waiterSnapshot = waiter.raw().snapshot();
+            boolean waiting = waiterSnapshot.blockedCountDelta() > 0
+                    || waiterSnapshot.waitedCountDelta() > 0
+                    || "BLOCKED".equals(waiterSnapshot.state())
+                    || "WAITING".equals(waiterSnapshot.state());
+            if (!waiting || waiterSnapshot.lockOwnerThreadId() <= 0L) {
+                continue;
+            }
+            ThreadObservation owner = byThreadId.get(waiterSnapshot.lockOwnerThreadId());
+            AttributionInsights.ThreadAttribution ownerAttribution = owner == null
+                    ? AttributionInsights.attributeThread(waiterSnapshot.lockOwnerName(), null)
+                    : owner.attribution();
+            ThreadRoleAnalysis ownerRole = owner == null
+                    ? classifyThreadRoleAnalysis(waiterSnapshot.lockOwnerName(), null)
+                    : owner.role();
+            String lockName = waiterSnapshot.lockName() == null || waiterSnapshot.lockName().isBlank() ? "unknown lock" : waiterSnapshot.lockName();
+            result.add(new ContentionSample(
+                    waiter.raw().threadId(),
+                    waiter.raw().threadName(),
+                    waiter.attribution().ownerMod(),
+                    waiter.attribution().confidence().label(),
+                    waiter.role().label(),
+                    owner == null ? waiterSnapshot.lockOwnerThreadId() : owner.raw().threadId(),
+                    owner == null ? blankToUnknown(waiterSnapshot.lockOwnerName()) : owner.raw().threadName(),
+                    ownerAttribution.ownerMod(),
+                    ownerAttribution.confidence().label(),
+                    ownerRole.label(),
+                    lockName,
+                    waiterSnapshot.blockedTimeDeltaMs(),
+                    waiterSnapshot.waitedTimeDeltaMs(),
+                    waiter.attribution().candidateLabels(),
+                    ownerAttribution.candidateLabels(),
+                    pairwiseConfidence(waiter.attribution(), ownerAttribution).label()
+            ));
+        }
+        return result;
     }
 
     private long sumPhaseCalls(Map<String, RenderPhaseProfiler.PhaseSnapshot> phases, String... needles) {
@@ -658,91 +1011,159 @@ public class SystemMetricsProfiler {
         }
     }
 
-    private String buildSchedulingConflictSummary(Map<String, ThreadLoadProfiler.ThreadSnapshot> threadDetails) {
-        ThreadLoadProfiler.ThreadSnapshot server = threadDetails.get("Server Thread");
-        ThreadLoadProfiler.ThreadSnapshot render = threadDetails.get("Render Thread");
-        double workerLoad = threadDetails.entrySet().stream()
-                .filter(entry -> entry.getKey().startsWith("Worker-Main-"))
-                .mapToDouble(entry -> entry.getValue().loadPercent())
-                .sum();
-        int processors = Runtime.getRuntime().availableProcessors();
-        if (server != null && server.loadPercent() > 35.0 && workerLoad > 50.0 && processors <= 8) {
-            return String.format(Locale.ROOT, "Possible scheduling conflict: Server Thread %.1f%% with Worker-Main load %.1f%% across %d logical cores", server.loadPercent(), workerLoad, processors);
+    static String classifyThreadRole(String threadName, StackTraceElement[] stack) {
+        return classifyThreadRoleAnalysis(threadName, stack).label();
+    }
+
+    private static ThreadRoleAnalysis classifyThreadRoleAnalysis(String threadName, StackTraceElement[] stack) {
+        String lowerName = threadName == null ? "" : threadName.toLowerCase(Locale.ROOT);
+        String stackText = buildStackText(stack);
+        String lowerStack = stackText.toLowerCase(Locale.ROOT);
+        boolean render = lowerName.contains("render") || lowerStack.contains("gamerenderer") || lowerStack.contains("worldrenderer");
+        boolean server = lowerName.contains("server") || lowerName.contains("main thread") || lowerStack.contains("minecraftserver");
+        boolean profiler = lowerName.contains("taskmanager") || lowerStack.contains("wueffi.taskmanager");
+        boolean gc = containsAny(lowerName, "g1", "gc") || containsAny(lowerStack, "sun.jvm", "g1");
+        boolean network = containsAny(lowerName, "netty", "network") || containsAny(lowerStack, "clientconnection", "packet", "netty");
+        boolean ioPool = containsAny(lowerName, "io", "file", "save", "storage")
+                || containsAny(lowerStack, "region", "anvil", "storage", "filechannel", "asynchronousfilechannel", "nio", "zip", "compress", "flush");
+        boolean chunkGeneration = containsAny(lowerName, "worldgen", "gen")
+                || containsAny(lowerStack, "chunkstatus", "noisechunk", "worldgen", "generator");
+        boolean chunkMeshing = containsAny(lowerName, "chunk build", "builder", "mesh")
+                || containsAny(lowerStack, "chunkbuilder", "rebuild", "meshing", "compileterrain");
+        boolean chunkUpload = containsAny(lowerName, "upload")
+                || containsAny(lowerStack, "vertexbuffer", "upload", "bufferbuilder", "glbuffer");
+        boolean workerPool = containsAny(lowerName, "worker", "executor", "pool", "forkjoin", "c2me", "async")
+                || containsAny(lowerStack, "threadpoolexecutor", "forkjoin", "completablefuture", "executor", "worker", "c2me", "mailbox");
+
+        if (profiler) {
+            return new ThreadRoleAnalysis("Profiler", sourceForRole(lowerName, lowerStack, "taskmanager"), false, false, false, false, false, false);
         }
-        if (render != null && render.loadPercent() > 35.0 && workerLoad > 50.0 && processors <= 8) {
-            return String.format(Locale.ROOT, "Possible render scheduling conflict: Render Thread %.1f%% with Worker-Main load %.1f%% across %d logical cores", render.loadPercent(), workerLoad, processors);
+        if (render) {
+            return new ThreadRoleAnalysis("Render", sourceForRole(lowerName, lowerStack, "render"), true, false, false, false, false, false);
+        }
+        if (server) {
+            return new ThreadRoleAnalysis("Main Logic", sourceForRole(lowerName, lowerStack, "server"), true, false, false, false, false, false);
+        }
+        if (chunkUpload) {
+            return new ThreadRoleAnalysis("Chunk Upload Worker", sourceForRole(lowerName, lowerStack, "upload"), false, true, false, false, false, true);
+        }
+        if (chunkMeshing) {
+            return new ThreadRoleAnalysis("Chunk Meshing Worker", sourceForRole(lowerName, lowerStack, "mesh"), false, true, false, false, true, false);
+        }
+        if (chunkGeneration) {
+            return new ThreadRoleAnalysis("Chunk Generation Worker", sourceForRole(lowerName, lowerStack, "worldgen"), false, true, false, true, false, false);
+        }
+        if (ioPool) {
+            return new ThreadRoleAnalysis("IO Pool", sourceForRole(lowerName, lowerStack, "storage"), false, false, true, false, false, false);
+        }
+        if (network) {
+            return new ThreadRoleAnalysis("Network", sourceForRole(lowerName, lowerStack, "netty"), false, false, false, false, false, false);
+        }
+        if (gc) {
+            return new ThreadRoleAnalysis("GC", sourceForRole(lowerName, lowerStack, "gc"), false, false, false, false, false, false);
+        }
+        if (workerPool) {
+            return new ThreadRoleAnalysis("Worker Pool", sourceForRole(lowerName, lowerStack, "worker"), false, true, false, false, false, false);
+        }
+        return new ThreadRoleAnalysis("Other", "fallback", false, false, false, false, false, false);
+    }
+
+    private String buildSchedulingConflictSummary(List<ThreadObservation> observations) {
+        ThreadObservation hottestMain = observations.stream()
+                .filter(observation -> observation.role().mainLogic())
+                .max((a, b) -> Double.compare(a.raw().snapshot().loadPercent(), b.raw().snapshot().loadPercent()))
+                .orElse(null);
+        double workerLoad = observations.stream()
+                .filter(observation -> observation.role().countsAsWorker())
+                .mapToDouble(observation -> observation.raw().snapshot().loadPercent())
+                .sum();
+        int activeWorkers = countWorkers(observations, true);
+        int physicalCores = estimatePhysicalCores();
+        if (hottestMain != null
+                && hottestMain.raw().snapshot().loadPercent() > 35.0
+                && workerLoad > Math.max(45.0, physicalCores * 12.0)
+                && activeWorkers >= Math.max(2, physicalCores / 2)) {
+            return String.format(
+                    Locale.ROOT,
+                    "Possible scheduling conflict: %s %.1f%% with %s worker load %.1f%% across %d estimated physical cores",
+                    hottestMain.raw().canonicalThreadName(),
+                    hottestMain.raw().snapshot().loadPercent(),
+                    dominantWorkerLabel(observations),
+                    workerLoad,
+                    physicalCores
+            );
         }
         return "No scheduling conflict detected";
     }
 
-    private String buildParallelismFlag(Map<String, ThreadLoadProfiler.ThreadSnapshot> threadDetails) {
-        long activeWorkers = threadDetails.entrySet().stream()
-                .filter(entry -> entry.getKey().startsWith("Worker-Main-") && entry.getValue().loadPercent() >= 5.0)
+    private String buildParallelismFlag(List<ThreadObservation> observations) {
+        int activeWorkers = countWorkers(observations, true);
+        int idleWorkers = countWorkers(observations, false);
+        long blockedWorkers = observations.stream()
+                .filter(observation -> observation.role().countsAsWorker())
+                .filter(observation -> {
+                    ThreadLoadProfiler.ThreadSnapshot snapshot = observation.raw().snapshot();
+                    return snapshot.blockedCountDelta() > 0
+                            || snapshot.waitedCountDelta() > 0
+                            || "BLOCKED".equals(snapshot.state())
+                            || "WAITING".equals(snapshot.state());
+                })
                 .count();
-        long blockedWorkers = threadDetails.entrySet().stream()
-                .filter(entry -> entry.getKey().startsWith("Worker-Main-") && (entry.getValue().blockedCountDelta() > 0 || entry.getValue().waitedCountDelta() > 0 || "BLOCKED".equals(entry.getValue().state()) || "WAITING".equals(entry.getValue().state())))
-                .count();
-        double workerLoad = threadDetails.entrySet().stream()
-                .filter(entry -> entry.getKey().startsWith("Worker-Main-"))
-                .mapToDouble(entry -> entry.getValue().loadPercent())
+        double workerLoad = observations.stream()
+                .filter(observation -> observation.role().countsAsWorker())
+                .mapToDouble(observation -> observation.raw().snapshot().loadPercent())
                 .sum();
-        ThreadLoadProfiler.ThreadSnapshot server = threadDetails.get("Server Thread");
-        double serverLoad = server == null ? 0.0 : server.loadPercent();
+        ThreadObservation hottestMain = observations.stream()
+                .filter(observation -> observation.role().mainLogic())
+                .max((a, b) -> Double.compare(a.raw().snapshot().loadPercent(), b.raw().snapshot().loadPercent()))
+                .orElse(null);
+        double mainLoad = hottestMain == null ? 0.0 : hottestMain.raw().snapshot().loadPercent();
         if (activeWorkers == 0 && workerLoad < 5.0) {
-            return String.format(Locale.ROOT, "Parallelism low (%d high-load threads)", countHighLoadThreads(threadDetails));
+            return String.format(Locale.ROOT, "Parallelism low (%d high-load threads)", countHighLoadThreads(observations));
         }
         if (blockedWorkers >= Math.max(2, activeWorkers) && activeWorkers > 0) {
             return String.format(Locale.ROOT, "Parallelism blocked (%d active / %d waiting)", activeWorkers, blockedWorkers);
         }
-        if (serverLoad > 35.0 && workerLoad > 80.0) {
-            return String.format(Locale.ROOT, "Parallelism saturated (%d workers / %d high-load threads)", activeWorkers, countHighLoadThreads(threadDetails));
+        if (mainLoad > 35.0 && workerLoad > Math.max(80.0, estimatePhysicalCores() * 18.0)) {
+            return String.format(Locale.ROOT, "Parallelism saturated (%d workers / %d idle / %d high-load threads)", activeWorkers, idleWorkers, countHighLoadThreads(observations));
         }
-        return String.format(Locale.ROOT, "Parallelism healthy (%d workers / %d high-load threads)", activeWorkers, countHighLoadThreads(threadDetails));
+        return String.format(Locale.ROOT, "Parallelism healthy (%d workers / %d idle / %d high-load threads)", activeWorkers, idleWorkers, countHighLoadThreads(observations));
     }
 
     private int estimatePhysicalCores() {
         return Math.max(1, Runtime.getRuntime().availableProcessors() / 2);
     }
 
-    private int countHighLoadThreads(Map<String, ThreadLoadProfiler.ThreadSnapshot> threadDetails) {
-        return (int) threadDetails.values().stream()
+    private int countHighLoadThreads(List<ThreadObservation> observations) {
+        return (int) observations.stream()
+                .map(ThreadObservation::raw)
+                .map(ThreadLoadProfiler.RawThreadSnapshot::snapshot)
                 .filter(snapshot -> snapshot.loadPercent() >= 50.0)
                 .count();
     }
 
-    private String buildMainLogicSummary(Map<String, ThreadLoadProfiler.ThreadSnapshot> threadDetails) {
-        Map.Entry<String, ThreadLoadProfiler.ThreadSnapshot> main = threadDetails.entrySet().stream()
-                .filter(entry -> isMainLogicThread(entry.getKey()))
-                .max((a, b) -> Double.compare(a.getValue().loadPercent(), b.getValue().loadPercent()))
+    private String buildMainLogicSummary(List<ThreadObservation> observations) {
+        ThreadObservation main = observations.stream()
+                .filter(observation -> observation.role().mainLogic())
+                .max((a, b) -> Double.compare(a.raw().snapshot().loadPercent(), b.raw().snapshot().loadPercent()))
                 .orElse(null);
         if (main == null) {
             return "Main Logic: n/a";
         }
-        return String.format(Locale.ROOT, "Main Logic: %s (%.0f%%)", main.getKey(), main.getValue().loadPercent());
+        return String.format(Locale.ROOT, "Main Logic: %s (%.0f%%)", main.raw().threadName(), main.raw().snapshot().loadPercent());
     }
 
-    private String buildBackgroundSummary(Map<String, ThreadLoadProfiler.ThreadSnapshot> threadDetails) {
-        double backgroundLoad = threadDetails.entrySet().stream()
-                .filter(entry -> !isMainLogicThread(entry.getKey()))
-                .mapToDouble(entry -> entry.getValue().loadPercent())
+    private String buildBackgroundSummary(List<ThreadObservation> observations) {
+        double backgroundLoad = observations.stream()
+                .filter(observation -> !observation.role().mainLogic())
+                .mapToDouble(observation -> observation.raw().snapshot().loadPercent())
                 .sum();
-        String label = threadDetails.entrySet().stream()
-                .filter(entry -> !isMainLogicThread(entry.getKey()))
-                .map(Map.Entry::getKey)
+        String label = observations.stream()
+                .filter(observation -> !observation.role().mainLogic())
+                .map(observation -> observation.role().label())
                 .findFirst()
-                .orElse("Workers/JVM");
-        if (label.startsWith("Worker-Main-") || label.startsWith("C2ME")) {
-            label = "Workers/C2ME";
-        } else if (label.startsWith("G1") || label.contains("GC")) {
-            label = "Workers/GC";
-        } else if (label.equals("unknown")) {
-            label = "Infrastructure";
-        }
+                .orElse("Infrastructure");
         return String.format(Locale.ROOT, "Background: %s (%.0f%%)", label, backgroundLoad);
-    }
-
-    private boolean isMainLogicThread(String threadName) {
-        return "Server Thread".equals(threadName) || "Render Thread".equals(threadName) || threadName.toLowerCase(Locale.ROOT).contains("main thread");
     }
 
     private String buildCpuSensorStatus(String sensorSource) {
@@ -767,23 +1188,110 @@ public class SystemMetricsProfiler {
 
 
 
-    private String buildParallelismEfficiency(double totalThreadLoad) {
-        if (totalThreadLoad > 800.0) {
-            return "Heavy Multithreading Active (C2ME).";
+    private String buildParallelismEfficiency(double totalThreadLoad, int activeWorkers, int idleWorkers) {
+        if (activeWorkers >= Math.max(4, estimatePhysicalCores()) && totalThreadLoad > 800.0) {
+            return "Heavy multithreading active.";
         }
-        if (totalThreadLoad < 300.0) {
-            return "Light Multithreading Active.";
+        if (activeWorkers == 0 && totalThreadLoad < 300.0) {
+            return "Light multithreading active.";
         }
-        return "Moderate Multithreading Active.";
+        if (idleWorkers > activeWorkers && activeWorkers > 0) {
+            return "Moderate multithreading active with spare worker capacity.";
+        }
+        return "Moderate multithreading active.";
     }
 
-    private int countWorkers(Map<String, ThreadLoadProfiler.ThreadSnapshot> threadDetails, boolean active) {
-        return (int) threadDetails.entrySet().stream()
-                .filter(entry -> entry.getKey().startsWith("Worker-Main-") || entry.getKey().toLowerCase(Locale.ROOT).contains("worker") || entry.getKey().contains("C2ME"))
-                .filter(entry -> active
-                        ? entry.getValue().loadPercent() >= 5.0 || "RUNNABLE".equals(entry.getValue().state())
-                        : entry.getValue().loadPercent() < 5.0 && ("WAITING".equals(entry.getValue().state()) || "TIMED_WAITING".equals(entry.getValue().state())))
+    private int countWorkers(List<ThreadObservation> observations, boolean active) {
+        return (int) observations.stream()
+                .filter(observation -> observation.role().countsAsWorker())
+                .filter(observation -> active
+                        ? observation.raw().snapshot().loadPercent() >= 5.0 || "RUNNABLE".equals(observation.raw().snapshot().state())
+                        : observation.raw().snapshot().loadPercent() < 5.0 && ("WAITING".equals(observation.raw().snapshot().state()) || "TIMED_WAITING".equals(observation.raw().snapshot().state())))
                 .count();
+    }
+
+    private int countRoleMatches(List<ThreadObservation> observations, java.util.function.Predicate<ThreadRoleAnalysis> predicate) {
+        return (int) observations.stream()
+                .map(ThreadObservation::role)
+                .filter(predicate)
+                .count();
+    }
+
+    private AttributionInsights.Confidence pairwiseConfidence(AttributionInsights.ThreadAttribution waiter, AttributionInsights.ThreadAttribution owner) {
+        if (waiter == null || owner == null) {
+            return AttributionInsights.Confidence.WEAK_HEURISTIC;
+        }
+        boolean waiterConcrete = isConcreteMod(waiter.ownerMod());
+        boolean ownerConcrete = isConcreteMod(owner.ownerMod());
+        if (waiterConcrete && ownerConcrete
+                && waiter.confidence() != AttributionInsights.Confidence.WEAK_HEURISTIC
+                && owner.confidence() != AttributionInsights.Confidence.WEAK_HEURISTIC) {
+            return AttributionInsights.Confidence.PAIRWISE_INFERRED;
+        }
+        if (waiterConcrete || ownerConcrete) {
+            return AttributionInsights.Confidence.INFERRED;
+        }
+        return AttributionInsights.Confidence.WEAK_HEURISTIC;
+    }
+
+    private boolean isConcreteMod(String modId) {
+        return modId != null && !modId.isBlank() && !modId.startsWith("shared/") && !modId.startsWith("runtime/");
+    }
+
+    private static String buildStackText(StackTraceElement[] stack) {
+        if (stack == null || stack.length == 0) {
+            return "";
+        }
+        StringBuilder builder = new StringBuilder();
+        for (StackTraceElement frame : stack) {
+            if (frame == null) {
+                continue;
+            }
+            if (!builder.isEmpty()) {
+                builder.append(' ');
+            }
+            builder.append(frame.getClassName()).append('#').append(frame.getMethodName());
+        }
+        return builder.toString();
+    }
+
+    private static String sourceForRole(String lowerName, String lowerStack, String marker) {
+        boolean inName = marker != null && !marker.isBlank() && lowerName.contains(marker);
+        boolean inStack = marker != null && !marker.isBlank() && lowerStack.contains(marker);
+        if (inName && inStack) {
+            return "thread name + stack ancestry";
+        }
+        if (inStack) {
+            return "stack ancestry";
+        }
+        if (inName) {
+            return "thread name";
+        }
+        return "heuristic";
+    }
+
+    private static boolean containsAny(String text, String... needles) {
+        if (text == null || text.isBlank()) {
+            return false;
+        }
+        for (String needle : needles) {
+            if (needle != null && !needle.isBlank() && text.contains(needle)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private String dominantWorkerLabel(List<ThreadObservation> observations) {
+        return observations.stream()
+                .filter(observation -> observation.role().countsAsWorker())
+                .map(observation -> observation.role().label())
+                .findFirst()
+                .orElse("background");
+    }
+
+    private String blankToUnknown(String value) {
+        return value == null || value.isBlank() ? "unknown" : value;
     }
 
     private String sampleBiome() {

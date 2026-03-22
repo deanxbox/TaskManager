@@ -14,73 +14,79 @@ public class FrameTimelineProfiler {
     private final long[] frameTimes = new long[SIZE];
     private final long[] frameTimestamps = new long[SIZE];
     private final double[] fpsHistory = new double[SIZE];
+    private final long[] selfCostHistory = new long[SIZE];
     private int index = 0;
     private int count = 0;
     private long latestFrameNs = 0;
     private long frameSequence = 0;
     private double currentFps = 0.0;
+    private long pendingSelfCostNs = 0L;
 
     private long frameStart;
 
-    public void beginFrame() {
+    public synchronized void beginFrame() {
         frameStart = System.nanoTime();
     }
 
-    public void endFrame() {
+    public synchronized void endFrame() {
         long now = System.nanoTime();
         recordFrame(now - frameStart, now);
     }
 
-    void recordFrame(long durationNs, long timestampNs) {
+    synchronized void recordFrame(long durationNs, long timestampNs) {
         frameTimes[index] = durationNs;
         frameTimestamps[index] = timestampNs;
         latestFrameNs = durationNs;
         frameSequence++;
         currentFps = computeRollingFps(timestampNs, index, Math.min(count + 1, SIZE));
         fpsHistory[index] = currentFps > 0.0 ? currentFps : 1_000_000_000.0 / Math.max(1L, durationNs);
+        selfCostHistory[index] = pendingSelfCostNs;
+        pendingSelfCostNs = 0L;
         index = (index + 1) % SIZE;
         if (count < SIZE) {
             count++;
         }
     }
 
-    void reset() {
+    synchronized void reset() {
         Arrays.fill(frameTimes, 0L);
         Arrays.fill(frameTimestamps, 0L);
         Arrays.fill(fpsHistory, 0.0);
+        Arrays.fill(selfCostHistory, 0L);
         index = 0;
         count = 0;
         latestFrameNs = 0L;
         frameSequence = 0L;
         currentFps = 0.0;
+        pendingSelfCostNs = 0L;
         frameStart = 0L;
     }
 
-    public long[] getFrames() {
-        return frameTimes;
+    public synchronized long[] getFrames() {
+        return Arrays.copyOf(frameTimes, frameTimes.length);
     }
 
-    public double[] getFpsHistory() {
-        return fpsHistory;
+    public synchronized double[] getFpsHistory() {
+        return Arrays.copyOf(fpsHistory, fpsHistory.length);
     }
 
-    public int getIndex() {
+    public synchronized int getIndex() {
         return index;
     }
 
-    public int getCount() {
+    public synchronized int getCount() {
         return count;
     }
 
-    public long getLatestFrameNs() {
+    public synchronized long getLatestFrameNs() {
         return latestFrameNs;
     }
 
-    public long getFrameSequence() {
+    public synchronized long getFrameSequence() {
         return frameSequence;
     }
 
-    public double getCurrentFps() {
+    public synchronized double getCurrentFps() {
         if (count == 0) {
             return 0.0;
         }
@@ -89,7 +95,7 @@ public class FrameTimelineProfiler {
         return rolling > 0.0 ? rolling : (currentFps > 0.0 ? currentFps : getAverageFps());
     }
 
-    public double getAverageFps() {
+    public synchronized double getAverageFps() {
         if (count == 0) {
             return 0.0;
         }
@@ -106,17 +112,17 @@ public class FrameTimelineProfiler {
         return 1_000_000_000.0 / averageFrameNs;
     }
 
-    public double getOnePercentLowFps() {
+    public synchronized double getOnePercentLowFps() {
         long percentileNs = getPercentileFrameNs(0.99);
         return percentileNs <= 0L ? 0.0 : 1_000_000_000.0 / percentileNs;
     }
 
-    public double getPointOnePercentLowFps() {
+    public synchronized double getPointOnePercentLowFps() {
         long percentileNs = getPercentileFrameNs(0.999);
         return percentileNs <= 0L ? 0.0 : 1_000_000_000.0 / percentileNs;
     }
 
-    public long getAverageFrameNs() {
+    public synchronized long getAverageFrameNs() {
         if (count == 0) return 0;
 
         long total = 0;
@@ -126,7 +132,7 @@ public class FrameTimelineProfiler {
         return total / count;
     }
 
-    public double getFrameVarianceMs() {
+    public synchronized double getFrameVarianceMs() {
         if (count == 0) return 0;
 
         double meanMs = getAverageFrameNs() / 1_000_000.0;
@@ -139,16 +145,16 @@ public class FrameTimelineProfiler {
         return variance / count;
     }
 
-    public double getFrameStdDevMs() {
+    public synchronized double getFrameStdDevMs() {
         return Math.sqrt(getFrameVarianceMs());
     }
 
-    public double getStutterScore() {
+    public synchronized double getStutterScore() {
         double stdDevMs = getFrameStdDevMs();
         return Math.min(100.0, stdDevMs * 8.0);
     }
 
-    public long getMaxFrameNs() {
+    public synchronized long getMaxFrameNs() {
         long max = 0;
         for (int i = 0; i < count; i++) {
             if (frameTimes[i] > max) {
@@ -158,7 +164,7 @@ public class FrameTimelineProfiler {
         return max;
     }
 
-    public double getMaxFps() {
+    public synchronized double getMaxFps() {
         double max = 0.0;
         for (int i = 0; i < count; i++) {
             if (fpsHistory[i] > max) {
@@ -168,7 +174,7 @@ public class FrameTimelineProfiler {
         return max;
     }
 
-    public long getPercentileFrameNs(double percentile) {
+    public synchronized long getPercentileFrameNs(double percentile) {
         if (count == 0) return 0;
 
         long[] copy = new long[count];
@@ -179,7 +185,7 @@ public class FrameTimelineProfiler {
         return copy[idx];
     }
 
-    public double[] getOrderedFrameMsHistory() {
+    public synchronized double[] getOrderedFrameMsHistory() {
         double[] ordered = new double[count];
         for (int i = 0; i < count; i++) {
             int sourceIndex = (index - count + i + SIZE) % SIZE;
@@ -188,7 +194,7 @@ public class FrameTimelineProfiler {
         return ordered;
     }
 
-    public long[] getOrderedFrameTimestampHistory() {
+    public synchronized long[] getOrderedFrameTimestampHistory() {
         long[] ordered = new long[count];
         for (int i = 0; i < count; i++) {
             int sourceIndex = (index - count + i + SIZE) % SIZE;
@@ -197,7 +203,7 @@ public class FrameTimelineProfiler {
         return ordered;
     }
 
-    public double[] getOrderedFpsHistory() {
+    public synchronized double[] getOrderedFpsHistory() {
         double[] ordered = new double[count];
         for (int i = 0; i < count; i++) {
             int sourceIndex = (index - count + i + SIZE) % SIZE;
@@ -206,7 +212,41 @@ public class FrameTimelineProfiler {
         return ordered;
     }
 
-    public double getHistorySpanSeconds() {
+    public synchronized void addSelfCost(long durationNs) {
+        pendingSelfCostNs += Math.max(0L, durationNs);
+    }
+
+    public synchronized double[] getOrderedSelfCostMsHistory() {
+        double[] ordered = new double[count];
+        for (int i = 0; i < count; i++) {
+            int sourceIndex = (index - count + i + SIZE) % SIZE;
+            ordered[i] = selfCostHistory[sourceIndex] / 1_000_000.0;
+        }
+        return ordered;
+    }
+
+    public synchronized double getSelfCostAvgMs() {
+        if (count == 0) {
+            return 0.0;
+        }
+        long total = 0L;
+        for (int i = 0; i < count; i++) {
+            total += selfCostHistory[i];
+        }
+        return total / (double) count / 1_000_000.0;
+    }
+
+    public synchronized double getSelfCostMaxMs() {
+        long max = 0L;
+        for (int i = 0; i < count; i++) {
+            if (selfCostHistory[i] > max) {
+                max = selfCostHistory[i];
+            }
+        }
+        return max / 1_000_000.0;
+    }
+
+    public synchronized double getHistorySpanSeconds() {
         if (count < 2) {
             return 0.0;
         }
@@ -275,7 +315,7 @@ public class FrameTimelineProfiler {
         return framesInWindow * 1_000_000_000.0 / Math.max(1L, endTimestampNs - oldestTimestamp);
     }
 
-    public java.util.Map<String, Double> getFrameTimeHistogram() {
+    public synchronized java.util.Map<String, Double> getFrameTimeHistogram() {
         if (count == 0) {
             return java.util.Map.of("<8ms", 0.0, "8-16ms", 0.0, "16-32ms", 0.0, ">32ms", 0.0);
         }

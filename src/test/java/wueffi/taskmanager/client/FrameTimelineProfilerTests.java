@@ -9,6 +9,8 @@ public final class FrameTimelineProfilerTests {
         rollingFpsUsesRecentWindow();
         averageAndLowFpsTrackRecordedFrames();
         orderedFrameTimestampsStayInInsertionOrder();
+        selfCostHistoryTracksLastFrame();
+        returnedArraysAreDefensiveCopies();
     }
 
     private static void rollingFpsUsesRecentWindow() {
@@ -45,6 +47,37 @@ public final class FrameTimelineProfilerTests {
         assertEquals(10_000_000L, timestamps[0], "first timestamp");
         assertEquals(21_000_000L, timestamps[1], "second timestamp");
         assertEquals(33_000_000L, timestamps[2], "third timestamp");
+    }
+
+    private static void selfCostHistoryTracksLastFrame() {
+        FrameTimelineProfiler profiler = new FrameTimelineProfiler();
+        profiler.reset();
+        profiler.addSelfCost(250_000L);
+        profiler.recordFrame(10_000_000L, 10_000_000L);
+        profiler.addSelfCost(750_000L);
+        profiler.recordFrame(11_000_000L, 21_000_000L);
+
+        double[] selfCostHistory = profiler.getOrderedSelfCostMsHistory();
+        assertEquals(2, selfCostHistory.length, "self-cost history length");
+        assertNear(0.25, selfCostHistory[0], 0.0001, "first self-cost value");
+        assertNear(0.75, selfCostHistory[1], 0.0001, "second self-cost value");
+        assertNear(0.5, profiler.getSelfCostAvgMs(), 0.0001, "average self-cost");
+        assertNear(0.75, profiler.getSelfCostMaxMs(), 0.0001, "max self-cost");
+    }
+
+    private static void returnedArraysAreDefensiveCopies() {
+        FrameTimelineProfiler profiler = new FrameTimelineProfiler();
+        profiler.reset();
+        profiler.recordFrame(10_000_000L, 10_000_000L);
+        profiler.recordFrame(11_000_000L, 21_000_000L);
+
+        long[] frames = profiler.getFrames();
+        double[] fpsHistory = profiler.getFpsHistory();
+        frames[0] = 999L;
+        fpsHistory[0] = 999L;
+
+        assertEquals(10_000_000L, profiler.getFrames()[0], "frame history should be copied");
+        assertNear(100.0, profiler.getFpsHistory()[0], 0.0001, "fps history should be copied");
     }
 
     private static void assertNear(double expected, double actual, double tolerance, String message) {

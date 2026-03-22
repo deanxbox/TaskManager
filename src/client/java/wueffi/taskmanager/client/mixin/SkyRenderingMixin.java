@@ -32,7 +32,7 @@ public class SkyRenderingMixin {
             CallbackInfo ci) {
 
         if (!ProfilerManager.getInstance().shouldCollectDetailedMetrics()) return;
-        RenderPhaseProfiler.getInstance().beginCpuPhase("sky.renderCelestialBodies", "minecraft");
+        RenderPhaseProfiler.getInstance().beginCpuPhase("sky.renderCelestialBodies", "shared/render");
         GpuTimer.begin("sky.renderCelestialBodies");
     }
 

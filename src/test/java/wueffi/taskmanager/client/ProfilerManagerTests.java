@@ -9,6 +9,7 @@ public final class ProfilerManagerTests {
         snapshotPublishingHonorsForceAndDelay();
         missedSampleCountDetectsDroppedIntervals();
         observedSampleIntervalUsesAverageGap();
+        sessionLoggingKeepsCaptureActiveInManualDeep();
     }
 
     private static void snapshotPublishingHonorsForceAndDelay() {
@@ -28,6 +29,13 @@ public final class ProfilerManagerTests {
         long observed = ProfilerManager.computeObservedSampleIntervalMs(new long[] {1000L, 1050L, 1100L, 1200L}, 50);
         assertEquals(66L, observed, "observed interval should average the captured sample gaps");
         assertEquals(50L, ProfilerManager.computeObservedSampleIntervalMs(new long[] {1000L}, 50), "fallback interval should be used for tiny samples");
+    }
+
+    private static void sessionLoggingKeepsCaptureActiveInManualDeep() {
+        assertTrue(ProfilerManager.computeCaptureActive(ProfilerManager.CaptureMode.MANUAL_DEEP, false, true),
+                "manual deep recording should stay active while a session is being recorded");
+        assertFalse(ProfilerManager.computeCaptureActive(ProfilerManager.CaptureMode.MANUAL_DEEP, false, false),
+                "manual deep without screen or session should stay inactive");
     }
 
     private static void assertTrue(boolean value, String message) {

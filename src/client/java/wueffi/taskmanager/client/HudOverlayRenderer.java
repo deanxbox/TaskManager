@@ -5,12 +5,13 @@ import net.minecraft.client.font.TextRenderer;
 import net.minecraft.client.gui.DrawContext;
 import wueffi.taskmanager.client.util.ConfigManager;
 
-import java.util.ArrayDeque;
 import java.util.ArrayList;
-import java.util.Deque;
-import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.function.Supplier;
 
 public final class HudOverlayRenderer {
@@ -37,37 +38,118 @@ public final class HudOverlayRenderer {
     private static final int LABEL_VALUE_GAP = 8;
     private static final int VALUE_RIGHT_PADDING = 4;
     private static final int MAX_MEMORY_RATE_SAMPLES = 24;
-    private static final Map<String, DisplayCacheEntry> displayCache = new HashMap<>();
-    private static final Deque<MemoryRateSample> memoryRateSamples = new ArrayDeque<>();
-    private static final Map<String, RateSample> rateSamples = new HashMap<>();
-    private static final Map<String, SensorRateSample> sensorRateSamples = new HashMap<>();
+    private static final int MAX_DISPLAY_CACHE_ENTRIES = 192;
+    private static final int MAX_RATE_CACHE_ENTRIES = 128;
+    private static final Map<String, DisplayCacheEntry> displayCache = new ConcurrentHashMap<>();
+    private static final ConcurrentLinkedDeque<String> displayCacheOrder = new ConcurrentLinkedDeque<>();
+    private static final ConcurrentLinkedDeque<MemoryRateSample> memoryRateSamples = new ConcurrentLinkedDeque<>();
+    private static final Map<String, RateSample> rateSamples = new ConcurrentHashMap<>();
+    private static final ConcurrentLinkedDeque<String> rateSampleOrder = new ConcurrentLinkedDeque<>();
+    private static final Map<String, SensorRateSample> sensorRateSamples = new ConcurrentHashMap<>();
+    private static final ConcurrentLinkedDeque<String> sensorRateSampleOrder = new ConcurrentLinkedDeque<>();
+    private static HudLayoutCache cachedLayout;
+    private static long currentHudNowMillis;
 
     private HudOverlayRenderer() {
     }
 
     public static void render(DrawContext ctx) {
         MinecraftClient client = MinecraftClient.getInstance();
-        if (!ConfigManager.isHudEnabled()) {
-            return;
-        }
         if (client.options.hudHidden || client.currentScreen instanceof TaskManagerScreen) {
             return;
         }
 
-        ProfilerManager profilerManager = ProfilerManager.getInstance();
-        ProfilerManager.ProfilerSnapshot snapshot = profilerManager.getCurrentSnapshot();
-        FrameTimelineProfiler frame = FrameTimelineProfiler.getInstance();
-        MemoryProfiler.Snapshot memory = snapshot.memory();
-        SystemMetricsProfiler.Snapshot system = snapshot.systemMetrics();
-        refreshDisplayedMetrics(frame, memory, snapshot, system);
-        ProfilerManager.RuleFinding highestFinding = highestFinding(profilerManager);
-        double latestFrameMs = frame.getLatestFrameNs() / 1_000_000.0;
-        long recentSpikeAge = snapshot.spikes().isEmpty() ? Long.MAX_VALUE : Math.max(0L, System.currentTimeMillis() - snapshot.spikes().get(0).capturedAtEpochMillis());
-        boolean actionableWarning = hasActionableWarning(snapshot, highestFinding, latestFrameMs, recentSpikeAge);
-        int alertColor = severityColor(highestFinding == null ? null : highestFinding.severity(), actionableWarning);
+        long renderNow = System.currentTimeMillis();
+        currentHudNowMillis = renderNow;
+        try {
+            ProfilerManager profilerManager = ProfilerManager.getInstance();
+            renderPerformanceAlertBanner(ctx, client, profilerManager);
+            if (!ConfigManager.isHudEnabled()) {
+                return;
+            }
+            ProfilerManager.ProfilerSnapshot snapshot = profilerManager.getCurrentSnapshot();
+            FrameTimelineProfiler frame = FrameTimelineProfiler.getInstance();
+            MemoryProfiler.Snapshot memory = snapshot.memory();
+            SystemMetricsProfiler.Snapshot system = snapshot.systemMetrics();
+            refreshDisplayedMetrics(frame, memory, snapshot, system);
+            ProfilerManager.RuleFinding highestFinding = highestFinding(profilerManager);
+            double latestFrameMs = frame.getLatestFrameNs() / 1_000_000.0;
+            long recentSpikeAge = snapshot.spikes().isEmpty() ? Long.MAX_VALUE : Math.max(0L, renderNow - snapshot.spikes().get(0).capturedAtEpochMillis());
+            boolean actionableWarning = hasActionableWarning(snapshot, highestFinding, latestFrameMs, recentSpikeAge);
+            int alertColor = severityColor(highestFinding == null ? null : highestFinding.severity(), actionableWarning);
 
-        if (!shouldRenderHud(snapshot, highestFinding, latestFrameMs, recentSpikeAge)) {
+            if (!shouldRenderHud(snapshot, highestFinding, latestFrameMs, recentSpikeAge)) {
+                return;
+            }
+
+            HudLayoutCache layout = prepareHudLayout(client, profilerManager, snapshot, frame, memory, system, highestFinding, latestFrameMs, actionableWarning, alertColor);
+            TextRenderer textRenderer = client.textRenderer;
+            int backgroundColor = applyHudTransparency(BG);
+            int borderFillColor = applyHudTransparency(layout.borderColor());
+            int dividerColor = applyHudTransparency(0x443A3F46);
+            ctx.fill(layout.x(), layout.y(), layout.x() + layout.width(), layout.y() + layout.height(), backgroundColor);
+            ctx.fill(layout.x(), layout.y(), layout.x() + layout.width(), layout.y() + 1, borderFillColor);
+            ctx.fill(layout.x(), layout.y(), layout.x() + 1, layout.y() + layout.height(), borderFillColor);
+            ctx.fill(layout.x() + layout.width() - 1, layout.y(), layout.x() + layout.width(), layout.y() + layout.height(), borderFillColor);
+            ctx.fill(layout.x(), layout.y() + layout.height() - 1, layout.x() + layout.width(), layout.y() + layout.height(), borderFillColor);
+            ctx.fill(layout.x(), layout.y() + HEADER_HEIGHT, layout.x() + layout.width(), layout.y() + HEADER_HEIGHT + 1, dividerColor);
+
+            ctx.drawText(textRenderer, "Task Manager", layout.x() + PADDING, layout.y() + 5, actionableWarning ? HEADER : DIM, false);
+            String modeText = snapshot.mode().name().replace('_', ' ');
+            ctx.drawText(textRenderer, modeText, layout.x() + layout.width() - PADDING - textRenderer.getWidth(modeText), layout.y() + 5, actionableWarning ? alertColor : DIM, false);
+
+            int rowY = layout.y() + HEADER_HEIGHT + 6;
+            for (Row row : layout.rows()) {
+                if (row.fullWidth()) {
+                    drawEntry(ctx, textRenderer, layout.x() + PADDING, rowY, layout.contentWidth(), row.entries().getFirst(), true);
+                } else {
+                    for (int i = 0; i < row.entries().size(); i++) {
+                        int cellX = layout.x() + PADDING + i * (layout.cellWidth() + GAP);
+                        drawEntry(ctx, textRenderer, cellX, rowY, layout.cellWidth(), row.entries().get(i), false);
+                    }
+                }
+                rowY += ROW_HEIGHT;
+            }
+        } finally {
+            currentHudNowMillis = 0L;
+        }
+    }
+
+    private static void renderPerformanceAlertBanner(DrawContext ctx, MinecraftClient client, ProfilerManager profilerManager) {
+        ProfilerManager.PerformanceAlert alert = profilerManager.getLatestPerformanceAlert();
+        if (alert == null) {
             return;
+        }
+        TextRenderer textRenderer = client.textRenderer;
+        String label = alert.label() + " alert";
+        String message = textRenderer.trimToWidth(alert.message(), Math.max(220, client.getWindow().getScaledWidth() - 80));
+        int width = Math.min(client.getWindow().getScaledWidth() - 24, Math.max(240, textRenderer.getWidth(message) + 24));
+        int x = Math.max(12, (client.getWindow().getScaledWidth() - width) / 2);
+        int y = 10;
+        int bg = applyHudTransparency(profilerManager.isPerformanceAlertFlashActive() ? 0xCC5B1717 : 0xB0331A1A);
+        int border = severityColor(alert.severity(), true);
+        ctx.fill(x, y, x + width, y + 30, bg);
+        ctx.fill(x, y, x + width, y + 1, border);
+        ctx.fill(x, y + 29, x + width, y + 30, border);
+        ctx.fill(x, y, x + 1, y + 30, border);
+        ctx.fill(x + width - 1, y, x + width, y + 30, border);
+        ctx.drawText(textRenderer, label, x + 8, y + 5, HEADER, false);
+        ctx.drawText(textRenderer, message, x + 8, y + 17, TEXT, false);
+    }
+
+    private static HudLayoutCache prepareHudLayout(MinecraftClient client, ProfilerManager profilerManager, ProfilerManager.ProfilerSnapshot snapshot, FrameTimelineProfiler frame, MemoryProfiler.Snapshot memory, SystemMetricsProfiler.Snapshot system, ProfilerManager.RuleFinding highestFinding, double latestFrameMs, boolean actionableWarning, int alertColor) {
+        int screenW = client.getWindow().getScaledWidth();
+        int screenH = client.getWindow().getScaledHeight();
+        int columns = ConfigManager.getHudLayoutMode().columns();
+        int configHash = computeHudConfigHash();
+        if (cachedLayout != null
+                && cachedLayout.snapshot() == snapshot
+                && cachedLayout.configHash() == configHash
+                && cachedLayout.screenW() == screenW
+                && cachedLayout.screenH() == screenH
+                && cachedLayout.columns() == columns
+                && cachedLayout.actionableWarning() == actionableWarning) {
+            return cachedLayout;
         }
 
         List<Entry> entries = new ArrayList<>();
@@ -91,10 +173,7 @@ public final class HudOverlayRenderer {
             appendExpandedDetails(entries, profilerManager, snapshot, highestFinding, alertColor, autoFocusEntry != null);
         }
 
-        int screenW = client.getWindow().getScaledWidth();
-        int screenH = client.getWindow().getScaledHeight();
         int maxContentWidth = Math.max(160, screenW - 16 - (PADDING * 2));
-        int columns = ConfigManager.getHudLayoutMode().columns();
         int cellWidth = getCellWidth(columns, maxContentWidth);
         List<Entry> layoutEntries = normalizeEntriesForColumns(entries, client.textRenderer, columns, cellWidth, maxContentWidth);
         List<Row> rows = buildRows(layoutEntries, columns);
@@ -116,33 +195,41 @@ public final class HudOverlayRenderer {
             }
         }
 
-        int backgroundColor = applyHudTransparency(BG);
-        int borderFillColor = applyHudTransparency(borderColor);
-        int dividerColor = applyHudTransparency(0x443A3F46);
-        ctx.fill(x, y, x + width, y + height, backgroundColor);
-        ctx.fill(x, y, x + width, y + 1, borderFillColor);
-        ctx.fill(x, y, x + 1, y + height, borderFillColor);
-        ctx.fill(x + width - 1, y, x + width, y + height, borderFillColor);
-        ctx.fill(x, y + height - 1, x + width, y + height, borderFillColor);
-        ctx.fill(x, y + HEADER_HEIGHT, x + width, y + HEADER_HEIGHT + 1, dividerColor);
+        cachedLayout = new HudLayoutCache(snapshot, configHash, screenW, screenH, columns, actionableWarning, rows, contentWidth, cellWidth, width, height, x, y, borderColor);
+        return cachedLayout;
+    }
 
-        TextRenderer textRenderer = client.textRenderer;
-        ctx.drawText(textRenderer, "Task Manager", x + PADDING, y + 5, actionableWarning ? HEADER : DIM, false);
-        String modeText = snapshot.mode().name().replace('_', ' ');
-        ctx.drawText(textRenderer, modeText, x + width - PADDING - textRenderer.getWidth(modeText), y + 5, actionableWarning ? alertColor : DIM, false);
+    private static long hudNow() {
+        return currentHudNowMillis > 0L ? currentHudNowMillis : System.currentTimeMillis();
+    }
 
-        int rowY = y + HEADER_HEIGHT + 6;
-        for (Row row : rows) {
-            if (row.fullWidth()) {
-                drawEntry(ctx, textRenderer, x + PADDING, rowY, contentWidth, row.entries().getFirst(), true);
-            } else {
-                for (int i = 0; i < row.entries().size(); i++) {
-                    int cellX = x + PADDING + i * (cellWidth + GAP);
-                    drawEntry(ctx, textRenderer, cellX, rowY, cellWidth, row.entries().get(i), false);
-                }
-            }
-            rowY += ROW_HEIGHT;
-        }
+    private static int computeHudConfigHash() {
+        return Objects.hash(
+                ConfigManager.getHudConfigMode(),
+                ConfigManager.getHudPreset(),
+                ConfigManager.getHudLayoutMode(),
+                ConfigManager.getHudPosition(),
+                ConfigManager.getHudTransparencyPercent(),
+                ConfigManager.isHudAutoFocusAlertRow(),
+                ConfigManager.isHudExpandedOnWarning(),
+                ConfigManager.isHudShowFps(),
+                ConfigManager.isHudShowFrame(),
+                ConfigManager.isHudShowTicks(),
+                ConfigManager.isHudShowUtilization(),
+                ConfigManager.isHudShowLogic(),
+                ConfigManager.isHudShowBackground(),
+                ConfigManager.isHudShowParallelism(),
+                ConfigManager.isHudShowFrameBudget(),
+                ConfigManager.isHudShowMemory(),
+                ConfigManager.isHudShowVram(),
+                ConfigManager.isHudShowNetwork(),
+                ConfigManager.isHudShowChunkActivity(),
+                ConfigManager.isHudShowWorld(),
+                ConfigManager.isHudShowDiskIo(),
+                ConfigManager.isHudShowInputLatency(),
+                ConfigManager.isHudShowSession(),
+                ConfigManager.isHudShowTemperatures(),
+                ConfigManager.isHudBudgetColorMode());
     }
 
     private static void buildCompactEntries(List<Entry> entries, ProfilerManager.ProfilerSnapshot snapshot, FrameTimelineProfiler frame, MemoryProfiler.Snapshot memory, SystemMetricsProfiler.Snapshot system) {
@@ -152,6 +239,9 @@ public final class HudOverlayRenderer {
         entries.add(new Entry("GPU", formatUtilAndTemp(system, false), utilizationColor(system, false), false));
         entries.add(new Entry("Memory", displayedMemoryText(memory), memoryColor(memory), false));
         entries.add(new Entry("VRAM", displayedMetric("vram", () -> vramText(system)), vramColor(system), false));
+        if (frame.getSelfCostAvgMs() > 0.1) {
+            entries.add(new Entry("Profiler", displayedMetric("profiler.cost", () -> String.format(Locale.ROOT, "%.2f ms", frame.getSelfCostAvgMs())), DIM, false));
+        }
         if (snapshot.sessionLogging()) {
             entries.add(new Entry("Session", displayedMetric("session", () -> formatDuration(snapshot.sessionLoggingElapsedMillis()) + " / " + formatDuration(ConfigManager.getSessionDurationSeconds() * 1000L)), WARN, false));
         }
@@ -169,6 +259,9 @@ public final class HudOverlayRenderer {
         entries.add(new Entry("Input Latency", displayedMetric("input.latency", () -> inputLatencyText(system)), inputLatencyColor(system), false));
         entries.add(new Entry("Memory", displayedMemoryText(memory), memoryColor(memory), false));
         entries.add(new Entry("VRAM", displayedMetric("vram", () -> vramText(system)), vramColor(system), false));
+        if (frame.getSelfCostAvgMs() > 0.1) {
+            entries.add(new Entry("Profiler", displayedMetric("profiler.cost", () -> String.format(Locale.ROOT, "%.2f ms", frame.getSelfCostAvgMs())), DIM, false));
+        }
         entries.add(networkEntry(system));
         entries.add(new Entry("Chunk Activity", displayedMetric("chunk.activity", () -> chunkActivityText(system)), chunkActivityColor(system), true));
         entries.add(new Entry("Entities", displayedMetric("world.entities", () -> worldEntitiesText(snapshot)), DIM, false));
@@ -217,6 +310,9 @@ public final class HudOverlayRenderer {
         }
         if (ConfigManager.isHudShowVram()) {
             entries.add(new Entry("VRAM", displayedMetric("vram", () -> vramText(system)), vramColor(system), false));
+        }
+        if (frame.getSelfCostAvgMs() > 0.1) {
+            entries.add(new Entry("Profiler", displayedMetric("profiler.cost", () -> String.format(Locale.ROOT, "%.2f ms", frame.getSelfCostAvgMs())), DIM, false));
         }
         if (ConfigManager.isHudShowNetwork()) {
             entries.add(networkEntry(system));
@@ -407,7 +503,7 @@ public final class HudOverlayRenderer {
 
     private static String displayedFpsText(FrameTimelineProfiler frame) {
         return displayedMetric("fps.primary", () -> {
-            long now = System.currentTimeMillis();
+            long now = hudNow();
             return format0(frame.getCurrentFps()) + " now | " + format0(frame.getAverageFps()) + " avg" + rateSuffix("fps", frame.getCurrentFps(), now, "fps/s", ConfigManager.isHudShowFpsRateOfChange());
         });
     }
@@ -417,7 +513,7 @@ public final class HudOverlayRenderer {
     }
 
     private static String displayedMemoryText(MemoryProfiler.Snapshot memory) {
-        return displayedMetric("memory.primary", () -> formatMemoryDisplay(memory, System.currentTimeMillis()));
+        return displayedMetric("memory.primary", () -> formatMemoryDisplay(memory, hudNow()));
     }
 
     private static void refreshDisplayedMetrics(FrameTimelineProfiler frame, MemoryProfiler.Snapshot memory, ProfilerManager.ProfilerSnapshot snapshot, SystemMetricsProfiler.Snapshot system) {
@@ -441,13 +537,14 @@ public final class HudOverlayRenderer {
     }
 
     private static String displayedMetric(String key, Supplier<String> supplier) {
-        long now = System.currentTimeMillis();
+        long now = hudNow();
         DisplayCacheEntry cached = displayCache.get(key);
         if (cached != null && !shouldRefreshDisplayedMetric(now, cached.updatedAtMillis(), ConfigManager.getMetricsUpdateIntervalMs())) {
             return cached.value();
         }
         String value = supplier.get();
         displayCache.put(key, new DisplayCacheEntry(now, value));
+        recordCacheKey(displayCacheOrder, key, MAX_DISPLAY_CACHE_ENTRIES, displayCache);
         return value;
     }
 
@@ -457,19 +554,17 @@ public final class HudOverlayRenderer {
 
     private static String compactFrameText(FrameTimelineProfiler frame) {
         double avgFrameMs = frame.getAverageFrameNs() / 1_000_000.0;
-        return format1(avgFrameMs) + " avg | " + format1(frame.getMaxFrameNs() / 1_000_000.0) + " max" + rateSuffix("frame", avgFrameMs, System.currentTimeMillis(), "ms/s", ConfigManager.isHudShowFrameRateOfChange());
+        return format1(avgFrameMs) + " avg | " + format1(frame.getMaxFrameNs() / 1_000_000.0) + " max" + rateSuffix("frame", avgFrameMs, hudNow(), "ms/s", ConfigManager.isHudShowFrameRateOfChange());
     }
 
     private static String formatMemoryDisplay(MemoryProfiler.Snapshot memory, long now) {
         long usedBytes = Math.max(0L, memory.heapUsedBytes());
         long maxBytes = Math.max(usedBytes, memory.heapMaxBytes() > 0 ? memory.heapMaxBytes() : memory.heapCommittedBytes());
         memoryRateSamples.addLast(new MemoryRateSample(now, usedBytes));
-        while (memoryRateSamples.size() > MAX_MEMORY_RATE_SAMPLES) {
-            memoryRateSamples.removeFirst();
-        }
+        trimDeque(memoryRateSamples, MAX_MEMORY_RATE_SAMPLES);
         long cutoff = now - 4000L;
         while (memoryRateSamples.size() > 2 && memoryRateSamples.peekFirst() != null && memoryRateSamples.peekFirst().capturedAtMillis() < cutoff) {
-            memoryRateSamples.removeFirst();
+            memoryRateSamples.pollFirst();
         }
 
         String base = formatMegabytes(usedBytes) + "/" + formatMegabytes(maxBytes) + " MB";
@@ -484,7 +579,7 @@ public final class HudOverlayRenderer {
     }
 
     private static String formatUtilAndTemp(SystemMetricsProfiler.Snapshot system, boolean cpu) {
-        long now = System.currentTimeMillis();
+        long now = hudNow();
         String sensorKey = cpu ? "cpu" : "gpu";
         double loadPercent = cpu ? system.cpuCoreLoadPercent() : system.gpuCoreLoadPercent();
         double temperatureC = cpu ? system.cpuTemperatureC() : system.gpuTemperatureC();
@@ -495,7 +590,9 @@ public final class HudOverlayRenderer {
         if (!ConfigManager.isHudShowTemperatures()) {
             return load + appendSuffix(loadRateSuffix);
         }
-        String temp = temperatureC >= 0.0 ? format0(temperatureC) + "C" : "n/a";
+        String temp = cpu
+                ? (temperatureC >= 0.0 ? format0(temperatureC) + "C" : "n/a")
+                : TelemetryTextFormatter.formatGpuTemperatureCompact(system);
         if (!ConfigManager.isHudShowUtilizationRateOfChange()) {
             return load + " / " + temp;
         }
@@ -524,7 +621,7 @@ public final class HudOverlayRenderer {
     }
 
     private static String frameBudgetText(FrameTimelineProfiler frame) {
-        long now = System.currentTimeMillis();
+        long now = hudNow();
         double currentFrameMs = frame.getLatestFrameNs() / 1_000_000.0;
         double targetFrameMs = targetFrameBudgetMs();
         double overBudgetMs = currentFrameMs - targetFrameMs;
@@ -533,7 +630,7 @@ public final class HudOverlayRenderer {
     }
 
     private static String vramText(SystemMetricsProfiler.Snapshot system) {
-        long now = System.currentTimeMillis();
+        long now = hudNow();
         if (system.vramUsedBytes() < 0 || system.vramTotalBytes() <= 0) {
             return "n/a";
         }
@@ -548,7 +645,7 @@ public final class HudOverlayRenderer {
     }
 
     private static String networkText(SystemMetricsProfiler.Snapshot system) {
-        long now = System.currentTimeMillis();
+        long now = hudNow();
         String down = compactIo(system.bytesReceivedPerSecond());
         String up = compactIo(system.bytesSentPerSecond());
         String base = "D " + down + " | U " + up;
@@ -561,7 +658,7 @@ public final class HudOverlayRenderer {
     }
 
     private static String chunkActivityText(SystemMetricsProfiler.Snapshot system) {
-        long now = System.currentTimeMillis();
+        long now = hudNow();
         String base = "G " + system.chunksGenerating() + " | M " + system.chunksMeshing() + " | U " + system.chunksUploading();
         if (!ConfigManager.isHudShowChunkActivityRateOfChange()) {
             return base;
@@ -578,7 +675,7 @@ public final class HudOverlayRenderer {
         if (latencyMs < 0.0) {
             return "n/a";
         }
-        return format1(latencyMs) + " ms" + rateSuffix("input.latency", latencyMs, System.currentTimeMillis(), "ms/s", ConfigManager.isHudShowInputLatencyRateOfChange());
+        return format1(latencyMs) + " ms" + rateSuffix("input.latency", latencyMs, hudNow(), "ms/s", ConfigManager.isHudShowInputLatencyRateOfChange());
     }
 
     private static int frameBudgetColor(FrameTimelineProfiler frame) {
@@ -693,6 +790,7 @@ public final class HudOverlayRenderer {
         if (previous == null) {
             String initial = ConfigManager.isHudShowZeroRateOfChange() ? "~0 B" + units : "";
             rateSamples.put(key, new RateSample(now, currentValue, initial));
+            recordCacheKey(rateSampleOrder, key, MAX_RATE_CACHE_ENTRIES, rateSamples);
             return initial;
         }
         long elapsedMillis = now - previous.capturedAtMillis();
@@ -704,6 +802,7 @@ public final class HudOverlayRenderer {
                 ? ""
                 : signedByteRate(deltaPerSecond, units);
         rateSamples.put(key, new RateSample(now, currentValue, suffix));
+        recordCacheKey(rateSampleOrder, key, MAX_RATE_CACHE_ENTRIES, rateSamples);
         return suffix;
     }
 
@@ -794,12 +893,12 @@ public final class HudOverlayRenderer {
     }
 
     private static String worldEntitiesText(ProfilerManager.ProfilerSnapshot snapshot) {
-        long now = System.currentTimeMillis();
+        long now = hudNow();
         return Integer.toString(snapshot.entityCounts().totalEntities()) + rateSuffix("world.entities", snapshot.entityCounts().totalEntities(), now, "/s", ConfigManager.isHudShowWorldRateOfChange());
     }
 
     private static String worldChunksText(ProfilerManager.ProfilerSnapshot snapshot) {
-        long now = System.currentTimeMillis();
+        long now = hudNow();
         String loaded = Long.toString(snapshot.chunkCounts().loadedChunks());
         String rendered = Long.toString(snapshot.chunkCounts().renderedChunks());
         if (!ConfigManager.isHudShowWorldRateOfChange()) {
@@ -812,7 +911,7 @@ public final class HudOverlayRenderer {
     }
 
     private static String diskIoText(SystemMetricsProfiler.Snapshot system) {
-        long now = System.currentTimeMillis();
+        long now = hudNow();
         String read = compactIo(system.diskReadBytesPerSecond());
         String write = compactIo(system.diskWriteBytesPerSecond());
         if (!ConfigManager.isHudShowDiskIoRateOfChange()) {
@@ -858,7 +957,7 @@ public final class HudOverlayRenderer {
         if (!ConfigManager.isHudShowNetworkRateOfChange()) {
             return "";
         }
-        long now = System.currentTimeMillis();
+        long now = hudNow();
         String downRate = optionalByteRateSuffix("network.down", system.bytesReceivedPerSecond(), now, "/s/s");
         String upRate = optionalByteRateSuffix("network.up", system.bytesSentPerSecond(), now, "/s/s");
         return appendSuffix(joinRateParts(downRate, upRate));
@@ -868,14 +967,14 @@ public final class HudOverlayRenderer {
         if (!ConfigManager.isHudShowDiskIoRateOfChange()) {
             return "";
         }
-        long now = System.currentTimeMillis();
+        long now = hudNow();
         String readRate = optionalRateSuffix("disk.read", system.diskReadBytesPerSecond(), now, "B/s/s");
         String writeRate = optionalRateSuffix("disk.write", system.diskWriteBytesPerSecond(), now, "B/s/s");
         return appendSuffix(joinRateParts(readRate, writeRate));
     }
 
     private static String tickText(String key, double millis) {
-        return format1(millis) + " ms" + rateSuffix(key, millis, System.currentTimeMillis(), "ms/s", ConfigManager.isHudShowTickRateOfChange());
+        return format1(millis) + " ms" + rateSuffix(key, millis, hudNow(), "ms/s", ConfigManager.isHudShowTickRateOfChange());
     }
 
     private static String rateSuffix(String key, double currentValue, long now, String units, boolean enabled) {
@@ -891,6 +990,7 @@ public final class HudOverlayRenderer {
         if (previous == null) {
             String initial = ConfigManager.isHudShowZeroRateOfChange() ? "~0 " + units : "";
             rateSamples.put(key, new RateSample(now, currentValue, initial));
+            recordCacheKey(rateSampleOrder, key, MAX_RATE_CACHE_ENTRIES, rateSamples);
             return initial;
         }
 
@@ -904,6 +1004,7 @@ public final class HudOverlayRenderer {
                 ? ""
                 : signedDynamicRate(deltaPerSecond, units);
         rateSamples.put(key, new RateSample(now, currentValue, suffix));
+        recordCacheKey(rateSampleOrder, key, MAX_RATE_CACHE_ENTRIES, rateSamples);
         return suffix;
     }
 
@@ -925,11 +1026,13 @@ public final class HudOverlayRenderer {
         if (previous == null) {
             String initial = ConfigManager.isHudShowZeroRateOfChange() ? "~0 " + units : "";
             sensorRateSamples.put(key, new SensorRateSample(now, currentValue, now, currentValue, initial));
+            recordCacheKey(sensorRateSampleOrder, key, MAX_RATE_CACHE_ENTRIES, sensorRateSamples);
             return initial;
         }
 
         if (Math.abs(currentValue - previous.lastObservedValue()) < 0.05) {
             sensorRateSamples.put(key, previous.withObserved(now, currentValue));
+            recordCacheKey(sensorRateSampleOrder, key, MAX_RATE_CACHE_ENTRIES, sensorRateSamples);
             return previous.displaySuffix();
         }
 
@@ -939,7 +1042,26 @@ public final class HudOverlayRenderer {
                 ? ""
                 : signedDynamicRate(deltaPerSecond, units);
         sensorRateSamples.put(key, new SensorRateSample(now, currentValue, now, currentValue, suffix));
+        recordCacheKey(sensorRateSampleOrder, key, MAX_RATE_CACHE_ENTRIES, sensorRateSamples);
         return suffix;
+    }
+
+    private static <T> void recordCacheKey(ConcurrentLinkedDeque<String> order, String key, int maxEntries, Map<String, T> cache) {
+        order.remove(key);
+        order.addLast(key);
+        while (cache.size() > maxEntries) {
+            String eldest = order.pollFirst();
+            if (eldest == null) {
+                break;
+            }
+            cache.remove(eldest);
+        }
+    }
+
+    private static <T> void trimDeque(ConcurrentLinkedDeque<T> deque, int maxEntries) {
+        while (deque.size() > maxEntries) {
+            deque.pollFirst();
+        }
     }
 
     private static String joinRateParts(String first, String second) {
@@ -1019,6 +1141,9 @@ public final class HudOverlayRenderer {
     }
 
     private record DisplayCacheEntry(long updatedAtMillis, String value) {
+    }
+
+    private record HudLayoutCache(ProfilerManager.ProfilerSnapshot snapshot, int configHash, int screenW, int screenH, int columns, boolean actionableWarning, List<Row> rows, int contentWidth, int cellWidth, int width, int height, int x, int y, int borderColor) {
     }
 
     private record ValueSegment(String text, int color) {

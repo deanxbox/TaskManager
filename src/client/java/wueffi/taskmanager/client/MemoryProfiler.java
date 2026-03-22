@@ -1,5 +1,6 @@
 package wueffi.taskmanager.client;
 
+import com.sun.management.ThreadMXBean;
 import wueffi.taskmanager.client.util.ModClassIndex;
 
 import javax.management.MBeanServer;
@@ -14,6 +15,9 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
 public class MemoryProfiler {
@@ -24,6 +28,7 @@ public class MemoryProfiler {
     private static final ObjectName DIAGNOSTIC_COMMAND_NAME;
     private static final int MAX_SHARED_FAMILIES = 8;
     private static final int MAX_CLASSES_PER_FAMILY = 8;
+    private static final long MIN_MOD_SAMPLE_INTERVAL_MS = 10_000L;
 
     static {
         ObjectName name = null;
@@ -42,8 +47,35 @@ public class MemoryProfiler {
     private final Map<String, String> classModCache = new ConcurrentHashMap<>();
     private final Map<String, Long> lastGcCountsByName = new ConcurrentHashMap<>();
     private final Map<String, Long> lastGcTimesByName = new ConcurrentHashMap<>();
+    private final Map<Long, Long> lastAllocatedBytesByThread = new ConcurrentHashMap<>();
     private final AtomicLong lastJvmSampleAtMillis = new AtomicLong(0);
     private final AtomicLong lastModSampleAtMillis = new AtomicLong(0);
+    private final AtomicLong lastAllocationSampleAtMillis = new AtomicLong(0);
+    private final AtomicLong lastModSampleDurationMillis = new AtomicLong(0);
+    private final ExecutorService modHistogramExecutor = Executors.newSingleThreadExecutor(r -> {
+        Thread thread = new Thread(r, "taskmanager-memory-histogram");
+        thread.setDaemon(true);
+        return thread;
+    });
+    private final AtomicBoolean modSampleInFlight = new AtomicBoolean(false);
+    private final ThreadMXBean threadBean;
+    private volatile Map<String, Long> modAllocationRateBytesPerSecond = Map.of();
+    private volatile Map<Long, Long> threadAllocationRateBytesPerSecond = Map.of();
+
+    private MemoryProfiler() {
+        ThreadMXBean detected = null;
+        try {
+            java.lang.management.ThreadMXBean platformBean = ManagementFactory.getThreadMXBean();
+            if (platformBean instanceof ThreadMXBean sunBean) {
+                detected = sunBean;
+                if (sunBean.isThreadAllocatedMemorySupported() && !sunBean.isThreadAllocatedMemoryEnabled()) {
+                    sunBean.setThreadAllocatedMemoryEnabled(true);
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        this.threadBean = detected;
+    }
 
     public void sampleJvm() {
         try {
@@ -87,12 +119,20 @@ public class MemoryProfiler {
 
             long directBufferBytes = 0;
             long mappedBufferBytes = 0;
+            long directBufferCount = 0;
+            long mappedBufferCount = 0;
+            long directBufferCapacityBytes = 0;
+            long mappedBufferCapacityBytes = 0;
             for (BufferPoolMXBean pool : bufferPools) {
                 String name = pool.getName().toLowerCase();
                 if (name.contains("direct")) {
                     directBufferBytes += Math.max(0, pool.getMemoryUsed());
+                    directBufferCount += Math.max(0, pool.getCount());
+                    directBufferCapacityBytes += Math.max(0, pool.getTotalCapacity());
                 } else if (name.contains("mapped")) {
                     mappedBufferBytes += Math.max(0, pool.getMemoryUsed());
+                    mappedBufferCount += Math.max(0, pool.getCount());
+                    mappedBufferCapacityBytes += Math.max(0, pool.getTotalCapacity());
                 }
             }
 
@@ -127,6 +167,10 @@ public class MemoryProfiler {
                     gcType,
                     directBufferBytes,
                     mappedBufferBytes,
+                    directBufferCount,
+                    mappedBufferCount,
+                    directBufferCapacityBytes,
+                    mappedBufferCapacityBytes,
                     SystemMetricsProfiler.getInstance().getSnapshot().directMemoryMaxBytes(),
                     metaspaceBytes,
                     codeCacheBytes,
@@ -134,15 +178,33 @@ public class MemoryProfiler {
                     Math.max(0, heapCommitted - heapUsed)
             );
             lastJvmSampleAtMillis.set(System.currentTimeMillis());
+            sampleAllocationRates();
         } catch (Throwable ignored) {
         }
     }
 
-    public void samplePerMod() {
+    public void requestPerModSample() {
+        if (getLastModSampleAgeMillis() < MIN_MOD_SAMPLE_INTERVAL_MS) {
+            return;
+        }
+        if (!modSampleInFlight.compareAndSet(false, true)) {
+            return;
+        }
+        modHistogramExecutor.execute(() -> {
+            try {
+                samplePerMod();
+            } finally {
+                modSampleInFlight.set(false);
+            }
+        });
+    }
+
+    private void samplePerMod() {
         if (DIAGNOSTIC_COMMAND_NAME == null) {
             return;
         }
 
+        long startedAtMillis = System.currentTimeMillis();
         try {
             MBeanServer server = ManagementFactory.getPlatformMBeanServer();
             Object result = server.invoke(
@@ -191,7 +253,8 @@ public class MemoryProfiler {
                 }
             }
 
-            addRuntimeBucket(bytesByMod, "runtime/native-direct", snapshot.directBufferBytes() + snapshot.mappedBufferBytes());
+            addRuntimeBucket(bytesByMod, "runtime/native-direct-buffers", snapshot.directBufferBytes());
+            addRuntimeBucket(bytesByMod, "runtime/native-mapped-buffers", snapshot.mappedBufferBytes());
             addRuntimeBucket(bytesByMod, "runtime/metaspace", snapshot.metaspaceBytes());
             addRuntimeBucket(bytesByMod, "runtime/code-cache", snapshot.codeCacheBytes());
             addRuntimeBucket(bytesByMod, "runtime/class-space", snapshot.classSpaceBytes());
@@ -227,6 +290,7 @@ public class MemoryProfiler {
             topClassesByMod = trimmedClassesByMod;
 
             lastModSampleAtMillis.set(System.currentTimeMillis());
+            lastModSampleDurationMillis.set(Math.max(0L, System.currentTimeMillis() - startedAtMillis));
         } catch (Throwable ignored) {
         }
     }
@@ -251,6 +315,18 @@ public class MemoryProfiler {
         return topClassesByMod;
     }
 
+    public Map<String, Long> getModAllocationRateBytesPerSecond() {
+        return modAllocationRateBytesPerSecond;
+    }
+
+    public Map<Long, Long> getThreadAllocationRateBytesPerSecond() {
+        return threadAllocationRateBytesPerSecond;
+    }
+
+    public long getLastModSampleDurationMillis() {
+        return lastModSampleDurationMillis.get();
+    }
+
     public long getLastModSampleAgeMillis() {
         long last = lastModSampleAtMillis.get();
         if (last == 0) return Long.MAX_VALUE;
@@ -263,10 +339,112 @@ public class MemoryProfiler {
         sharedClassFamilies = Map.of();
         sharedFamilyClasses = Map.of();
         topClassesByMod = Map.of();
+        modAllocationRateBytesPerSecond = Map.of();
+        threadAllocationRateBytesPerSecond = Map.of();
         lastGcCountsByName.clear();
         lastGcTimesByName.clear();
+        lastAllocatedBytesByThread.clear();
         lastJvmSampleAtMillis.set(0);
         lastModSampleAtMillis.set(0);
+        lastAllocationSampleAtMillis.set(0);
+        lastModSampleDurationMillis.set(0);
+    }
+
+    private void sampleAllocationRates() {
+        ThreadMXBean bean = threadBean;
+        if (bean == null || !bean.isThreadAllocatedMemorySupported() || !bean.isThreadAllocatedMemoryEnabled()) {
+            return;
+        }
+
+        long now = System.currentTimeMillis();
+        long previous = lastAllocationSampleAtMillis.getAndSet(now);
+        ThreadSnapshotCollector collector = ThreadSnapshotCollector.getInstance();
+        ThreadSnapshotCollector.Snapshot latestSnapshot = collector.getLatestSnapshot();
+        if (previous <= 0L) {
+            primeAllocatedBytes(bean, latestSnapshot.threadsById().keySet());
+            return;
+        }
+        long elapsedMillis = Math.max(1L, now - previous);
+        Map<String, Long> bytesByMod = new LinkedHashMap<>();
+        Map<Long, Long> bytesByThread = new LinkedHashMap<>();
+        Map<Long, Long> nextAllocatedBytes = new ConcurrentHashMap<>();
+        for (long threadId : latestSnapshot.threadsById().keySet()) {
+            long allocatedBytes = bean.getThreadAllocatedBytes(threadId);
+            if (allocatedBytes < 0L) {
+                continue;
+            }
+            nextAllocatedBytes.put(threadId, allocatedBytes);
+            long previousBytes = lastAllocatedBytesByThread.getOrDefault(threadId, allocatedBytes);
+            long delta = Math.max(0L, allocatedBytes - previousBytes);
+            if (delta <= 0L) {
+                continue;
+            }
+            long bytesPerSecond = Math.round(delta * 1000.0 / elapsedMillis);
+            bytesByThread.put(threadId, bytesPerSecond);
+            distributeAllocationDelta(bytesByMod, collector.getRecentThreadSnapshots(threadId, previous, 4), bytesPerSecond);
+        }
+        lastAllocatedBytesByThread.clear();
+        lastAllocatedBytesByThread.putAll(nextAllocatedBytes);
+        modAllocationRateBytesPerSecond = bytesByMod.entrySet().stream()
+                .sorted(Map.Entry.<String, Long>comparingByValue(Comparator.reverseOrder()))
+                .collect(LinkedHashMap::new, (map, entry) -> map.put(entry.getKey(), entry.getValue()), LinkedHashMap::putAll);
+        threadAllocationRateBytesPerSecond = bytesByThread.entrySet().stream()
+                .sorted(Map.Entry.<Long, Long>comparingByValue(Comparator.reverseOrder()))
+                .collect(LinkedHashMap::new, (map, entry) -> map.put(entry.getKey(), entry.getValue()), LinkedHashMap::putAll);
+    }
+
+    private void distributeAllocationDelta(Map<String, Long> bytesByMod, List<ThreadSnapshotCollector.ThreadStackSnapshot> threadSnapshots, long bytesPerSecond) {
+        if (threadSnapshots == null || threadSnapshots.isEmpty() || bytesPerSecond <= 0L) {
+            return;
+        }
+        long[] shares = CollectorMath.splitBudget(bytesPerSecond, threadSnapshots.size());
+        for (int i = 0; i < threadSnapshots.size(); i++) {
+            ThreadSnapshotCollector.ThreadStackSnapshot threadSnapshot = threadSnapshots.get(i);
+            String mod = resolveAllocatingMod(threadSnapshot.threadName(), threadSnapshot.stack());
+            bytesByMod.merge(mod, shares[i], Long::sum);
+        }
+    }
+
+    private void primeAllocatedBytes(ThreadMXBean bean, Iterable<Long> threadIds) {
+        lastAllocatedBytesByThread.clear();
+        for (Long threadId : threadIds) {
+            if (threadId == null) {
+                continue;
+            }
+            long allocatedBytes = bean.getThreadAllocatedBytes(threadId);
+            if (allocatedBytes >= 0L) {
+                lastAllocatedBytesByThread.put(threadId, allocatedBytes);
+            }
+        }
+    }
+
+    private String resolveAllocatingMod(String threadName, StackTraceElement[] stack) {
+        if (stack != null) {
+            for (StackTraceElement element : stack) {
+                String mod = ModClassIndex.getModForClassName(element.getClassName());
+                if (mod != null) {
+                    if ("fabricloader".equals(mod) || mod.startsWith("fabric-") || mod.startsWith("fabric_api")) {
+                        return "shared/framework";
+                    }
+                    return mod;
+                }
+                String className = element.getClassName();
+                if (className.startsWith("net.minecraft.") || className.startsWith("com.mojang.")) {
+                    return "minecraft";
+                }
+                if (className.startsWith("java.") || className.startsWith("javax.") || className.startsWith("jdk.") || className.startsWith("sun.") || className.startsWith("org.lwjgl.")) {
+                    continue;
+                }
+            }
+        }
+        String normalizedThreadName = threadName == null ? "" : threadName.toLowerCase();
+        if (normalizedThreadName.contains("render")) {
+            return "shared/render";
+        }
+        if (normalizedThreadName.contains("server")) {
+            return "minecraft";
+        }
+        return "shared/jvm";
     }
 
     private boolean isOldGenCollector(String name) {
@@ -384,6 +562,10 @@ public class MemoryProfiler {
             String gcType,
             long directBufferBytes,
             long mappedBufferBytes,
+            long directBufferCount,
+            long mappedBufferCount,
+            long directBufferCapacityBytes,
+            long mappedBufferCapacityBytes,
             long directMemoryMaxBytes,
             long metaspaceBytes,
             long codeCacheBytes,
@@ -391,7 +573,7 @@ public class MemoryProfiler {
             long gcHeadroomBytes
     ) {
         static Snapshot empty() {
-            return new Snapshot(0, 0, 0, 0, 0, 0, 0, 0, 0, "none", 0, 0, -1, 0, 0, 0, 0);
+            return new Snapshot(0, 0, 0, 0, 0, 0, 0, 0, 0, "none", 0, 0, 0, 0, 0, 0, -1, 0, 0, 0, 0);
         }
     }
 }

@@ -4,8 +4,8 @@ import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import wueffi.taskmanager.client.util.ConfigManager;
 
-import java.io.ByteArrayOutputStream;
-import java.io.InputStream;
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.util.Locale;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -13,26 +13,35 @@ import java.util.concurrent.atomic.AtomicBoolean;
 final class WindowsTelemetryBridge {
 
     record Sample(
+            long capturedAtEpochMillis,
             boolean bridgeActive,
             String counterSource,
             String sensorSource,
             String sensorErrorCode,
+            String cpuTemperatureProvider,
+            String gpuTemperatureProvider,
+            String gpuHotSpotTemperatureProvider,
             double cpuCoreLoadPercent,
             double gpuCoreLoadPercent,
             double gpuTemperatureC,
+            double gpuHotSpotTemperatureC,
             double cpuTemperatureC,
             long bytesReceivedPerSecond,
             long bytesSentPerSecond,
             long diskReadBytesPerSecond,
-            long diskWriteBytesPerSecond
+            long diskWriteBytesPerSecond,
+            long sampleDurationMillis
     ) {
         static Sample empty() {
-            return new Sample(false, "Unavailable", "Unavailable", "No bridge data", -1, -1, -1, -1, -1, -1, -1, -1);
+            return new Sample(0L, false, "Unavailable", "Unavailable", "No bridge data", "Unavailable", "Unavailable", "Unavailable", -1, -1, -1, -1, -1, -1, -1, -1, -1, 0L);
         }
     }
 
+    record Health(String helperStatus, long latestSampleAgeMillis, long helperUptimeMillis, boolean fallbackActive, long latestSampleDurationMillis) {}
+
     private static final String SCRIPT = """
             $ErrorActionPreference = 'SilentlyContinue'
+            $sampleStartedAt = [System.Environment]::TickCount64
             $netRecv = 0.0
             $netSent = 0.0
             $diskRead = 0.0
@@ -41,16 +50,20 @@ final class WindowsTelemetryBridge {
             $gpuLoad = -1.0
             $cpuTemp = -1.0
             $gpuTemp = -1.0
+            $gpuHotSpot = -1.0
             $cpuSensorSource = 'Unavailable'
-            $gpuSensorSource = 'Unavailable'
+            $gpuTempSensorSource = 'Unavailable'
+            $gpuHotSpotSensorSource = 'Unavailable'
             $cpuSensorMatch = 'none'
-            $gpuSensorMatch = 'none'
+            $gpuTempSensorMatch = 'none'
+            $gpuHotSpotSensorMatch = 'none'
             $sensorAttempts = New-Object 'System.Collections.Generic.List[string]'
             $sensorErrors = New-Object 'System.Collections.Generic.List[string]'
             $counterSource = 'Windows Performance Counters'
             $activeRenderer = if ($env:TM_ACTIVE_RENDERER) { [string]$env:TM_ACTIVE_RENDERER } else { '' }
             $activeVendor = if ($env:TM_ACTIVE_VENDOR) { [string]$env:TM_ACTIVE_VENDOR } else { '' }
             $gpuPreferredMatchFound = $false
+            $loadedAssemblyPaths = New-Object 'System.Collections.Generic.HashSet[string]'
 
             function Normalize-Name($text) {
               if ($null -eq $text) { return '' }
@@ -79,6 +92,20 @@ final class WindowsTelemetryBridge {
               } catch {}
             }
 
+            function Ensure-LoadedAssembly($dllPath) {
+              if ([string]::IsNullOrWhiteSpace($dllPath) -or -not (Test-Path $dllPath)) { return $false }
+              try {
+                if (-not $script:loadedAssemblyPaths.Contains($dllPath)) {
+                  [System.Reflection.Assembly]::LoadFrom($dllPath) | Out-Null
+                  $script:loadedAssemblyPaths.Add($dllPath) | Out-Null
+                }
+                return $true
+              } catch {
+                Add-SensorError(('DLL ' + [System.IO.Path]::GetFileName($dllPath)), $_.Exception.Message)
+                return $false
+              }
+            }
+
             function Update-HardwareTree($hardware) {
               try { $hardware.Update() } catch {}
               try { foreach ($sub in $hardware.SubHardware) { Update-HardwareTree $sub } } catch {}
@@ -95,18 +122,33 @@ final class WindowsTelemetryBridge {
                 $script:cpuSensorMatch = $hardwareName + ' / ' + $sensorName
               }
               if ($gpuMatch) {
+                $hotSpotMatch = $search -match 'hot spot|hotspot|junction temperature|junction|gpu junction|hot spot temperature|mem junction|memory junction|hot point'
                 $preferredGpu = Test-PreferredGpu $hardwareName $sensorName $sensorIdentifier
                 if ($preferredGpu) {
-                  if (-not $script:gpuPreferredMatchFound -or $gpuTemp -lt 0 -or $sensorValue -gt $gpuTemp) {
-                    $script:gpuTemp = [double]$sensorValue
-                    $script:gpuSensorSource = $origin
-                    $script:gpuSensorMatch = $hardwareName + ' / ' + $sensorName
-                    $script:gpuPreferredMatchFound = $true
+                  if ($hotSpotMatch) {
+                      if ($script:gpuHotSpot -lt 0 -or $sensorValue -gt $script:gpuHotSpot) {
+                        $script:gpuHotSpot = [double]$sensorValue
+                        $script:gpuHotSpotSensorSource = $origin
+                        $script:gpuHotSpotSensorMatch = $hardwareName + ' / ' + $sensorName
+                      }
+                    } elseif (-not $script:gpuPreferredMatchFound -or $gpuTemp -lt 0 -or $sensorValue -gt $gpuTemp) {
+                      $script:gpuTemp = [double]$sensorValue
+                    $script:gpuTempSensorSource = $origin
+                    $script:gpuTempSensorMatch = $hardwareName + ' / ' + $sensorName
                   }
+                  $script:gpuPreferredMatchFound = $true
                 } elseif (-not $script:gpuPreferredMatchFound -and ($gpuTemp -lt 0 -or $sensorValue -gt $gpuTemp)) {
-                  $script:gpuTemp = [double]$sensorValue
-                  $script:gpuSensorSource = $origin
-                  $script:gpuSensorMatch = $hardwareName + ' / ' + $sensorName
+                  if ($hotSpotMatch) {
+                    if ($script:gpuHotSpot -lt 0 -or $sensorValue -gt $script:gpuHotSpot) {
+                      $script:gpuHotSpot = [double]$sensorValue
+                      $script:gpuHotSpotSensorSource = $origin
+                      $script:gpuHotSpotSensorMatch = $hardwareName + ' / ' + $sensorName
+                    }
+                  } else {
+                    $script:gpuTemp = [double]$sensorValue
+                    $script:gpuTempSensorSource = $origin
+                    $script:gpuTempSensorMatch = $hardwareName + ' / ' + $sensorName
+                  }
                 }
               }
             }
@@ -169,12 +211,11 @@ final class WindowsTelemetryBridge {
               try {
                 if (-not (Test-Path $dllPath)) { continue }
                 Add-SensorAttempt ('DLL ' + [System.IO.Path]::GetFileName($dllPath))
+                if (-not (Ensure-LoadedAssembly $dllPath)) { continue }
                 if ($dllPath -like '*LibreHardwareMonitor*') {
-                  Add-Type -Path $dllPath
                   $computer = New-Object LibreHardwareMonitor.Hardware.Computer
                   $origin = 'LibreHardwareMonitor DLL'
                 } else {
-                  Add-Type -Path $dllPath
                   $computer = New-Object OpenHardwareMonitor.Hardware.Computer
                   $origin = 'OpenHardwareMonitor DLL'
                 }
@@ -372,8 +413,8 @@ final class WindowsTelemetryBridge {
                     $utilValue = [double]($selected[3].Trim())
                     if ($tempValue -gt 0) {
                       $gpuTemp = $tempValue
-                      $gpuSensorSource = 'nvidia-smi'
-                      $gpuSensorMatch = $selected[1].Trim()
+                      $gpuTempSensorSource = 'nvidia-smi'
+                      $gpuTempSensorMatch = $selected[1].Trim()
                     }
                     if ($utilValue -ge 0) {
                       $gpuLoad = $utilValue
@@ -386,97 +427,290 @@ final class WindowsTelemetryBridge {
 
             $attemptText = if ($sensorAttempts.Count -gt 0) { ' | Tried: ' + (($sensorAttempts | Select-Object -Unique) -join ', ') } else { '' }
             $errorText = if ($sensorErrors.Count -gt 0) { (($sensorErrors | Select-Object -Unique) -join ' | ') } else { 'none' }
-            $sensorSource = 'CPU: ' + $cpuSensorSource + ' [' + $cpuSensorMatch + '] | GPU: ' + $gpuSensorSource + ' [' + $gpuSensorMatch + ']' + $attemptText
+            $sensorSource = 'CPU: ' + $cpuSensorSource + ' [' + $cpuSensorMatch + '] | GPU: ' + $gpuTempSensorSource + ' [' + $gpuTempSensorMatch + '] | GPU Hot Spot: ' + $gpuHotSpotSensorSource + ' [' + $gpuHotSpotSensorMatch + ']' + $attemptText
             $result = @{
               bridgeActive = $true
               counterSource = $counterSource
               sensorSource = $sensorSource
               sensorErrorCode = $errorText
+              cpuTemperatureProvider = $cpuSensorSource
+              gpuTemperatureProvider = $gpuTempSensorSource
+              gpuHotSpotTemperatureProvider = $gpuHotSpotSensorSource
               cpuCoreLoadPercent = $cpuLoad
               gpuCoreLoadPercent = $gpuLoad
               gpuTemperatureC = $gpuTemp
+              gpuHotSpotTemperatureC = $gpuHotSpot
               cpuTemperatureC = $cpuTemp
               bytesReceivedPerSecond = [int64][math]::Round($netRecv)
               bytesSentPerSecond = [int64][math]::Round($netSent)
               diskReadBytesPerSecond = [int64][math]::Round($diskRead)
               diskWriteBytesPerSecond = [int64][math]::Round($diskWrite)
+              sampleDurationMillis = [int64]([System.Environment]::TickCount64 - $sampleStartedAt)
             }
             $result | ConvertTo-Json -Compress
             """;
 
-    private final AtomicBoolean requestInFlight = new AtomicBoolean(false);
+    private final AtomicBoolean helperStarting = new AtomicBoolean(false);
+    private final AtomicBoolean fallbackRefreshInFlight = new AtomicBoolean(false);
+    private final Object helperLock = new Object();
     private volatile Sample latest = Sample.empty();
     private volatile long lastRequestAtMillis;
+    private volatile long helperStartedAtMillis;
+    private volatile Process helperProcess;
+    private volatile Thread helperReaderThread;
+    private volatile int helperIntervalMillis = -1;
+    private volatile String helperRenderer = "";
+    private volatile String helperVendor = "";
 
     boolean isSupported() {
         return System.getProperty("os.name", "").toLowerCase(Locale.ROOT).contains("win");
     }
 
-    void requestRefreshIfNeeded() {
+    void requestRefreshIfNeeded(boolean fastNativeTelemetryAvailable) {
         if (!isSupported()) {
             latest = Sample.empty();
+            stopHelper();
             return;
         }
 
         long now = System.currentTimeMillis();
-        int requestIntervalMillis = ProfilerManager.getInstance().shouldCollectFrameMetrics() ? 50 : ConfigManager.getMetricsUpdateIntervalMs();
-        if (now - lastRequestAtMillis < requestIntervalMillis || !requestInFlight.compareAndSet(false, true)) {
+        int requestIntervalMillis = ProfilerManager.getInstance().isProfilerSelfProtectionActive()
+                ? 4_000
+                : ProfilerManager.getInstance().shouldCollectFrameMetrics()
+                ? (fastNativeTelemetryAvailable ? 2_000 : 1_000)
+                : ConfigManager.getMetricsUpdateIntervalMs();
+        SystemMetricsProfiler.Snapshot systemSnapshot = SystemMetricsProfiler.getInstance().getSnapshot();
+        String activeRenderer = normalizeHelperValue(systemSnapshot.gpuRenderer());
+        String activeVendor = normalizeHelperValue(systemSnapshot.gpuVendor());
+        if (helperNeedsRestart(requestIntervalMillis, activeRenderer, activeVendor)) {
+            restartHelper(requestIntervalMillis, activeRenderer, activeVendor);
+            return;
+        }
+        if (helperReaderThread != null && helperReaderThread.isAlive() && now - lastRequestAtMillis < requestIntervalMillis) {
+            requestFallbackRefreshIfStale(requestIntervalMillis, activeRenderer, activeVendor);
             return;
         }
         lastRequestAtMillis = now;
-
-        Thread thread = new Thread(this::runRefresh, "taskmanager-windows-telemetry");
-        thread.setDaemon(true);
-        thread.start();
+        if (!isHelperAlive()) {
+            restartHelper(requestIntervalMillis, activeRenderer, activeVendor);
+        }
+        requestFallbackRefreshIfStale(requestIntervalMillis, activeRenderer, activeVendor);
     }
 
     Sample getLatest() {
         return latest;
     }
 
-    private void runRefresh() {
+    Health getHealth() {
+        long now = System.currentTimeMillis();
+        long helperUptimeMillis = helperStartedAtMillis <= 0L ? 0L : Math.max(0L, now - helperStartedAtMillis);
+        long latestSampleAgeMillis = latest.capturedAtEpochMillis() <= 0L ? Long.MAX_VALUE : Math.max(0L, now - latest.capturedAtEpochMillis());
+        String helperStatus;
+        if (!isSupported()) {
+            helperStatus = "unsupported";
+        } else if (fallbackRefreshInFlight.get()) {
+            helperStatus = "fallback";
+        } else if (isHelperAlive()) {
+            helperStatus = latestSampleAgeMillis > Math.max(10_000L, helperIntervalMillis * 5L) ? "stale" : "alive";
+        } else {
+            helperStatus = "stopped";
+        }
+        return new Health(helperStatus, latestSampleAgeMillis, helperUptimeMillis, fallbackRefreshInFlight.get(), latest.sampleDurationMillis());
+    }
+
+    private boolean helperNeedsRestart(int intervalMillis, String renderer, String vendor) {
+        if (!isHelperAlive()) {
+            return true;
+        }
+        if (helperIntervalMillis != intervalMillis) {
+            return true;
+        }
+        if (!helperRenderer.equals(renderer)) {
+            return true;
+        }
+        if (!helperVendor.equals(vendor)) {
+            return true;
+        }
+        long now = System.currentTimeMillis();
+        long helperUptimeMillis = helperStartedAtMillis <= 0L ? Long.MAX_VALUE : Math.max(0L, now - helperStartedAtMillis);
+        long startupGraceMillis = Math.max(4_000L, intervalMillis * 3L);
+        if (latest.capturedAtEpochMillis() <= 0L) {
+            return helperUptimeMillis > startupGraceMillis * 2L;
+        }
+        long age = Math.max(0L, now - latest.capturedAtEpochMillis());
+        return helperUptimeMillis > startupGraceMillis && age > Math.max(10_000L, intervalMillis * 5L);
+    }
+
+    private boolean isHelperAlive() {
+        Process process = helperProcess;
+        return process != null && process.isAlive();
+    }
+
+    private void restartHelper(int intervalMillis, String renderer, String vendor) {
+        if (!helperStarting.compareAndSet(false, true)) {
+            return;
+        }
         try {
-            SystemMetricsProfiler.Snapshot systemSnapshot = SystemMetricsProfiler.getInstance().getSnapshot();
-            String activeRenderer = systemSnapshot.gpuRenderer();
-            String activeVendor = systemSnapshot.gpuVendor();
-            ProcessBuilder processBuilder = new ProcessBuilder("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", SCRIPT)
-                    .redirectErrorStream(true);
-            if (activeRenderer != null) {
-                processBuilder.environment().put("TM_ACTIVE_RENDERER", activeRenderer);
+            synchronized (helperLock) {
+                stopHelperLocked();
+                ProcessBuilder processBuilder = new ProcessBuilder(
+                        "powershell",
+                        "-NoProfile",
+                        "-ExecutionPolicy",
+                        "Bypass",
+                        "-Command",
+                        buildLoopScript(intervalMillis)
+                ).redirectErrorStream(true);
+                processBuilder.environment().put("TM_ACTIVE_RENDERER", renderer);
+                processBuilder.environment().put("TM_ACTIVE_VENDOR", vendor);
+                Process process = processBuilder.start();
+                helperProcess = process;
+                helperIntervalMillis = intervalMillis;
+                helperRenderer = renderer;
+                helperVendor = vendor;
+                helperStartedAtMillis = System.currentTimeMillis();
+                lastRequestAtMillis = helperStartedAtMillis;
+                Thread readerThread = new Thread(() -> readHelperOutput(process), "taskmanager-windows-telemetry");
+                readerThread.setDaemon(true);
+                helperReaderThread = readerThread;
+                readerThread.start();
             }
-            if (activeVendor != null) {
-                processBuilder.environment().put("TM_ACTIVE_VENDOR", activeVendor);
+        } catch (Exception e) {
+            taskmanagerClient.LOGGER.debug("Windows telemetry bridge failed to start helper: {}", e.getMessage());
+        } finally {
+            helperStarting.set(false);
+        }
+    }
+
+    private void readHelperOutput(Process process) {
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                String json = line.trim();
+                if (json.isEmpty() || !json.startsWith("{")) {
+                    continue;
+                }
+                Sample parsed = parseSample(json);
+                if (parsed != null) {
+                    latest = mergeWithPrevious(parsed, latest);
+                }
             }
+        } catch (Exception e) {
+            taskmanagerClient.LOGGER.debug("Windows telemetry bridge helper stopped: {}", e.getMessage());
+        } finally {
+            synchronized (helperLock) {
+                if (helperProcess == process) {
+                    stopHelperLocked();
+                }
+            }
+        }
+    }
+
+    private void requestFallbackRefreshIfStale(int intervalMillis, String renderer, String vendor) {
+        long now = System.currentTimeMillis();
+        long helperUptimeMillis = helperStartedAtMillis <= 0L ? Long.MAX_VALUE : Math.max(0L, now - helperStartedAtMillis);
+        long age = latest.capturedAtEpochMillis() > 0L
+                ? Math.max(0L, now - latest.capturedAtEpochMillis())
+                : helperUptimeMillis;
+        long fallbackDelayMillis = latest.capturedAtEpochMillis() > 0L
+                ? Math.max(3_000L, intervalMillis * 2L)
+                : Math.max(1_500L, intervalMillis);
+        if (age <= fallbackDelayMillis || !fallbackRefreshInFlight.compareAndSet(false, true)) {
+            return;
+        }
+        Thread thread = new Thread(() -> runFallbackRefresh(renderer, vendor), "taskmanager-windows-telemetry-fallback");
+        thread.setDaemon(true);
+        thread.start();
+    }
+
+    private void runFallbackRefresh(String renderer, String vendor) {
+        try {
+            ProcessBuilder processBuilder = new ProcessBuilder(
+                    "powershell",
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-Command",
+                    SCRIPT
+            ).redirectErrorStream(true);
+            processBuilder.environment().put("TM_ACTIVE_RENDERER", renderer);
+            processBuilder.environment().put("TM_ACTIVE_VENDOR", vendor);
             Process process = processBuilder.start();
-            byte[] output = readAll(process.getInputStream());
-            int exitCode = process.waitFor();
-            if (exitCode != 0) {
-                return;
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    String json = line.trim();
+                    if (json.isEmpty() || !json.startsWith("{")) {
+                        continue;
+                    }
+                    Sample parsed = parseSample(json);
+                    if (parsed != null) {
+                        latest = mergeWithPrevious(parsed, latest);
+                        break;
+                    }
+                }
             }
-            String json = new String(output, StandardCharsets.UTF_8).trim();
-            if (json.isEmpty()) {
-                return;
-            }
+            process.waitFor();
+        } catch (Exception e) {
+            taskmanagerClient.LOGGER.debug("Windows telemetry fallback refresh failed: {}", e.getMessage());
+        } finally {
+            fallbackRefreshInFlight.set(false);
+        }
+    }
+
+    private Sample parseSample(String json) {
+        try {
             JsonObject root = JsonParser.parseString(json).getAsJsonObject();
-            Sample parsed = new Sample(
+            return new Sample(
+                    System.currentTimeMillis(),
                     getBoolean(root, "bridgeActive"),
                     getString(root, "counterSource"),
                     getString(root, "sensorSource"),
                     getString(root, "sensorErrorCode"),
+                    getString(root, "cpuTemperatureProvider"),
+                    getString(root, "gpuTemperatureProvider"),
+                    getString(root, "gpuHotSpotTemperatureProvider"),
                     getDouble(root, "cpuCoreLoadPercent"),
                     getDouble(root, "gpuCoreLoadPercent"),
                     getDouble(root, "gpuTemperatureC"),
+                    getDouble(root, "gpuHotSpotTemperatureC"),
                     getDouble(root, "cpuTemperatureC"),
                     getLong(root, "bytesReceivedPerSecond"),
                     getLong(root, "bytesSentPerSecond"),
                     getLong(root, "diskReadBytesPerSecond"),
-                    getLong(root, "diskWriteBytesPerSecond")
+                    getLong(root, "diskWriteBytesPerSecond"),
+                    getLong(root, "sampleDurationMillis")
             );
-            latest = mergeWithPrevious(parsed, latest);
-        } catch (Exception e) {
-            taskmanagerClient.LOGGER.debug("Windows telemetry bridge failed: {}", e.getMessage());
-        } finally {
-            requestInFlight.set(false);
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    private String buildLoopScript(int intervalMillis) {
+        int safeInterval = Math.max(250, intervalMillis);
+        return "$ProgressPreference='SilentlyContinue'; while ($true) { & { " + SCRIPT + " }; Start-Sleep -Milliseconds " + safeInterval + " }";
+    }
+
+    private String normalizeHelperValue(String value) {
+        return value == null ? "" : value;
+    }
+
+    private void stopHelper() {
+        synchronized (helperLock) {
+            stopHelperLocked();
+        }
+    }
+
+    private void stopHelperLocked() {
+        Process process = helperProcess;
+        helperProcess = null;
+        helperReaderThread = null;
+        helperIntervalMillis = -1;
+        helperRenderer = "";
+        helperVendor = "";
+        helperStartedAtMillis = 0L;
+        if (process != null) {
+            process.destroy();
         }
     }
 
@@ -485,19 +719,45 @@ final class WindowsTelemetryBridge {
             previous = Sample.empty();
         }
         return new Sample(
-                current.bridgeActive() || previous.bridgeActive(),
+                current.capturedAtEpochMillis() > 0L ? current.capturedAtEpochMillis() : previous.capturedAtEpochMillis(),
+                current.bridgeActive(),
                 chooseText(current.counterSource(), previous.counterSource(), "Unavailable"),
                 chooseText(current.sensorSource(), previous.sensorSource(), "Unavailable"),
                 chooseText(current.sensorErrorCode(), previous.sensorErrorCode(), "No bridge data"),
-                chooseDouble(current.cpuCoreLoadPercent(), previous.cpuCoreLoadPercent()),
-                chooseDouble(current.gpuCoreLoadPercent(), previous.gpuCoreLoadPercent()),
-                chooseDouble(current.gpuTemperatureC(), previous.gpuTemperatureC()),
-                chooseDouble(current.cpuTemperatureC(), previous.cpuTemperatureC()),
-                chooseLong(current.bytesReceivedPerSecond(), previous.bytesReceivedPerSecond()),
-                chooseLong(current.bytesSentPerSecond(), previous.bytesSentPerSecond()),
-                chooseLong(current.diskReadBytesPerSecond(), previous.diskReadBytesPerSecond()),
-                chooseLong(current.diskWriteBytesPerSecond(), previous.diskWriteBytesPerSecond())
+                chooseText(current.cpuTemperatureProvider(), previous.cpuTemperatureProvider(), "Unavailable"),
+                chooseText(current.gpuTemperatureProvider(), previous.gpuTemperatureProvider(), "Unavailable"),
+                chooseText(current.gpuHotSpotTemperatureProvider(), previous.gpuHotSpotTemperatureProvider(), "Unavailable"),
+                chooseMetric(current.cpuCoreLoadPercent(), previous.cpuCoreLoadPercent()),
+                chooseMetric(current.gpuCoreLoadPercent(), previous.gpuCoreLoadPercent()),
+                chooseMetric(current.gpuTemperatureC(), previous.gpuTemperatureC()),
+                chooseMetric(current.gpuHotSpotTemperatureC(), previous.gpuHotSpotTemperatureC()),
+                chooseMetric(current.cpuTemperatureC(), previous.cpuTemperatureC()),
+                chooseMetric(current.bytesReceivedPerSecond(), previous.bytesReceivedPerSecond()),
+                chooseMetric(current.bytesSentPerSecond(), previous.bytesSentPerSecond()),
+                chooseMetric(current.diskReadBytesPerSecond(), previous.diskReadBytesPerSecond()),
+                chooseMetric(current.diskWriteBytesPerSecond(), previous.diskWriteBytesPerSecond()),
+                current.sampleDurationMillis() > 0L ? current.sampleDurationMillis() : previous.sampleDurationMillis()
         );
+    }
+
+    private double chooseMetric(double current, double previous) {
+        if (Double.isFinite(current) && current >= 0.0) {
+            return current;
+        }
+        if (Double.isFinite(previous) && previous >= 0.0) {
+            return previous;
+        }
+        return -1.0;
+    }
+
+    private long chooseMetric(long current, long previous) {
+        if (current >= 0L) {
+            return current;
+        }
+        if (previous >= 0L) {
+            return previous;
+        }
+        return -1L;
     }
 
     private String chooseText(String current, String previous, String fallback) {
@@ -508,21 +768,6 @@ final class WindowsTelemetryBridge {
             return previous;
         }
         return fallback;
-    }
-
-    private double chooseDouble(double current, double previous) {
-        return current >= 0.0 ? current : previous;
-    }
-
-    private long chooseLong(long current, long previous) {
-        return current >= 0L ? current : previous;
-    }
-
-    private byte[] readAll(InputStream inputStream) throws Exception {
-        try (InputStream in = inputStream; ByteArrayOutputStream out = new ByteArrayOutputStream()) {
-            in.transferTo(out);
-            return out.toByteArray();
-        }
     }
 
     private boolean getBoolean(JsonObject root, String key) {
